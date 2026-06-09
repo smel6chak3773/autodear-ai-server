@@ -3,6 +3,7 @@
 const OpenAI = require("openai");
 const { APP_KNOWLEDGE } = require("./appKnowledge");
 const { detectIntent } = require("./intentDetector");
+const { buildAction } = require("./actionRouter");
 const { findServices, detectService } = require("./tools/serviceTools");
 const {
   createBookingDraft,
@@ -225,10 +226,13 @@ async function processMessage({ userId, message, session }) {
 
   const toolData = getToolData(userId, intentResult.intent, text);
 
+  const action = buildAction(intentResult.intent, toolData);
+
   if (!openai) {
     return {
       answer: buildFallbackAnswer(toolData, intentResult.intent),
       intent: intentResult.intent,
+      action,
       toolData,
     };
   }
