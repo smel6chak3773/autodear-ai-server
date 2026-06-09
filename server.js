@@ -55,6 +55,7 @@ app.post("/api/assistant/message", async (req, res) => {
         cached: true,
         answer: cached.value.answer,
         intent: cached.value.intent,
+        action: cached.value.action,
         toolData: cached.value.toolData,
       });
     }
@@ -75,6 +76,7 @@ app.post("/api/assistant/message", async (req, res) => {
       cached: false,
       answer: result.answer,
       intent: result.intent,
+      action: result.action,
       toolData: result.toolData,
     });
   } catch (error) {
