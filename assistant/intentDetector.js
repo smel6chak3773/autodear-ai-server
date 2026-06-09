@@ -55,7 +55,16 @@ function detectIntent(message = "") {
     text.includes("диагност") ||
     text.includes("автосвар") ||
     text.includes("свароч") ||
-    text.includes("сварка")
+    text.includes("сварка") ||
+    text.includes("завар") ||
+    text.includes("порог") ||
+    text.includes("днище") ||
+    text.includes("аргон") ||
+    text.includes("кузов") ||
+    text.includes("акпп") ||
+    text.includes("мкпп") ||
+    text.includes("коробк") ||
+    text.includes("антикор")
   ) {
     return {
       intent: "service_search",
