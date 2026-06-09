@@ -29,6 +29,14 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/version", (req, res) => {
+  res.json({
+    ok: true,
+    version: "booking-action-api-1817d06",
+    expectedLatestCommit: "1817d06",
+  });
+});
+
 app.post("/api/assistant/cache/clear", (req, res) => {
   cacheStore.clear();
   res.json({ ok: true, message: "Assistant cache cleared" });
