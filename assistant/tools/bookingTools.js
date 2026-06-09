@@ -1,6 +1,7 @@
 // server/assistant/tools/bookingTools.js
 
 const bookingDrafts = new Map();
+const latestServicesByUser = new Map();
 
 const BOOKING_STATUS = {
   DRAFT: "draft",
@@ -40,6 +41,19 @@ function createBookingDraft(input = {}) {
 
 function getBookingDraft(id) {
   return bookingDrafts.get(id);
+}
+
+function saveLatestServicesForUser(userId = "guest_demo", services = []) {
+  if (!services?.length) return;
+
+  latestServicesByUser.set(userId, {
+    services,
+    savedAt: new Date().toISOString(),
+  });
+}
+
+function getLatestServicesForUser(userId = "guest_demo") {
+  return latestServicesByUser.get(userId)?.services || [];
 }
 
 function getLatestBookingDraftForUser(userId = "guest_demo") {
@@ -156,6 +170,8 @@ module.exports = {
   BOOKING_STATUS,
   createBookingDraft,
   getBookingDraft,
+  saveLatestServicesForUser,
+  getLatestServicesForUser,
   getLatestBookingDraftForUser,
   customerConfirmBooking,
   businessConfirmBooking,

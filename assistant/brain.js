@@ -7,6 +7,8 @@ const { buildAction } = require("./actionRouter");
 const { findServices, detectService } = require("./tools/serviceTools");
 const {
   createBookingDraft,
+  saveLatestServicesForUser,
+  getLatestServicesForUser,
   getLatestBookingDraftForUser,
   customerConfirmBooking,
 } = require("./tools/bookingTools");
@@ -166,11 +168,34 @@ function findSelectedSlotFromText(text, service) {
 }
 
 function maybeCreateBookingDraft(userId, text, services = []) {
-  const selectedService = findSelectedServiceFromText(text, services);
+  const normalized = normalize(text);
+
+  const wantsBooking =
+    normalized.includes("запиш") ||
+    normalized.includes("заброниру") ||
+    normalized.includes("хочу на") ||
+    normalized.includes("на завтра") ||
+    normalized.includes("завтра на");
+
+  if (!wantsBooking) return null;
+
+  const latestServices = getLatestServicesForUser(userId);
+  const candidateServices = services?.length ? services : latestServices;
+
+  let selectedService =
+    findSelectedServiceFromText(text, candidateServices) || candidateServices[0];
 
   if (!selectedService) return null;
 
-  const selectedSlot = findSelectedSlotFromText(text, selectedService);
+  const selectedSlot =
+    findSelectedSlotFromText(text, selectedService) ||
+    selectedService.availableSlots?.find((slot) => {
+      const normalizedSlot = normalize(slot);
+      return (
+        normalized.includes(normalizedSlot.replace("завтра ", "")) ||
+        normalized.includes(normalizedSlot.replace("завтра ", "").replace(":", ""))
+      );
+    });
 
   if (!selectedSlot) return null;
 
@@ -197,10 +222,24 @@ function getToolData(userId, intent, text) {
 
   if (intent === "service_search") {
     const services = findServices(text);
-    const bookingDraft = maybeCreateBookingDraft(userId, text, services);
+    const isBookingRequest =
+      normalize(text).includes("запиш") ||
+      normalize(text).includes("заброниру") ||
+      normalize(text).includes("завтра на") ||
+      normalize(text).includes("хочу на");
+
+    const bookingDraft = maybeCreateBookingDraft(
+      userId,
+      text,
+      isBookingRequest ? getLatestServicesForUser(userId) : services
+    );
+
+    if (services?.length && !isBookingRequest) {
+      saveLatestServicesForUser(userId, services);
+    }
 
     return {
-      services,
+      services: bookingDraft ? [] : services,
       bookingDraft,
     };
   }
