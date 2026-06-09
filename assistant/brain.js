@@ -3,7 +3,7 @@
 const OpenAI = require("openai");
 const { APP_KNOWLEDGE } = require("./appKnowledge");
 const { detectIntent } = require("./intentDetector");
-const { findServices } = require("./tools/serviceTools");
+const { findServices, detectService } = require("./tools/serviceTools");
 const {
   createBookingDraft,
   getLatestBookingDraftForUser,
@@ -211,6 +211,18 @@ function getToolData(userId, intent, text) {
 async function processMessage({ userId, message, session }) {
   const text = String(message || "").trim();
   const intentResult = detectIntent(text);
+
+  const detectedService = detectService(text);
+
+  if (
+    detectedService &&
+    detectedService.source !== "fallback" &&
+    intentResult.intent === "general_chat"
+  ) {
+    intentResult.intent = "service_search";
+    intentResult.confidence = 0.95;
+  }
+
   const toolData = getToolData(userId, intentResult.intent, text);
 
   if (!openai) {
