@@ -1,11 +1,11 @@
 // assistant/actionRouter.js
 
 function buildAction(intent, toolData = {}) {
-  if (toolData.services?.length) {
+  if (toolData.customerConfirmedBooking) {
     return {
-      type: "SHOW_SERVICES",
+      type: "BOOKING_SENT",
       payload: {
-        services: toolData.services,
+        booking: toolData.customerConfirmedBooking,
       },
     };
   }
@@ -19,11 +19,11 @@ function buildAction(intent, toolData = {}) {
     };
   }
 
-  if (toolData.customerConfirmedBooking) {
+  if (toolData.services?.length) {
     return {
-      type: "BOOKING_SENT",
+      type: "SHOW_SERVICES",
       payload: {
-        booking: toolData.customerConfirmedBooking,
+        services: toolData.services,
       },
     };
   }

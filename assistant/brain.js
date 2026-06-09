@@ -26,8 +26,7 @@ function isConfirmation(text = "") {
     normalized === "да" ||
     normalized.includes("да подтверждаю") ||
     normalized.includes("подтверждаю") ||
-    normalized.includes("записывай") ||
-    normalized.includes("запиши") ||
+    normalized.includes("подтвердить") ||
     normalized.includes("согласен")
   );
 }
@@ -305,6 +304,7 @@ ${getIntentInstruction(intentResult.intent)}
         response.output_text ||
         buildFallbackAnswer(toolData, intentResult.intent),
       intent: intentResult.intent,
+      action,
       toolData,
     };
   } catch (error) {
@@ -313,6 +313,7 @@ ${getIntentInstruction(intentResult.intent)}
     return {
       answer: buildFallbackAnswer(toolData, intentResult.intent),
       intent: intentResult.intent,
+      action,
       toolData,
     };
   }
