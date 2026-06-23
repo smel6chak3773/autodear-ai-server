@@ -3,6 +3,7 @@
 const { detectServiceByText } = require("../data/serviceCatalog");
 const serviceSynonyms = require("../data/serviceSynonyms");
 const { findStationsByService } = require("../data/stations");
+const { findStationsByServiceFromSupabase } = require("./stationSearchTools");
 
 function normalize(text = "") {
   return String(text).toLowerCase().replaceAll("ё", "е").trim();
@@ -46,20 +47,7 @@ function findServices(query = "") {
     return matchedStations;
   }
 
-  return [
-    {
-      id: "service_fallback_1",
-      name: `${detected.title} · AUTODEAR Partner`,
-      city: "Севастополь",
-      address: "Севастополь, ул. Индустриальная, 12",
-      service: detected.title,
-      rating: 4.9,
-      reviews: 127,
-      distanceKm: 2.4,
-      photoUrl: "https://picsum.photos/400/300?random=11",
-      availableSlots: ["Завтра 10:00", "Завтра 14:30", "Завтра 18:00"],
-    },
-  ];
+  return [];
 }
 
 module.exports = {

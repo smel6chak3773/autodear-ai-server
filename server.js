@@ -32,8 +32,8 @@ app.get("/health", (req, res) => {
 app.get("/version", (req, res) => {
   res.json({
     ok: true,
-    version: "booking-action-api-1817d06",
-    expectedLatestCommit: "1817d06",
+    version: "supabase-station-search-22a54f5",
+    expectedLatestCommit: "22a54f5",
   });
 });
 

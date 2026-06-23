@@ -207,7 +207,7 @@ function maybeCreateBookingDraft(userId, text, services = []) {
   });
 }
 
-function getToolData(userId, intent, text) {
+async function getToolData(userId, intent, text) {
   if (isConfirmation(text)) {
     const latestDraft = getLatestBookingDraftForUser(userId);
 
@@ -221,7 +221,7 @@ function getToolData(userId, intent, text) {
   }
 
   if (intent === "service_search") {
-    const services = findServices(text);
+    const services = await findServices(text);
     const isBookingRequest =
       normalize(text).includes("запиш") ||
       normalize(text).includes("заброниру") ||
@@ -236,6 +236,30 @@ function getToolData(userId, intent, text) {
 
     if (services?.length && !isBookingRequest) {
       saveLatestServicesForUser(userId, services);
+    }
+
+    if (!services?.length && !bookingDraft) {
+      return {
+        services: [],
+        bookingDraft: null,
+        emptyState: {
+          type: "NO_SERVICE_PROVIDERS",
+          title: "Пока нет подключённых СТО",
+          message: "Мы поняли, какая услуга нужна, но в базе AUTODEAR пока нет реальных СТО, которые выбрали эту услугу в бизнес-кабинете.",
+        },
+      };
+    }
+
+    if (!services?.length && !bookingDraft) {
+      return {
+        services: [],
+        bookingDraft: null,
+        emptyState: {
+          type: "NO_SERVICE_PROVIDERS",
+          title: "Пока нет подключённых СТО",
+          message: "Мы поняли, какая услуга нужна, но в базе AUTODEAR пока нет реальных СТО, которые выбрали эту услугу в бизнес-кабинете.",
+        },
+      };
     }
 
     return {
@@ -262,9 +286,18 @@ async function processMessage({ userId, message, session }) {
     intentResult.confidence = 0.95;
   }
 
-  const toolData = getToolData(userId, intentResult.intent, text);
+  const toolData = await getToolData(userId, intentResult.intent, text);
 
   const action = buildAction(intentResult.intent, toolData);
+
+  if (toolData?.emptyState) {
+    return {
+      answer: toolData.emptyState.message,
+      intent: intentResult.intent,
+      action,
+      toolData,
+    };
+  }
 
   if (!openai) {
     return {
