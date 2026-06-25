@@ -4,6 +4,7 @@ const OpenAI = require("openai");
 const { APP_KNOWLEDGE } = require("./appKnowledge");
 const { detectIntent } = require("./intentDetector");
 const { buildAction } = require("./actionRouter");
+const { findVerifiedRoute } = require("./knowledgeStore");
 const { findServices, detectService } = require("./tools/serviceTools");
 const {
   createBookingDraft,
@@ -221,6 +222,11 @@ async function getToolData(userId, intent, text) {
   }
 
   if (intent === "service_search") {
+    const matchedKnowledge = findVerifiedRoute(text, {
+      intent: "service_search",
+      threshold: 0.45,
+    });
+
     const services = await findServices(text);
     const isBookingRequest =
       normalize(text).includes("запиш") ||
@@ -242,10 +248,13 @@ async function getToolData(userId, intent, text) {
       return {
         services: [],
         bookingDraft: null,
+        matchedKnowledge,
         emptyState: {
           type: "NO_SERVICE_PROVIDERS",
           title: "Пока нет подключённых СТО",
-          message: "Мы поняли, какая услуга нужна, но в базе AUTODEAR пока нет реальных СТО, которые выбрали эту услугу в бизнес-кабинете.",
+          message: matchedKnowledge?.serviceName
+            ? `Похоже, нужна услуга: ${matchedKnowledge.serviceName}. Пока в AUTODEAR нет подключённых СТО по этой услуге.`
+            : "Мы поняли, какая услуга нужна, но в базе AUTODEAR пока нет реальных СТО, которые выбрали эту услугу в бизнес-кабинете.",
         },
       };
     }
@@ -254,10 +263,13 @@ async function getToolData(userId, intent, text) {
       return {
         services: [],
         bookingDraft: null,
+        matchedKnowledge,
         emptyState: {
           type: "NO_SERVICE_PROVIDERS",
           title: "Пока нет подключённых СТО",
-          message: "Мы поняли, какая услуга нужна, но в базе AUTODEAR пока нет реальных СТО, которые выбрали эту услугу в бизнес-кабинете.",
+          message: matchedKnowledge?.serviceName
+            ? `Похоже, нужна услуга: ${matchedKnowledge.serviceName}. Пока в AUTODEAR нет подключённых СТО по этой услуге.`
+            : "Мы поняли, какая услуга нужна, но в базе AUTODEAR пока нет реальных СТО, которые выбрали эту услугу в бизнес-кабинете.",
         },
       };
     }

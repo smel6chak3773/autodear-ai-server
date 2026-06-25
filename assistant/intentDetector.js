@@ -50,6 +50,8 @@ function detectIntent(message = "") {
     text.includes("сервис") ||
     text.includes("ремонт") ||
     text.includes("замен") ||
+    text.includes("поменять") ||
+    text.includes("поменять") ||
     text.includes("лобов") ||
     text.includes("шиномонтаж") ||
     text.includes("диагност") ||
@@ -64,6 +66,12 @@ function detectIntent(message = "") {
     text.includes("акпп") ||
     text.includes("мкпп") ||
     text.includes("коробк") ||
+    text.includes("тормоз") ||
+    text.includes("подвеск") ||
+    text.includes("чек") ||
+    text.includes("тормоз") ||
+    text.includes("подвеск") ||
+    text.includes("чек") ||
     text.includes("антикор")
   ) {
     return {
@@ -74,7 +82,6 @@ function detectIntent(message = "") {
 
   if (
     text.includes("запчаст") ||
-    text.includes("колод") ||
     text.includes("масло") ||
     text.includes("фильтр") ||
     text.includes("свеч") ||
