@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
 
 const { processMessage } = require("./assistant/brain");
 const memoryStore = require("./assistant/memoryStore");
@@ -10,6 +11,17 @@ const cacheStore = require("./assistant/cacheStore");
 const app = express();
 
 const PORT = Number(process.env.PORT || process.env.AUTODEAR_AI_PORT || 3010);
+
+const supabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || "";
+const supabaseKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ||
+  "";
+
+const supabase = supabaseUrl && supabaseKey
+  ? createClient(supabaseUrl, supabaseKey)
+  : null;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -35,6 +47,50 @@ app.get("/version", (req, res) => {
     version: "supabase-station-search-22a54f5",
     expectedLatestCommit: "22a54f5",
   });
+});
+
+
+app.post("/api/push/register-token", async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(500).json({ ok: false, error: "supabase_not_configured" });
+    }
+
+    const nowIso = new Date().toISOString();
+    const token = String(req.body.token || req.body.fcmToken || "").trim();
+
+    if (!token) {
+      return res.status(400).json({ ok: false, error: "token_required" });
+    }
+
+    const payload = {
+      user_id: req.body.user_id || req.body.userId || null,
+      user_email: req.body.user_email || req.body.userEmail || null,
+      role: req.body.role || "guest",
+      expo_push_token: token,
+      platform: req.body.platform || "android",
+      device_name: req.body.device_name || req.body.deviceName || null,
+      app_env: req.body.app_env || req.body.appEnv || "production",
+      is_active: true,
+      updated_at: nowIso,
+    };
+
+    const { data, error } = await supabase
+      .from("device_push_tokens")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error("[AUTODEAR][PUSH] register-token failed:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true, id: data?.id || null });
+  } catch (error) {
+    console.error("[AUTODEAR][PUSH] register-token error:", error);
+    return res.status(500).json({ ok: false, error: error?.message || "unknown" });
+  }
 });
 
 app.post("/api/assistant/cache/clear", (req, res) => {
