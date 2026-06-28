@@ -77,7 +77,7 @@ app.post("/api/push/register-token", async (req, res) => {
 
     const { data, error } = await supabase
       .from("device_push_tokens")
-      .insert(payload)
+      .upsert(payload, { onConflict: "expo_push_token" })
       .select("id")
       .single();
 
