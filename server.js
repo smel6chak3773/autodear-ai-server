@@ -9,6 +9,7 @@ const memoryStore = require("./assistant/memoryStore");
 const cacheStore = require("./assistant/cacheStore");
 
 const app = express();
+const vehicleCheckCache = new Map();
 
 const PORT = Number(process.env.PORT || process.env.AUTODEAR_AI_PORT || 3010);
 
@@ -47,6 +48,196 @@ app.get("/version", (req, res) => {
     version: "supabase-station-search-22a54f5",
     expectedLatestCommit: "22a54f5",
   });
+});
+
+
+
+
+
+app.post("/api/vehicle-check/report", async (req, res) => {
+  try {
+    const token = process.env.AVTOVINCODE_TOKEN || "";
+    const mode = String(req.body.mode || "").trim();
+    const inputVin = String(req.body.vin || "").trim().toUpperCase();
+    const plate = String(req.body.plate || req.body.gosnomer || "").trim().toUpperCase();
+
+    if (!token) {
+      return res.status(500).json({
+        ok: false,
+        error: "AVTOVINCODE_TOKEN_NOT_CONFIGURED_ON_SERVER",
+      });
+    }
+
+    const callAvtoVinCod = async (path) => {
+      const url = `https://api.avtovincod.ru${path}`;
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+        },
+      });
+
+      const json = await response.json().catch(() => null);
+
+      if (!response.ok || !json) {
+        throw new Error(json?.error || `AVTOVINCODE_HTTP_${response.status}`);
+      }
+
+      if (json?.success === 0) {
+        throw new Error(json?.error || json?.code || "AVTOVINCODE_REQUEST_FAILED");
+      }
+
+      return json;
+    };
+
+    let vin = inputVin;
+    let numberResult = null;
+
+    const directCacheKey = vin ? `vin:${vin}` : "";
+    if (directCacheKey && vehicleCheckCache.has(directCacheKey)) {
+      return res.json(vehicleCheckCache.get(directCacheKey));
+    }
+
+    if (mode === "number") {
+      if (!plate) return res.status(400).json({ ok: false, error: "PLATE_REQUIRED" });
+
+      numberResult = await callAvtoVinCod(`/gos2vin?plate=${encodeURIComponent(plate)}`);
+
+      if (!numberResult?.success) {
+        return res.status(400).json({
+          ok: false,
+          error: numberResult?.error || "VIN_BY_PLATE_NOT_FOUND",
+          providerCode: numberResult?.code || null,
+          raw: { numberResult },
+        });
+      }
+
+      vin =
+        numberResult?.vin ||
+        numberResult?.record?.vin ||
+        numberResult?.result?.vin ||
+        numberResult?.result?.number2vin?.vin ||
+        "";
+    }
+
+    if (!vin) return res.status(400).json({ ok: false, error: "VIN_REQUIRED" });
+
+    const [registration, score] = await Promise.all([
+      callAvtoVinCod(`/vin?vin=${encodeURIComponent(vin)}`),
+      callAvtoVinCod(`/score?vin=${encodeURIComponent(vin)}`),
+    ]);
+
+    if (!registration?.success && !score?.success) {
+      return res.status(400).json({
+        ok: false,
+        error: registration?.error || score?.error || "VIN_CHECK_FAILED",
+        providerCode: registration?.code || score?.code || null,
+        raw: { numberResult, registration, score },
+      });
+    }
+
+    const registrationRecord = registration?.record || {};
+    const scoreRecord = score?.record || {};
+    const record = {
+      ...registrationRecord,
+      ...scoreRecord,
+      regNumber: scoreRecord.regNumber || registrationRecord.regNumber || plate || null,
+      pts: {
+        ...(registrationRecord.pts || {}),
+        ...(scoreRecord.pts || {}),
+        num: scoreRecord?.pts?.num || registrationRecord?.pts?.num || null,
+        date: scoreRecord?.pts?.date || registrationRecord?.pts?.date || null,
+      },
+      sts: {
+        ...(registrationRecord.sts || {}),
+        ...(scoreRecord.sts || {}),
+        num: scoreRecord?.sts?.num || registrationRecord?.sts?.num || null,
+        date: scoreRecord?.sts?.date || registrationRecord?.sts?.date || null,
+      },
+      ownershipPeriods:
+        Array.isArray(scoreRecord.ownershipPeriods) && scoreRecord.ownershipPeriods.length
+          ? scoreRecord.ownershipPeriods
+          : registrationRecord.ownershipPeriods || [],
+    };
+    const ownershipPeriods = Array.isArray(record.ownershipPeriods)
+      ? record.ownershipPeriods
+      : [];
+
+    const finalReport = {
+      ok: true,
+      provider: "avtovincode",
+      vin,
+      numberResult,
+      raw: {
+        registration,
+        score,
+      },
+      result: {
+        gibdd: {
+          vehicle: {
+            vin: record.vin || vin,
+            bodyNumber: record.bodyNumber || null,
+            regNumber: record.regNumber || plate || null,
+            model: record.model || null,
+            year: record.year || null,
+            color: record.color || null,
+            engineVolume: record.engineVolume || null,
+            powerHp: record.powerHp || null,
+            powerKwt: record.powerKwt || null,
+            category: record.category || null,
+            maxWeight: record.maxWeight || null,
+            weightWithoutLoading: record.weightWithoutLoading || null,
+            recordStatus: record.recordStatus || null,
+            lastRegAction: record.lastRegAction || null,
+          },
+          pts: record.pts || null,
+          sts: record.sts || null,
+          ownershipPeriods,
+          ownersCount: ownershipPeriods.length,
+        },
+        restrict: {
+          items: score?.restrictions || [],
+          restricted: Boolean(score?.status?.restricted),
+        },
+        dtp: null,
+        wanted: {
+          items: score?.searches || [],
+          wanted: Boolean(score?.status?.wanted),
+          specWanted: Boolean(score?.status?.spec_wanted),
+        },
+      },
+      ai: {
+        riskLevel:
+          score?.status?.restricted || score?.status?.wanted || score?.status?.spec_wanted
+            ? "high"
+            : ownershipPeriods.length >= 6
+              ? "medium"
+              : "low",
+        title:
+          score?.status?.restricted || score?.status?.wanted || score?.status?.spec_wanted
+            ? "Высокий риск"
+            : ownershipPeriods.length >= 6
+              ? "Средний риск"
+              : "Низкий риск",
+        summary:
+          score?.status?.restricted || score?.status?.wanted || score?.status?.spec_wanted
+            ? "Найдены ограничения или признаки розыска. Такой автомобиль нельзя покупать без дополнительной юридической проверки."
+            : ownershipPeriods.length >= 6
+              ? `Ограничений и розыска не найдено, но у автомобиля много периодов владения: ${ownershipPeriods.length}. Перед покупкой стоит проверить пробег, ДТП и сервисную историю.`
+              : "Ограничений и розыска не найдено. По базовым данным критических рисков не видно.",
+      },
+    };
+
+    vehicleCheckCache.set(`vin:${vin}`, finalReport);
+    return res.json(finalReport);
+  } catch (error) {
+    console.error("[AUTODEAR][VEHICLE_CHECK] error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "VEHICLE_CHECK_UNKNOWN_ERROR",
+    });
+  }
 });
 
 
