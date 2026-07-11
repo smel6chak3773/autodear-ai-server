@@ -7,6 +7,7 @@ const { createClient } = require("@supabase/supabase-js");
 const { processMessage } = require("./assistant/brain");
 const memoryStore = require("./assistant/memoryStore");
 const cacheStore = require("./assistant/cacheStore");
+const { diagnoseDeveloperSnapshot } = require("./developer/diagnose");
 
 const app = express();
 const vehicleCheckCache = new Map();
@@ -281,6 +282,27 @@ app.post("/api/push/register-token", async (req, res) => {
   } catch (error) {
     console.error("[AUTODEAR][PUSH] register-token error:", error);
     return res.status(500).json({ ok: false, error: error?.message || "unknown" });
+  }
+});
+
+app.post("/api/developer/diagnose", async (req, res) => {
+  try {
+    const snapshot = req.body?.snapshot || {};
+
+    const result = await diagnoseDeveloperSnapshot(snapshot);
+
+    return res.json({
+      ok: true,
+      aiUsed: result.aiUsed,
+      diagnosis: result.diagnosis,
+    });
+  } catch (error) {
+    console.error("[AUTODEAR][DEVELOPER_DIAGNOSE_ROUTE]", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "DEVELOPER_DIAGNOSE_FAILED",
+    });
   }
 });
 
