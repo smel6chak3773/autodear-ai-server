@@ -204,7 +204,23 @@ async function diagnoseDeveloperSnapshot(snapshot = {}) {
       aiUsed: true,
     };
   } catch (error) {
-    console.error("[AUTODEAR][DEVELOPER_DIAGNOSE]", error);
+    console.error(
+      "[AUTODEAR][DEVELOPER_DIAGNOSE]",
+      {
+        status: error?.status || null,
+        code: error?.code || null,
+        message: error?.message || String(error),
+        type: error?.type || null,
+        requestId:
+          error?.request_id ||
+          error?.headers?.["x-request-id"] ||
+          null,
+        responseData:
+          error?.response?.data ||
+          error?.error ||
+          null,
+      }
+    );
 
     return {
       diagnosis: fallback,
