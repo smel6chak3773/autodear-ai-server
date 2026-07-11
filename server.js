@@ -46,8 +46,8 @@ app.get("/health", (req, res) => {
 app.get("/version", (req, res) => {
   res.json({
     ok: true,
-    version: "supabase-station-search-22a54f5",
-    expectedLatestCommit: "22a54f5",
+    version: "developer-diagnose-api",
+    expectedLatestCommit: "developer-diagnose-api",
   });
 });
 
