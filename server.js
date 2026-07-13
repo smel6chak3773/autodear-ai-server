@@ -55,6 +55,216 @@ app.get("/version", (req, res) => {
 
 
 
+function normalizeVin(value = "") {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-HJ-NPR-Z0-9]/g, "")
+    .slice(0, 17);
+}
+
+function mapVpicFuel(value = "") {
+  const text = String(value || "").toLowerCase();
+
+  if (text.includes("electric")) return "electric";
+  if (text.includes("hybrid")) return "hybrid";
+  if (text.includes("diesel")) return "diesel";
+
+  return "petrol";
+}
+
+function mapVpicTransmission(value = "") {
+  const text = String(value || "").toLowerCase();
+
+  if (
+    text.includes("manual") ||
+    text.includes("mechanical")
+  ) {
+    return "manual";
+  }
+
+  if (
+    text.includes("cvt") ||
+    text.includes("automatic")
+  ) {
+    return "automatic";
+  }
+
+  if (
+    text.includes("dual-clutch") ||
+    text.includes("dual clutch") ||
+    text.includes("dct") ||
+    text.includes("automated manual")
+  ) {
+    return "robot";
+  }
+
+  return "";
+}
+
+app.post("/api/vehicle/decode", async (req, res) => {
+  try {
+    const vin = normalizeVin(req.body?.vin);
+
+    if (!vin) {
+      return res.status(400).json({
+        ok: false,
+        error: "VIN_REQUIRED",
+      });
+    }
+
+    if (vin.length !== 17) {
+      return res.status(400).json({
+        ok: false,
+        error: "VIN_INVALID_LENGTH",
+      });
+    }
+
+    const cacheKey = `free_decode:${vin}`;
+
+    if (vehicleCheckCache.has(cacheKey)) {
+      return res.json(vehicleCheckCache.get(cacheKey));
+    }
+
+    const url =
+      `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/` +
+      `${encodeURIComponent(vin)}?format=json`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "AUTODEAR/1.0",
+      },
+    });
+
+    const json = await response.json().catch(() => null);
+
+    if (!response.ok || !json) {
+      return res.status(502).json({
+        ok: false,
+        error: `VPIC_HTTP_${response.status}`,
+      });
+    }
+
+    const row = Array.isArray(json.Results)
+      ? json.Results[0] || {}
+      : {};
+
+    const brand = String(row.Make || "").trim();
+    const model = String(row.Model || "").trim();
+    const year = Number(row.ModelYear || 0);
+    const body = String(row.BodyClass || "").trim();
+    const fuelRaw = String(row.FuelTypePrimary || "").trim();
+    const transmissionRaw = String(row.TransmissionStyle || "").trim();
+
+    const displacement = String(
+      row.DisplacementL ||
+      ""
+    ).trim();
+
+    const engineModel = String(
+      row.EngineModel ||
+      ""
+    ).trim();
+
+    const cylinders = String(
+      row.EngineCylinders ||
+      ""
+    ).trim();
+
+    const engineParts = [
+      displacement
+        ? `${displacement} л`
+        : "",
+      engineModel,
+      cylinders
+        ? `${cylinders} цил.`
+        : "",
+    ].filter(Boolean);
+
+    const fieldsFound = [
+      brand,
+      model,
+      year,
+      body,
+      fuelRaw,
+      displacement,
+      transmissionRaw,
+    ].filter(Boolean).length;
+
+    const result = {
+      ok: true,
+      provider: "nhtsa_vpic",
+      vin,
+
+      complete:
+        Boolean(brand) &&
+        Boolean(model) &&
+        Boolean(year),
+
+      confidence:
+        fieldsFound >= 6
+          ? "high"
+          : fieldsFound >= 3
+            ? "medium"
+            : "low",
+
+      vehicle: {
+        brand,
+        model,
+        year: year || null,
+        body,
+        fuel: mapVpicFuel(fuelRaw),
+        fuelRaw,
+        transmission:
+          mapVpicTransmission(transmissionRaw),
+        transmissionRaw,
+        engine: engineParts.join(" · "),
+        displacement,
+        engineModel,
+        cylinders:
+          cylinders
+            ? Number(cylinders)
+            : null,
+        driveType: String(row.DriveType || "").trim(),
+        manufacturer: String(
+          row.Manufacturer ||
+          row.ManufacturerName ||
+          ""
+        ).trim(),
+        plantCountry: String(
+          row.PlantCountry ||
+          ""
+        ).trim(),
+      },
+
+      diagnostic: {
+        errorCode: String(row.ErrorCode || ""),
+        errorText: String(row.ErrorText || ""),
+        fieldsFound,
+      },
+    };
+
+    vehicleCheckCache.set(cacheKey, result);
+
+    return res.json(result);
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][FREE_VIN_DECODE]",
+      error?.message || error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "VIN_DECODE_FAILED",
+    });
+  }
+});
+
+
 app.post("/api/vehicle-check/report", async (req, res) => {
   try {
     const token = process.env.AVTOVINCODE_TOKEN || "";
