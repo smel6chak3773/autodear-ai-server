@@ -193,6 +193,29 @@ app.post("/api/vehicle/decode", async (req, res) => {
       transmissionRaw,
     ].filter(Boolean).length;
 
+    const providerErrorCode = String(
+      row.ErrorCode || ""
+    );
+
+    const providerErrorText = String(
+      row.ErrorText || ""
+    );
+
+    if (!brand && !model && !year) {
+      return res.status(422).json({
+        ok: false,
+        error: "VIN_NOT_SUPPORTED_FREE",
+        provider: "nhtsa_vpic",
+        vin,
+        fallbackRequired: true,
+        diagnostic: {
+          errorCode: providerErrorCode,
+          errorText: providerErrorText,
+          fieldsFound,
+        },
+      });
+    }
+
     const result = {
       ok: true,
       provider: "nhtsa_vpic",
@@ -240,8 +263,8 @@ app.post("/api/vehicle/decode", async (req, res) => {
       },
 
       diagnostic: {
-        errorCode: String(row.ErrorCode || ""),
-        errorText: String(row.ErrorText || ""),
+        errorCode: providerErrorCode,
+        errorText: providerErrorText,
         fieldsFound,
       },
     };
