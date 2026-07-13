@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
+const OpenAI = require("openai");
 
 const { processMessage } = require("./assistant/brain");
 const memoryStore = require("./assistant/memoryStore");
@@ -11,6 +12,12 @@ const { diagnoseDeveloperSnapshot } = require("./developer/diagnose");
 
 const app = express();
 const vehicleCheckCache = new Map();
+
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    })
+  : null;
 
 const PORT = Number(process.env.PORT || process.env.AUTODEAR_AI_PORT || 3010);
 
@@ -26,7 +33,7 @@ const supabase = supabaseUrl && supabaseKey
   : null;
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "12mb" }));
 
 app.get("/", (req, res) => {
   res.json({
@@ -101,6 +108,247 @@ function mapVpicTransmission(value = "") {
 
   return "";
 }
+
+function cleanJsonText(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function normalizeVehiclePlate(value = "") {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/[^АВЕКМНОРСТУХA-Z0-9]/g, "");
+}
+
+app.post("/api/vehicle/read-sts", async (req, res) => {
+  try {
+    if (!openai) {
+      return res.status(500).json({
+        ok: false,
+        error: "OPENAI_API_KEY_NOT_CONFIGURED",
+      });
+    }
+
+    const imageBase64 = String(
+      req.body?.imageBase64 ||
+      req.body?.base64 ||
+      ""
+    ).trim();
+
+    const mimeType = String(
+      req.body?.mimeType ||
+      "image/jpeg"
+    ).trim();
+
+    if (!imageBase64) {
+      return res.status(400).json({
+        ok: false,
+        error: "STS_IMAGE_REQUIRED",
+      });
+    }
+
+    if (
+      ![
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+      ].includes(mimeType)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "STS_IMAGE_FORMAT_NOT_SUPPORTED",
+      });
+    }
+
+    const dataUrl = imageBase64.startsWith("data:")
+      ? imageBase64
+      : `data:${mimeType};base64,${imageBase64}`;
+
+    const response = await openai.responses.create({
+      model:
+        process.env.OPENAI_STS_MODEL ||
+        "gpt-4o-mini",
+
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "Проанализируй фотографию российского свидетельства о регистрации транспортного средства (СТС). " +
+                "Извлеки только данные, которые действительно видны. Ничего не выдумывай. " +
+                "Верни строго JSON без markdown со следующими полями: " +
+                '{"documentDetected":boolean,"vin":"","plate":"","brand":"","model":"","year":null,' +
+                '"vehicleType":"","category":"","bodyNumber":"","chassisNumber":"","color":"","enginePowerHp":null,' +
+                '"enginePowerKw":null,"engineDisplacementCc":null,"stsNumber":"","ownerName":"","confidence":"low|medium|high",' +
+                '"warnings":[]}. ' +
+                "VIN должен содержать 17 символов без пробелов. " +
+                "Госномер верни без пробелов. " +
+                "Если поле не читается — оставь пустую строку или null.",
+            },
+            {
+              type: "input_image",
+              image_url: dataUrl,
+              detail: "high",
+            },
+          ],
+        },
+      ],
+
+      max_output_tokens: 1200,
+    });
+
+    const rawText = String(
+      response.output_text ||
+      ""
+    );
+
+    let parsed = null;
+
+    try {
+      parsed = JSON.parse(
+        cleanJsonText(rawText)
+      );
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][STS_JSON_PARSE]",
+        rawText
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "STS_AI_INVALID_JSON",
+      });
+    }
+
+    const vin = normalizeVin(
+      parsed?.vin || ""
+    );
+
+    const plate = normalizeVehiclePlate(
+      parsed?.plate || ""
+    );
+
+    const vehicle = {
+      vin,
+      plate,
+
+      brand: String(
+        parsed?.brand || ""
+      ).trim(),
+
+      model: String(
+        parsed?.model || ""
+      ).trim(),
+
+      year:
+        Number(parsed?.year || 0) ||
+        null,
+
+      vehicleType: String(
+        parsed?.vehicleType || ""
+      ).trim(),
+
+      category: String(
+        parsed?.category || ""
+      ).trim(),
+
+      bodyNumber: String(
+        parsed?.bodyNumber || ""
+      ).trim(),
+
+      chassisNumber: String(
+        parsed?.chassisNumber || ""
+      ).trim(),
+
+      color: String(
+        parsed?.color || ""
+      ).trim(),
+
+      enginePowerHp:
+        Number(
+          parsed?.enginePowerHp || 0
+        ) || null,
+
+      enginePowerKw:
+        Number(
+          parsed?.enginePowerKw || 0
+        ) || null,
+
+      engineDisplacementCc:
+        Number(
+          parsed?.engineDisplacementCc || 0
+        ) || null,
+
+      stsNumber: String(
+        parsed?.stsNumber || ""
+      ).trim(),
+
+      ownerName: String(
+        parsed?.ownerName || ""
+      ).trim(),
+    };
+
+    const hasUsefulData = Boolean(
+      vehicle.vin ||
+      vehicle.plate ||
+      vehicle.brand ||
+      vehicle.model
+    );
+
+    if (
+      parsed?.documentDetected === false ||
+      !hasUsefulData
+    ) {
+      return res.status(422).json({
+        ok: false,
+        error: "STS_NOT_RECOGNIZED",
+        confidence:
+          parsed?.confidence || "low",
+        warnings: Array.isArray(
+          parsed?.warnings
+        )
+          ? parsed.warnings
+          : [],
+      });
+    }
+
+    return res.json({
+      ok: true,
+      provider: "openai_vision",
+      documentDetected: true,
+      confidence:
+        parsed?.confidence || "medium",
+      vehicle,
+      warnings: Array.isArray(
+        parsed?.warnings
+      )
+        ? parsed.warnings
+        : [],
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][STS_RECOGNITION]",
+      error?.message || error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "STS_RECOGNITION_FAILED",
+    });
+  }
+});
+
 
 app.post("/api/vehicle/decode", async (req, res) => {
   try {
