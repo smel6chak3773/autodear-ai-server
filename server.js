@@ -12,6 +12,7 @@ const { diagnoseDeveloperSnapshot } = require("./developer/diagnose");
 
 const app = express();
 const vehicleCheckCache = new Map();
+const geocodeCache = new Map();
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({
@@ -125,6 +126,124 @@ function normalizeVehiclePlate(value = "") {
     .replace(/\s+/g, "")
     .replace(/[^АВЕКМНОРСТУХA-Z0-9]/g, "");
 }
+
+function normalizeGeocodeText(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 300);
+}
+
+app.post("/api/geocode", async (req, res) => {
+  try {
+    const city = normalizeGeocodeText(req.body?.city);
+    const address = normalizeGeocodeText(req.body?.address);
+
+    if (!address) {
+      return res.status(400).json({
+        ok: false,
+        error: "ADDRESS_REQUIRED",
+      });
+    }
+
+    const query = [city, address]
+      .filter(Boolean)
+      .join(", ");
+
+    const cacheKey = query.toLowerCase();
+
+    if (geocodeCache.has(cacheKey)) {
+      return res.json({
+        ...geocodeCache.get(cacheKey),
+        cached: true,
+      });
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+
+    let response;
+
+    try {
+      const url =
+        "https://nominatim.openstreetmap.org/search" +
+        `?format=jsonv2&limit=1&addressdetails=1&q=${encodeURIComponent(query)}`;
+
+      response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "Accept-Language": "ru",
+          "User-Agent":
+            process.env.NOMINATIM_USER_AGENT ||
+            "AUTODEAR/1.0",
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      return res.status(502).json({
+        ok: false,
+        error: `GEOCODE_PROVIDER_HTTP_${response.status}`,
+      });
+    }
+
+    const data = await response.json();
+    const item = Array.isArray(data) ? data[0] : null;
+
+    if (!item) {
+      return res.status(404).json({
+        ok: false,
+        error: "ADDRESS_NOT_FOUND",
+        query,
+      });
+    }
+
+    const latitude = Number(item.lat);
+    const longitude = Number(item.lon);
+
+    if (
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude)
+    ) {
+      return res.status(502).json({
+        ok: false,
+        error: "INVALID_GEOCODE_COORDINATES",
+      });
+    }
+
+    const result = {
+      ok: true,
+      latitude,
+      longitude,
+      displayName: String(item.display_name || query),
+      query,
+      cached: false,
+    };
+
+    geocodeCache.set(cacheKey, result);
+
+    return res.json(result);
+  } catch (error) {
+    const message = String(error?.message || error || "");
+
+    console.log("[AUTODEAR][GEOCODE_ERROR]", message);
+
+    return res.status(
+      message.toLowerCase().includes("abort")
+        ? 504
+        : 500
+    ).json({
+      ok: false,
+      error: message.toLowerCase().includes("abort")
+        ? "GEOCODE_TIMEOUT"
+        : "GEOCODE_FAILED",
+    });
+  }
+});
 
 app.post("/api/vehicle/read-sts", async (req, res) => {
   try {
