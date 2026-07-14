@@ -51,6 +51,186 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/download", (req, res) => {
+  const googlePlayUrl = String(process.env.AUTODEAR_GOOGLE_PLAY_URL || "").trim();
+  const ruStoreUrl = String(process.env.AUTODEAR_RUSTORE_URL || "").trim();
+  const appStoreUrl = String(process.env.AUTODEAR_APP_STORE_URL || "").trim();
+
+  const storeButton = (url, title, subtitle) => {
+    if (!url) {
+      return `
+        <div class="store disabled">
+          <strong>${title}</strong>
+          <span>${subtitle} — скоро</span>
+        </div>
+      `;
+    }
+
+    return `
+      <a class="store" href="${url}" rel="noopener noreferrer">
+        <strong>${title}</strong>
+        <span>${subtitle}</span>
+      </a>
+    `;
+  };
+
+  res
+    .status(200)
+    .type("html")
+    .send(`<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1,maximum-scale=1"
+  />
+  <title>AUTODEAR — скачать приложение</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background:
+        radial-gradient(circle at top, #263244 0%, #111827 48%, #090d14 100%);
+      color: #ffffff;
+      font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Arial,
+        sans-serif;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 520px;
+      padding: 34px 28px;
+      border: 1px solid rgba(255,255,255,.13);
+      border-radius: 30px;
+      background: rgba(17,24,39,.88);
+      box-shadow: 0 24px 80px rgba(0,0,0,.38);
+      text-align: center;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      font-size: 36px;
+      font-weight: 900;
+      letter-spacing: 1px;
+    }
+
+    .auto {
+      color: #FFD21F;
+    }
+
+    .dear {
+      color: #FFFFFF;
+    }
+
+    h1 {
+      margin: 24px 0 8px;
+      font-size: 28px;
+      line-height: 1.2;
+    }
+
+    .lead {
+      margin: 0 auto;
+      max-width: 410px;
+      color: #AEB7C5;
+      font-size: 16px;
+      line-height: 1.55;
+    }
+
+    .stores {
+      display: grid;
+      gap: 12px;
+      margin-top: 28px;
+    }
+
+    .store {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 15px 18px;
+      border-radius: 17px;
+      background: #FFD21F;
+      color: #111827;
+      text-decoration: none;
+    }
+
+    .store strong {
+      font-size: 16px;
+    }
+
+    .store span {
+      font-size: 13px;
+      opacity: .75;
+    }
+
+    .store.disabled {
+      background: #232D3D;
+      color: #98A2B3;
+    }
+
+    .footer {
+      margin-top: 26px;
+      color: #667085;
+      font-size: 12px;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="card">
+    <div class="logo">
+      <span class="auto">AUTO</span><span class="dear">DEAR</span>
+    </div>
+
+    <h1>Всё для автомобиля — в одном приложении</h1>
+
+    <p class="lead">
+      Проверка автомобиля, сервисы рядом, объявления, гараж,
+      история обслуживания, чаты и AI-помощник.
+    </p>
+
+    <div class="stores">
+      ${storeButton(
+        googlePlayUrl,
+        "Google Play",
+        "Версия для Android"
+      )}
+
+      ${storeButton(
+        ruStoreUrl,
+        "RuStore",
+        "Версия для Android"
+      )}
+
+      ${storeButton(
+        appStoreUrl,
+        "App Store",
+        "Версия для iPhone"
+      )}
+    </div>
+
+    <div class="footer">
+      AUTODEAR © ${new Date().getFullYear()}
+    </div>
+  </main>
+</body>
+</html>`);
+});
+
 app.get("/version", (req, res) => {
   res.json({
     ok: true,
