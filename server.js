@@ -1104,7 +1104,7 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       invType: "READ_ONLY",
       amount: amountKopecks,
       properties: [
-        targetId,
+        email,
       ],
     };
 
