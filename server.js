@@ -1022,6 +1022,237 @@ app.post("/api/vehicle-check/report", async (req, res) => {
 });
 
 
+
+
+
+app.post("/api/payments/ckassa/create", async (req, res) => {
+  try {
+    const apiLoginAuthorization = String(
+      process.env.ApiLoginAuthorization || ""
+    ).trim();
+
+    const apiAuthorization = String(
+      process.env.ApiAutorization ||
+      process.env.ApiAuthorization ||
+      ""
+    ).trim();
+
+    const servCode = String(
+      process.env.servCode || ""
+    ).trim();
+
+    if (
+      !apiLoginAuthorization ||
+      !apiAuthorization ||
+      !servCode
+    ) {
+      console.error(
+        "[AUTODEAR][CKASSA][CONFIG_MISSING]",
+        {
+          hasApiLoginAuthorization:
+            Boolean(apiLoginAuthorization),
+          hasApiAuthorization:
+            Boolean(apiAuthorization),
+          hasServCode:
+            Boolean(servCode),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "CKASSA_CONFIG_MISSING",
+      });
+    }
+
+    const email = String(
+      req.body?.email || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    const purpose = String(
+      req.body?.purpose || ""
+    ).trim();
+
+    const targetId = String(
+      req.body?.targetId || ""
+    ).trim();
+
+    const paymentMethod = String(
+      req.body?.paymentMethod || "sbp"
+    ).trim();
+
+    const amountKopecks = Number(
+      req.body?.amountKopecks
+    );
+
+    if (
+      purpose !== "ads_wallet_topup" ||
+      !targetId ||
+      !Number.isInteger(amountKopecks) ||
+      amountKopecks < 50000
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_PAYMENT_REQUEST",
+      });
+    }
+
+    const payload = {
+      servCode,
+      startPaySelect: true,
+      invType: "READ_ONLY",
+      amount: amountKopecks,
+      properties: [
+        targetId,
+      ],
+    };
+
+    console.log(
+      "[AUTODEAR][CKASSA][CREATE_REQUEST]",
+      {
+        amountKopecks,
+        purpose,
+        targetId,
+        paymentMethod,
+        hasEmail: Boolean(email),
+        servCode,
+      }
+    );
+
+    const controller =
+      new AbortController();
+
+    const timeout =
+      setTimeout(() => {
+        controller.abort();
+      }, 60000);
+
+    let ckassaResponse;
+
+    try {
+      ckassaResponse = await fetch(
+        "https://api2.ckassa.ru/api-shop/rs/open/invoice/create2",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/plain, application/json",
+            ApiLoginAuthorization:
+              apiLoginAuthorization,
+            ApiAuthorization:
+              apiAuthorization,
+          },
+          body:
+            JSON.stringify(payload),
+          signal:
+            controller.signal,
+        }
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const raw = String(
+      await ckassaResponse.text()
+    ).trim();
+
+    if (!ckassaResponse.ok) {
+      console.error(
+        "[AUTODEAR][CKASSA][CREATE_FAILED]",
+        {
+          status:
+            ckassaResponse.status,
+          body:
+            raw.slice(0, 1000),
+        }
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "CKASSA_CREATE_FAILED",
+        providerStatus:
+          ckassaResponse.status,
+      });
+    }
+
+    let paymentUrl = raw;
+
+    if (
+      raw.startsWith('"') &&
+      raw.endsWith('"')
+    ) {
+      try {
+        paymentUrl =
+          JSON.parse(raw);
+      } catch {}
+    }
+
+    paymentUrl = String(
+      paymentUrl || ""
+    ).trim();
+
+    if (
+      !paymentUrl.startsWith(
+        "https://"
+      )
+    ) {
+      console.error(
+        "[AUTODEAR][CKASSA][INVALID_PAYMENT_URL]",
+        {
+          body:
+            raw.slice(0, 1000),
+        }
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error:
+          "CKASSA_INVALID_PAYMENT_URL",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][CKASSA][CREATE_OK]",
+      {
+        amountKopecks,
+        targetId,
+        paymentUrlHost:
+          (() => {
+            try {
+              return new URL(
+                paymentUrl
+              ).host;
+            } catch {
+              return null;
+            }
+          })(),
+      }
+    );
+
+    return res.json({
+      ok: true,
+      paymentUrl,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][CKASSA][CREATE_ERROR]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.name ===
+        "AbortError"
+          ? "CKASSA_TIMEOUT"
+          : error?.message ||
+            "CKASSA_CREATE_ERROR",
+    });
+  }
+});
+
+
 app.post("/api/push/register-token", async (req, res) => {
   try {
     if (!supabase) {
