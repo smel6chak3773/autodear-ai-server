@@ -1086,17 +1086,27 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       req.body?.amountKopecks
     );
 
-    if (
-      purpose !== "ads_wallet_topup" ||
-      !targetId ||
-      !Number.isInteger(amountKopecks) ||
-      amountKopecks < 50000
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "INVALID_PAYMENT_REQUEST",
-      });
-    }
+      const allowedPurposes = [
+        "wallet_topup",
+        "ads_wallet_topup",
+      ];
+
+      const minimumAmountKopecks =
+        purpose === "ads_wallet_topup"
+          ? 50000
+          : 10000;
+
+      if (
+        !allowedPurposes.includes(purpose) ||
+        !targetId ||
+        !Number.isInteger(amountKopecks) ||
+        amountKopecks < minimumAmountKopecks
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "INVALID_PAYMENT_REQUEST",
+        });
+      }
 
     const payload = {
       servCode,
