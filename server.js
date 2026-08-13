@@ -2062,6 +2062,196 @@ app.post("/api/payments/ckassa/sync-new", async (req, res) => {
 });
 
 
+
+// ============================================================
+// AUTODEAR ADS — REAL SERVER WALLET
+// Supabase is the source of truth.
+// Client can read the wallet through AUTODEAR API,
+// but cannot modify the financial tables directly.
+// ============================================================
+
+app.get("/api/ads/wallet/:ownerId", async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const ownerId = String(
+      req.params?.ownerId || ""
+    ).trim();
+
+    if (!ownerId) {
+      return res.status(400).json({
+        ok: false,
+        error: "OWNER_ID_REQUIRED",
+      });
+    }
+
+    const {
+      data: wallet,
+      error: walletError,
+    } = await supabase
+      .from("ads_wallets")
+      .select(
+        "owner_id,available_kopecks,reserved_kopecks,spent_kopecks,updated_at"
+      )
+      .eq("owner_id", ownerId)
+      .maybeSingle();
+
+    if (walletError) {
+      console.error(
+        "[AUTODEAR][ADS][WALLET_GET_ERROR]",
+        {
+          ownerId,
+          code: walletError.code,
+          message: walletError.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "ADS_WALLET_GET_ERROR",
+      });
+    }
+
+    const {
+      data: transactions,
+      error: transactionsError,
+    } = await supabase
+      .from("ads_wallet_transactions")
+      .select(
+        "id,operation_key,owner_id,type,status,amount_kopecks,campaign_id,placement_id,event_id,external_payment_id,description,created_at,confirmed_at"
+      )
+      .eq("owner_id", ownerId)
+      .order("created_at", {
+        ascending: false,
+      })
+      .limit(100);
+
+    if (transactionsError) {
+      console.error(
+        "[AUTODEAR][ADS][WALLET_TRANSACTIONS_GET_ERROR]",
+        {
+          ownerId,
+          code: transactionsError.code,
+          message:
+            transactionsError.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "ADS_WALLET_TRANSACTIONS_GET_ERROR",
+      });
+    }
+
+    const result = {
+      wallet: {
+        ownerId,
+
+        availableKopecks:
+          Number(
+            wallet?.available_kopecks || 0
+          ),
+
+        reservedKopecks:
+          Number(
+            wallet?.reserved_kopecks || 0
+          ),
+
+        spentKopecks:
+          Number(
+            wallet?.spent_kopecks || 0
+          ),
+
+        updatedAt:
+          wallet?.updated_at ||
+          new Date().toISOString(),
+      },
+
+      transactions:
+        (transactions || []).map(
+          (item) => ({
+            id: item.id,
+
+            operationKey:
+              item.operation_key,
+
+            ownerId:
+              item.owner_id,
+
+            type:
+              item.type,
+
+            status:
+              item.status,
+
+            amountKopecks:
+              Number(
+                item.amount_kopecks || 0
+              ),
+
+            campaignId:
+              item.campaign_id || undefined,
+
+            placementId:
+              item.placement_id || undefined,
+
+            eventId:
+              item.event_id || undefined,
+
+            externalPaymentId:
+              item.external_payment_id ||
+              undefined,
+
+            description:
+              item.description,
+
+            createdAt:
+              item.created_at,
+
+            confirmedAt:
+              item.confirmed_at ||
+              undefined,
+          })
+        ),
+    };
+
+    console.log(
+      "[AUTODEAR][ADS][WALLET_GET_OK]",
+      {
+        ownerId,
+        availableKopecks:
+          result.wallet.availableKopecks,
+        transactions:
+          result.transactions.length,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][ADS][WALLET_GET_FATAL]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "ADS_WALLET_GET_FATAL",
+    });
+  }
+});
+
+
 app.post("/api/push/register-token", async (req, res) => {
   try {
     if (!supabase) {
