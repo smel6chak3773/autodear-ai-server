@@ -1960,6 +1960,18 @@ app.post("/api/payments/ckassa/sync-new", async (req, res) => {
 
         if (candidates.length === 0) {
           summary.notFound += 1;
+
+          console.warn(
+            "[AUTODEAR][CKASSA][SYNC_NEW_NOT_FOUND]",
+            {
+              regPayNum,
+              providerState,
+              amountKopecks,
+              email: email || null,
+              providerPayment,
+            }
+          );
+
           continue;
         }
 
