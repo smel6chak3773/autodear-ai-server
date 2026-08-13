@@ -1661,6 +1661,407 @@ app.post("/api/payments/ckassa/callback", async (req, res) => {
 });
 
 
+
+app.post("/api/payments/ckassa/sync-new", async (req, res) => {
+  try {
+    const expectedSyncKey = String(
+      process.env.CKASSA_SYNC_KEY || ""
+    ).trim();
+
+    const receivedSyncKey = String(
+      req.headers["x-autodear-sync-key"] || ""
+    ).trim();
+
+    if (
+      !expectedSyncKey ||
+      !receivedSyncKey ||
+      receivedSyncKey !== expectedSyncKey
+    ) {
+      return res.status(401).json({
+        ok: false,
+        error: "UNAUTHORIZED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const apiLoginAuthorization = String(
+      process.env.ApiLoginAuthorization || ""
+    ).trim();
+
+    const apiAuthorization = String(
+      process.env.ApiAutorization ||
+      process.env.ApiAuthorization ||
+      ""
+    ).trim();
+
+    if (
+      !apiLoginAuthorization ||
+      !apiAuthorization
+    ) {
+      return res.status(500).json({
+        ok: false,
+        error: "CKASSA_CONFIG_MISSING",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][CKASSA][SYNC_NEW_BEGIN]"
+    );
+
+    const controller =
+      new AbortController();
+
+    const timeout = setTimeout(
+      () => controller.abort(),
+      60000
+    );
+
+    let ckassaResponse;
+
+    try {
+      ckassaResponse = await fetch(
+        "https://api2.ckassa.ru/api-shop/rs/open/payments/new",
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            ApiLoginAuthorization:
+              apiLoginAuthorization,
+            ApiAuthorization:
+              apiAuthorization,
+          },
+          signal: controller.signal,
+        }
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const raw = String(
+      await ckassaResponse.text()
+    ).trim();
+
+    if (!ckassaResponse.ok) {
+      console.error(
+        "[AUTODEAR][CKASSA][SYNC_NEW_PROVIDER_ERROR]",
+        {
+          status: ckassaResponse.status,
+          body: raw.slice(0, 600),
+        }
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "CKASSA_SYNC_PROVIDER_ERROR",
+        providerStatus:
+          ckassaResponse.status,
+      });
+    }
+
+    let providerData;
+
+    try {
+      providerData = raw
+        ? JSON.parse(raw)
+        : {};
+    } catch {
+      console.error(
+        "[AUTODEAR][CKASSA][SYNC_NEW_INVALID_JSON]"
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "CKASSA_SYNC_INVALID_JSON",
+      });
+    }
+
+    /*
+     * Open API документирует:
+     * {
+     *   payments: [...]
+     * }
+     *
+     * Оставляем также поддержку массива,
+     * если провайдер вернёт его напрямую.
+     */
+    const payments = Array.isArray(
+      providerData
+    )
+      ? providerData
+      : Array.isArray(
+          providerData?.payments
+        )
+      ? providerData.payments
+      : [];
+
+    const summary = {
+      fetched: payments.length,
+      matched: 0,
+      credited: 0,
+      duplicate: 0,
+      notPaid: 0,
+      ambiguous: 0,
+      notFound: 0,
+      invalid: 0,
+      errors: 0,
+    };
+
+    for (const providerPayment of payments) {
+      const regPayNum = String(
+        providerPayment?.regPayNum || ""
+      ).trim();
+
+      const providerState = String(
+        providerPayment?.state || ""
+      )
+        .trim()
+        .toUpperCase();
+
+      const amountKopecks = Number(
+        providerPayment?.amount
+      );
+
+      if (
+        !regPayNum ||
+        !providerState ||
+        !Number.isInteger(
+          amountKopecks
+        ) ||
+        amountKopecks <= 0
+      ) {
+        summary.invalid += 1;
+        continue;
+      }
+
+      let email = "";
+
+      const properties =
+        providerPayment?.properties;
+
+      if (Array.isArray(properties)) {
+        for (const item of properties) {
+          const candidate = String(
+            item?.value || ""
+          )
+            .trim()
+            .toLowerCase();
+
+          if (candidate.includes("@")) {
+            email = candidate;
+            break;
+          }
+        }
+      } else if (
+        properties &&
+        typeof properties === "object"
+      ) {
+        for (const value of Object.values(
+          properties
+        )) {
+          const candidate = String(
+            value || ""
+          )
+            .trim()
+            .toLowerCase();
+
+          if (candidate.includes("@")) {
+            email = candidate;
+            break;
+          }
+        }
+      }
+
+      /*
+       * Сначала ищем уже связанный regPayNum.
+       */
+      const {
+        data: boundPayment,
+        error: boundError,
+      } = await supabase
+        .from("ckassa_payments")
+        .select(
+          "id,email,amount_kopecks,status,reg_pay_num"
+        )
+        .eq(
+          "reg_pay_num",
+          regPayNum
+        )
+        .maybeSingle();
+
+      if (boundError) {
+        summary.errors += 1;
+        continue;
+      }
+
+      let localPayment =
+        boundPayment || null;
+
+      /*
+       * Если regPayNum ещё не привязан,
+       * ищем pending по сумме + email.
+       *
+       * При нескольких совпадениях ничего
+       * автоматически не начисляем.
+       */
+      if (!localPayment) {
+        let pendingQuery = supabase
+          .from("ckassa_payments")
+          .select(
+            "id,email,amount_kopecks,status,reg_pay_num,created_at"
+          )
+          .eq(
+            "amount_kopecks",
+            amountKopecks
+          )
+          .in(
+            "status",
+            [
+              "pending",
+              "processing",
+              "paid",
+            ]
+          )
+          .order(
+            "created_at",
+            {
+              ascending: false,
+            }
+          )
+          .limit(10);
+
+        if (email) {
+          pendingQuery =
+            pendingQuery.eq(
+              "email",
+              email
+            );
+        }
+
+        const {
+          data: pendingPayments,
+          error: pendingError,
+        } = await pendingQuery;
+
+        if (pendingError) {
+          summary.errors += 1;
+          continue;
+        }
+
+        const candidates =
+          Array.isArray(pendingPayments)
+            ? pendingPayments
+            : [];
+
+        if (candidates.length === 0) {
+          summary.notFound += 1;
+          continue;
+        }
+
+        if (candidates.length !== 1) {
+          summary.ambiguous += 1;
+
+          console.warn(
+            "[AUTODEAR][CKASSA][SYNC_NEW_AMBIGUOUS]",
+            {
+              regPayNum,
+              amountKopecks,
+              hasEmail: Boolean(email),
+              candidates:
+                candidates.length,
+            }
+          );
+
+          continue;
+        }
+
+        localPayment =
+          candidates[0];
+      }
+
+      summary.matched += 1;
+
+      const {
+        data: creditResult,
+        error: creditError,
+      } = await supabase.rpc(
+        "autodear_credit_ckassa_payment",
+        {
+          p_payment_id:
+            localPayment.id,
+          p_reg_pay_num:
+            regPayNum,
+          p_provider_state:
+            providerState,
+          p_callback_payload:
+            providerPayment || {},
+        }
+      );
+
+      if (creditError) {
+        summary.errors += 1;
+
+        console.error(
+          "[AUTODEAR][CKASSA][SYNC_NEW_CREDIT_ERROR]",
+          {
+            paymentId:
+              localPayment.id,
+            regPayNum,
+            code:
+              creditError.code,
+            message:
+              creditError.message,
+          }
+        );
+
+        continue;
+      }
+
+      if (
+        creditResult?.duplicate === true
+      ) {
+        summary.duplicate += 1;
+      } else if (
+        creditResult?.credited === true
+      ) {
+        summary.credited += 1;
+      } else {
+        summary.notPaid += 1;
+      }
+    }
+
+    console.log(
+      "[AUTODEAR][CKASSA][SYNC_NEW_OK]",
+      summary
+    );
+
+    return res.json({
+      ok: true,
+      summary,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][CKASSA][SYNC_NEW_ERROR]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.name === "AbortError"
+          ? "CKASSA_SYNC_TIMEOUT"
+          : error?.message ||
+            "CKASSA_SYNC_ERROR",
+    });
+  }
+});
+
+
 app.post("/api/push/register-token", async (req, res) => {
   try {
     if (!supabase) {
