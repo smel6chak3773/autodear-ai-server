@@ -2082,6 +2082,244 @@ app.post("/api/payments/ckassa/sync-new", async (req, res) => {
 // but cannot modify the financial tables directly.
 // ============================================================
 
+
+// ============================================================
+// AUTODEAR CENTRAL WALLET — PERSONAL / BUSINESS
+//
+// Supabase is the financial source of truth.
+//
+// One owner may have two independent wallets:
+//   personal
+//   business
+//
+// The client may READ financial state through AUTODEAR API,
+// but must never create money locally.
+// ============================================================
+
+app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const ownerId = String(
+      req.params?.ownerId || ""
+    ).trim();
+
+    const walletType = String(
+      req.params?.walletType || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!ownerId) {
+      return res.status(400).json({
+        ok: false,
+        error: "OWNER_ID_REQUIRED",
+      });
+    }
+
+    if (
+      walletType !== "personal" &&
+      walletType !== "business"
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_WALLET_TYPE",
+      });
+    }
+
+    const {
+      data: wallet,
+      error: walletError,
+    } = await supabase
+      .from("wallets")
+      .select(
+        "owner_id,wallet_type,owner_type,balance,updated_at"
+      )
+      .eq(
+        "owner_id",
+        ownerId
+      )
+      .eq(
+        "wallet_type",
+        walletType
+      )
+      .maybeSingle();
+
+    if (walletError) {
+      console.error(
+        "[AUTODEAR][WALLET][GET_ERROR]",
+        {
+          ownerId,
+          walletType,
+          code:
+            walletError.code,
+          message:
+            walletError.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "WALLET_GET_ERROR",
+      });
+    }
+
+    const {
+      data: transactions,
+      error: transactionsError,
+    } = await supabase
+      .from("wallet_transactions")
+      .select(
+        "id,owner_id,wallet_type,type,title,amount,balance_after,method,external_payment_id,created_at"
+      )
+      .eq(
+        "owner_id",
+        ownerId
+      )
+      .eq(
+        "wallet_type",
+        walletType
+      )
+      .order(
+        "created_at",
+        {
+          ascending: false,
+        }
+      )
+      .limit(100);
+
+    if (transactionsError) {
+      console.error(
+        "[AUTODEAR][WALLET][TRANSACTIONS_GET_ERROR]",
+        {
+          ownerId,
+          walletType,
+          code:
+            transactionsError.code,
+          message:
+            transactionsError.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "WALLET_TRANSACTIONS_GET_ERROR",
+      });
+    }
+
+    /*
+     * Если отдельного кошелька ещё нет,
+     * возвращаем корректный пустой кошелёк.
+     *
+     * GET никогда не создаёт финансовую запись.
+     * Она появится при первой реальной операции.
+     */
+    const result = {
+      wallet: {
+        ownerId,
+
+        walletType,
+
+        ownerType:
+          wallet?.owner_type ||
+          (
+            walletType === "business"
+              ? "business"
+              : "user"
+          ),
+
+        balance:
+          Number(
+            wallet?.balance || 0
+          ),
+
+        updatedAt:
+          wallet?.updated_at ||
+          null,
+      },
+
+      transactions:
+        (transactions || []).map(
+          (item) => ({
+            id:
+              item.id,
+
+            ownerId:
+              item.owner_id,
+
+            walletType:
+              item.wallet_type,
+
+            type:
+              item.type,
+
+            title:
+              item.title,
+
+            amount:
+              Number(
+                item.amount || 0
+              ),
+
+            balanceAfter:
+              Number(
+                item.balance_after || 0
+              ),
+
+            method:
+              item.method ||
+              undefined,
+
+            externalPaymentId:
+              item.external_payment_id ||
+              undefined,
+
+            createdAt:
+              item.created_at,
+          })
+        ),
+    };
+
+    console.log(
+      "[AUTODEAR][WALLET][GET_OK]",
+      {
+        ownerId,
+        walletType,
+        balance:
+          result.wallet.balance,
+        transactions:
+          result.transactions.length,
+        exists:
+          Boolean(wallet),
+      }
+    );
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WALLET][GET_FATAL]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "WALLET_GET_FATAL",
+    });
+  }
+});
+
+
 app.get("/api/ads/wallet/:ownerId", async (req, res) => {
   try {
     if (!supabase) {
