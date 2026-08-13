@@ -1097,9 +1097,13 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
         "ads_wallet_topup",
       ];
 
+      // TEMP 2026-08-13:
+      // CKassa integration test minimum = 50 RUB.
+      // IMPORTANT: restore Ads product minimum to 50000
+      // after the real end-to-end payment test.
       const minimumAmountKopecks =
         purpose === "ads_wallet_topup"
-          ? 50000
+          ? 5000
           : 10000;
 
       if (
