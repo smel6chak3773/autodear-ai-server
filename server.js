@@ -1082,6 +1082,12 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       req.body?.paymentMethod || "sbp"
     ).trim();
 
+    const requestedWalletType = String(
+      req.body?.walletType || ""
+    )
+      .trim()
+      .toLowerCase();
+
     const amountKopecks = Number(
       req.body?.amountKopecks
     );
@@ -1222,11 +1228,87 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       });
     }
 
+    if (!supabase) {
+      console.error(
+        "[AUTODEAR][CKASSA][PAYMENT_REGISTRY_UNAVAILABLE]"
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const walletType =
+      purpose === "ads_wallet_topup"
+        ? "ads"
+        : requestedWalletType === "business"
+        ? "business"
+        : "personal";
+
+    const paymentRecord = {
+      provider: "ckassa",
+      purpose,
+      target_id: targetId,
+      wallet_type: walletType,
+      email,
+      amount_kopecks: amountKopecks,
+      payment_method: paymentMethod,
+      invoice_url: paymentUrl,
+      status: "pending",
+    };
+
+    const {
+      data: storedPayment,
+      error: paymentStoreError,
+    } = await supabase
+      .from("ckassa_payments")
+      .upsert(
+        paymentRecord,
+        {
+          onConflict: "invoice_url",
+          ignoreDuplicates: false,
+        }
+      )
+      .select(
+        "id,purpose,target_id,wallet_type,amount_kopecks,status,created_at"
+      )
+      .single();
+
+    if (paymentStoreError) {
+      console.error(
+        "[AUTODEAR][CKASSA][PAYMENT_REGISTRY_ERROR]",
+        {
+          code: paymentStoreError.code,
+          message: paymentStoreError.message,
+          details: paymentStoreError.details,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "PAYMENT_REGISTRY_ERROR",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][CKASSA][PAYMENT_REGISTERED]",
+      {
+        paymentId: storedPayment?.id || null,
+        purpose,
+        targetId,
+        amountKopecks,
+        status: storedPayment?.status || "pending",
+      }
+    );
+
     console.log(
       "[AUTODEAR][CKASSA][CREATE_OK]",
       {
         amountKopecks,
         targetId,
+        paymentId:
+          storedPayment?.id || null,
         paymentUrlHost:
           (() => {
             try {
@@ -1243,6 +1325,8 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
     return res.json({
       ok: true,
       paymentUrl,
+      paymentId:
+        storedPayment?.id || null,
     });
   } catch (error) {
     console.error(
@@ -1258,6 +1342,316 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
           ? "CKASSA_TIMEOUT"
           : error?.message ||
             "CKASSA_CREATE_ERROR",
+    });
+  }
+});
+
+
+
+app.get("/api/payments/ckassa/callback", (req, res) => {
+  return res.json({
+    ok: true,
+    service: "AUTODEAR CKassa callback",
+    ready: true,
+  });
+});
+
+
+app.post("/api/payments/ckassa/callback", async (req, res) => {
+  try {
+    if (!supabase) {
+      console.error(
+        "[AUTODEAR][CKASSA][CALLBACK_SUPABASE_UNAVAILABLE]"
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const regPayNum = String(
+      req.body?.regPayNum || ""
+    ).trim();
+
+    const providerState = String(
+      req.body?.state || ""
+    )
+      .trim()
+      .toUpperCase();
+
+    const callbackAmountKopecks = Number(
+      req.body?.amount
+    );
+
+    const callbackProperty =
+      req.body?.property ||
+      req.body?.map ||
+      null;
+
+    let callbackEmail = "";
+
+    if (
+      callbackProperty &&
+      typeof callbackProperty === "object"
+    ) {
+      for (const value of Object.values(
+        callbackProperty
+      )) {
+        const candidate = String(
+          value || ""
+        )
+          .trim()
+          .toLowerCase();
+
+        if (candidate.includes("@")) {
+          callbackEmail = candidate;
+          break;
+        }
+      }
+    }
+
+    console.log(
+      "[AUTODEAR][CKASSA][CALLBACK_RECEIVED]",
+      {
+        regPayNum,
+        providerState,
+        callbackAmountKopecks,
+        hasEmail: Boolean(callbackEmail),
+      }
+    );
+
+    if (
+      !regPayNum ||
+      !providerState ||
+      !Number.isInteger(
+        callbackAmountKopecks
+      ) ||
+      callbackAmountKopecks <= 0
+    ) {
+      console.error(
+        "[AUTODEAR][CKASSA][CALLBACK_INVALID]",
+        {
+          regPayNum,
+          providerState,
+          callbackAmountKopecks,
+        }
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_CKASSA_CALLBACK",
+      });
+    }
+
+    let paymentQuery = supabase
+      .from("ckassa_payments")
+      .select(
+        "id,purpose,target_id,wallet_type,email,amount_kopecks,status,reg_pay_num,created_at"
+      )
+      .eq(
+        "amount_kopecks",
+        callbackAmountKopecks
+      )
+      .in(
+        "status",
+        [
+          "pending",
+          "processing",
+          "paid",
+          "credited",
+        ]
+      )
+      .order(
+        "created_at",
+        {
+          ascending: false,
+        }
+      )
+      .limit(10);
+
+    if (callbackEmail) {
+      paymentQuery =
+        paymentQuery.eq(
+          "email",
+          callbackEmail
+        );
+    }
+
+    const {
+      data: candidatePayments,
+      error: candidateError,
+    } = await paymentQuery;
+
+    if (candidateError) {
+      console.error(
+        "[AUTODEAR][CKASSA][CALLBACK_LOOKUP_ERROR]",
+        {
+          code: candidateError.code,
+          message:
+            candidateError.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "CKASSA_CALLBACK_LOOKUP_ERROR",
+      });
+    }
+
+    const candidates =
+      Array.isArray(candidatePayments)
+        ? candidatePayments
+        : [];
+
+    let payment = null;
+
+    const alreadyBound =
+      candidates.find(
+        (item) =>
+          String(
+            item.reg_pay_num || ""
+          ) === regPayNum
+      );
+
+    if (alreadyBound) {
+      payment = alreadyBound;
+    } else if (
+      candidates.length === 1
+    ) {
+      payment = candidates[0];
+    } else {
+      const pendingCandidates =
+        candidates.filter(
+          (item) =>
+            item.status ===
+              "pending" ||
+            item.status ===
+              "processing"
+        );
+
+      if (
+        pendingCandidates.length === 1
+      ) {
+        payment =
+          pendingCandidates[0];
+      }
+    }
+
+    if (!payment) {
+      console.error(
+        "[AUTODEAR][CKASSA][CALLBACK_PAYMENT_NOT_FOUND]",
+        {
+          regPayNum,
+          callbackAmountKopecks,
+          callbackEmail:
+            callbackEmail || null,
+          candidates:
+            candidates.length,
+        }
+      );
+
+      return res.status(404).json({
+        ok: false,
+        error:
+          "CKASSA_PAYMENT_NOT_FOUND",
+      });
+    }
+
+    if (
+      Number(payment.amount_kopecks) !==
+      callbackAmountKopecks
+    ) {
+      console.error(
+        "[AUTODEAR][CKASSA][CALLBACK_AMOUNT_MISMATCH]",
+        {
+          paymentId:
+            payment.id,
+          expected:
+            payment.amount_kopecks,
+          received:
+            callbackAmountKopecks,
+        }
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error:
+          "CKASSA_AMOUNT_MISMATCH",
+      });
+    }
+
+    const {
+      data: creditResult,
+      error: creditError,
+    } = await supabase.rpc(
+      "autodear_credit_ckassa_payment",
+      {
+        p_payment_id:
+          payment.id,
+        p_reg_pay_num:
+          regPayNum,
+        p_provider_state:
+          providerState,
+        p_callback_payload:
+          req.body || {},
+      }
+    );
+
+    if (creditError) {
+      console.error(
+        "[AUTODEAR][CKASSA][CALLBACK_CREDIT_ERROR]",
+        {
+          paymentId:
+            payment.id,
+          regPayNum,
+          code:
+            creditError.code,
+          message:
+            creditError.message,
+          details:
+            creditError.details,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "CKASSA_CREDIT_ERROR",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][CKASSA][CALLBACK_OK]",
+      {
+        paymentId:
+          payment.id,
+        regPayNum,
+        providerState,
+        result:
+          creditResult,
+      }
+    );
+
+    return res.status(200).json({
+      ok: true,
+      paymentId:
+        payment.id,
+      result:
+        creditResult,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][CKASSA][CALLBACK_ERROR]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        "CKASSA_CALLBACK_ERROR",
     });
   }
 });
