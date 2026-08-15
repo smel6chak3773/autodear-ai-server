@@ -1274,27 +1274,185 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       .trim()
       .toLowerCase();
 
-    const amountKopecks = Number(
+    let amountKopecks = Number(
       req.body?.amountKopecks
     );
 
-      const allowedPurposes = [
-        "wallet_topup",
-        "ads_wallet_topup",
-      ];
+    const allowedPurposes = [
+      "wallet_topup",
+      "ads_wallet_topup",
+      "vehicle_report_package",
+    ];
 
+    if (
+      !allowedPurposes.includes(purpose) ||
+      !targetId
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_PAYMENT_REQUEST",
+      });
+    }
+
+    let vehicleReportOrder = null;
+
+    if (purpose === "vehicle_report_package") {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const reportType = String(
+        req.body?.reportType || ""
+      )
+        .trim()
+        .toLowerCase();
+
+      const quantity = Number(
+        req.body?.quantity
+      );
+
+      if (
+        ![
+          "basic",
+          "extended",
+          "maximum",
+        ].includes(reportType) ||
+        !Number.isInteger(quantity) ||
+        quantity <= 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "INVALID_VEHICLE_REPORT_PACKAGE",
+        });
+      }
+
+      const {
+        data: product,
+        error: productError,
+      } = await supabase
+        .from("vehicle_report_products")
+        .select(
+          "id,report_type,quantity,unit_price_kopecks,total_price_kopecks,is_active"
+        )
+        .eq("report_type", reportType)
+        .eq("quantity", quantity)
+        .eq("is_active", true)
+        .maybeSingle();
+
+      if (productError) {
+        console.error(
+          "[AUTODEAR][VEHICLE_REPORT][PRODUCT_ERROR]",
+          {
+            reportType,
+            quantity,
+            code: productError.code,
+            message: productError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "VEHICLE_REPORT_PRODUCT_ERROR",
+        });
+      }
+
+      if (!product) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "VEHICLE_REPORT_PRODUCT_NOT_FOUND",
+        });
+      }
+
+      amountKopecks = Number(
+        product.total_price_kopecks
+      );
+
+      if (
+        !Number.isInteger(amountKopecks) ||
+        amountKopecks <= 0
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "INVALID_VEHICLE_REPORT_PRODUCT_PRICE",
+        });
+      }
+
+      const {
+        data: order,
+        error: orderError,
+      } = await supabase
+        .from("vehicle_report_orders")
+        .insert({
+          user_id: targetId,
+          product_id: product.id,
+          report_type: product.report_type,
+          quantity: product.quantity,
+          unit_price_kopecks:
+            Number(
+              product.unit_price_kopecks
+            ),
+          total_price_kopecks:
+            amountKopecks,
+          status: "pending",
+        })
+        .select(
+          "id,user_id,product_id,report_type,quantity,unit_price_kopecks,total_price_kopecks,status"
+        )
+        .single();
+
+      if (orderError || !order) {
+        console.error(
+          "[AUTODEAR][VEHICLE_REPORT][ORDER_CREATE_ERROR]",
+          {
+            targetId,
+            reportType,
+            quantity,
+            code:
+              orderError?.code || null,
+            message:
+              orderError?.message || null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "VEHICLE_REPORT_ORDER_CREATE_ERROR",
+        });
+      }
+
+      vehicleReportOrder = order;
+
+      console.log(
+        "[AUTODEAR][VEHICLE_REPORT][ORDER_CREATED]",
+        {
+          orderId: order.id,
+          userId: targetId,
+          reportType:
+            order.report_type,
+          quantity:
+            order.quantity,
+          amountKopecks,
+        }
+      );
+    } else {
       // TEMP 2026-08-13:
       // CKassa integration test minimum = 50 RUB.
-      // IMPORTANT: restore Ads product minimum to 50000
-      // after the real end-to-end payment test.
+      // Restore Ads minimum to 500 RUB
+      // after the payment integration test.
       const minimumAmountKopecks =
         purpose === "ads_wallet_topup"
           ? 5000
           : 10000;
 
       if (
-        !allowedPurposes.includes(purpose) ||
-        !targetId ||
         !Number.isInteger(amountKopecks) ||
         amountKopecks < minimumAmountKopecks
       ) {
@@ -1303,6 +1461,7 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
           error: "INVALID_PAYMENT_REQUEST",
         });
       }
+    }
 
     const payload = {
       servCode,
@@ -1432,14 +1591,31 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
     const walletType =
       purpose === "ads_wallet_topup"
         ? "ads"
+        : purpose ===
+          "vehicle_report_package"
+        ? "vehicle_report"
         : requestedWalletType === "business"
         ? "business"
         : "personal";
 
+    const paymentTargetId =
+      purpose ===
+        "vehicle_report_package"
+        ? vehicleReportOrder?.id
+        : targetId;
+
+    if (!paymentTargetId) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "PAYMENT_TARGET_ID_NOT_RESOLVED",
+      });
+    }
+
     const paymentRecord = {
       provider: "ckassa",
       purpose,
-      target_id: targetId,
+      target_id: paymentTargetId,
       wallet_type: walletType,
       email,
       amount_kopecks: amountKopecks,
@@ -1481,6 +1657,63 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       });
     }
 
+    if (
+      purpose ===
+        "vehicle_report_package" &&
+      vehicleReportOrder
+    ) {
+      const {
+        error: orderPaymentError,
+      } = await supabase
+        .from("vehicle_report_orders")
+        .update({
+          ckassa_payment_id:
+            storedPayment.id,
+          updated_at:
+            new Date().toISOString(),
+        })
+        .eq(
+          "id",
+          vehicleReportOrder.id
+        )
+        .eq(
+          "user_id",
+          targetId
+        );
+
+      if (orderPaymentError) {
+        console.error(
+          "[AUTODEAR][VEHICLE_REPORT][ORDER_PAYMENT_LINK_ERROR]",
+          {
+            orderId:
+              vehicleReportOrder.id,
+            paymentId:
+              storedPayment.id,
+            code:
+              orderPaymentError.code,
+            message:
+              orderPaymentError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "VEHICLE_REPORT_ORDER_PAYMENT_LINK_ERROR",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][VEHICLE_REPORT][ORDER_PAYMENT_LINKED]",
+        {
+          orderId:
+            vehicleReportOrder.id,
+          paymentId:
+            storedPayment.id,
+        }
+      );
+    }
+
     console.log(
       "[AUTODEAR][CKASSA][PAYMENT_REGISTERED]",
       {
@@ -1517,6 +1750,9 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       paymentUrl,
       paymentId:
         storedPayment?.id || null,
+      orderId:
+        vehicleReportOrder?.id || null,
+      amountKopecks,
     });
   } catch (error) {
     console.error(
@@ -1772,11 +2008,29 @@ app.post("/api/payments/ckassa/callback", async (req, res) => {
       });
     }
 
+    const creditRpcName =
+      payment.purpose ===
+        "vehicle_report_package"
+        ? "autodear_credit_vehicle_report_ckassa_payment"
+        : "autodear_credit_ckassa_payment";
+
+    console.log(
+      "[AUTODEAR][CKASSA][CREDIT_ROUTE]",
+      {
+        paymentId:
+          payment.id,
+        purpose:
+          payment.purpose,
+        rpc:
+          creditRpcName,
+      }
+    );
+
     const {
       data: creditResult,
       error: creditError,
     } = await supabase.rpc(
-      "autodear_credit_ckassa_payment",
+      creditRpcName,
       {
         p_payment_id:
           payment.id,
@@ -2185,10 +2439,67 @@ app.post("/api/payments/ckassa/sync-new", async (req, res) => {
       summary.matched += 1;
 
       const {
+        data: routingPayment,
+        error: routingPaymentError,
+      } = await supabase
+        .from("ckassa_payments")
+        .select(
+          "purpose,target_id"
+        )
+        .eq(
+          "id",
+          localPayment.id
+        )
+        .single();
+
+      if (
+        routingPaymentError ||
+        !routingPayment
+      ) {
+        summary.errors += 1;
+
+        console.error(
+          "[AUTODEAR][CKASSA][SYNC_NEW_ROUTING_ERROR]",
+          {
+            paymentId:
+              localPayment.id,
+            code:
+              routingPaymentError?.code ||
+              null,
+            message:
+              routingPaymentError?.message ||
+              "PAYMENT_ROUTING_NOT_FOUND",
+          }
+        );
+
+        continue;
+      }
+
+      const syncCreditRpcName =
+        routingPayment.purpose ===
+          "vehicle_report_package"
+          ? "autodear_credit_vehicle_report_ckassa_payment"
+          : "autodear_credit_ckassa_payment";
+
+      console.log(
+        "[AUTODEAR][CKASSA][SYNC_NEW_CREDIT_ROUTE]",
+        {
+          paymentId:
+            localPayment.id,
+          purpose:
+            routingPayment.purpose,
+          targetId:
+            routingPayment.target_id,
+          rpc:
+            syncCreditRpcName,
+        }
+      );
+
+      const {
         data: creditResult,
         error: creditError,
       } = await supabase.rpc(
-        "autodear_credit_ckassa_payment",
+        syncCreditRpcName,
         {
           p_payment_id:
             localPayment.id,
