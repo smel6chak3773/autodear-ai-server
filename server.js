@@ -154,6 +154,33 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/api/auth/me", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const userId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    userId,
+    email:
+      authResult?.user?.email ||
+      null,
+  });
+});
+
 app.get("/download", (req, res) => {
   const googlePlayUrl = String(process.env.AUTODEAR_GOOGLE_PLAY_URL || "").trim();
   const ruStoreUrl = String(process.env.AUTODEAR_RUSTORE_URL || "").trim();
