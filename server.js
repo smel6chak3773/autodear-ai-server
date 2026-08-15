@@ -872,10 +872,94 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       return json;
     };
 
+    const callOptionalAvtoVinCod = async (
+      path,
+      sourceName
+    ) => {
+      const url =
+        `https://api.avtovincod.ru${path}`;
+
+      const startedAt = Date.now();
+
+      console.log(
+        "[AUTODEAR][VEHICLE_CHECK][SOURCE_BEGIN]",
+        {
+          source: sourceName,
+        }
+      );
+
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          headers: {
+            Authorization:
+              `Bearer ${token}`,
+            Accept: "application/json",
+          },
+        });
+
+        const json =
+          await response
+            .json()
+            .catch(() => null);
+
+        console.log(
+          "[AUTODEAR][VEHICLE_CHECK][SOURCE_RESPONSE]",
+          {
+            source: sourceName,
+            status: response.status,
+            success:
+              json?.success ?? null,
+            ms:
+              Date.now() - startedAt,
+          }
+        );
+
+        if (!response.ok || !json) {
+          return {
+            success: 0,
+            unavailable: true,
+            httpStatus:
+              response.status,
+            code:
+              json?.code || null,
+            error:
+              json?.error ||
+              `AVTOVINCODE_HTTP_${response.status}`,
+          };
+        }
+
+        return json;
+      } catch (error) {
+        console.warn(
+          "[AUTODEAR][VEHICLE_CHECK][SOURCE_ERROR]",
+          {
+            source: sourceName,
+            message:
+              error?.message ||
+              String(error),
+            ms:
+              Date.now() - startedAt,
+          }
+        );
+
+        return {
+          success: 0,
+          unavailable: true,
+          error:
+            error?.message ||
+            String(error),
+        };
+      }
+    };
+
     let vin = inputVin;
     let numberResult = null;
 
-    const directCacheKey = vin ? `vin:${vin}` : "";
+    const directCacheKey =
+      vin
+        ? `vin:v2:${vin}`
+        : "";
     if (directCacheKey && vehicleCheckCache.has(directCacheKey)) {
       return res.json(vehicleCheckCache.get(directCacheKey));
     }
@@ -904,9 +988,21 @@ app.post("/api/vehicle-check/report", async (req, res) => {
 
     if (!vin) return res.status(400).json({ ok: false, error: "VIN_REQUIRED" });
 
-    const [registration, score] = await Promise.all([
-      callAvtoVinCod(`/vin?vin=${encodeURIComponent(vin)}`),
-      callAvtoVinCod(`/score?vin=${encodeURIComponent(vin)}`),
+    const [
+      registration,
+      score,
+      accidents,
+    ] = await Promise.all([
+      callAvtoVinCod(
+        `/vin?vin=${encodeURIComponent(vin)}`
+      ),
+      callAvtoVinCod(
+        `/score?vin=${encodeURIComponent(vin)}`
+      ),
+      callOptionalAvtoVinCod(
+        `/accidents?vin=${encodeURIComponent(vin)}`,
+        "accidents"
+      ),
     ]);
 
     if (!registration?.success && !score?.success) {
@@ -945,6 +1041,60 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       ? record.ownershipPeriods
       : [];
 
+    const accidentRecords =
+      Array.isArray(accidents?.records)
+        ? accidents.records
+        : [];
+
+    const accidentsChecked =
+      accidents?.success === 1;
+
+    const hasAccidents =
+      accidentsChecked
+        ? Boolean(
+            accidents?.hasAccidents ||
+            accidentRecords.length > 0
+          )
+        : false;
+
+    const accidentCount =
+      accidentsChecked
+        ? Number(
+            accidents?.found ??
+            accidentRecords.length
+          )
+        : 0;
+
+    console.log(
+      "[AUTODEAR][VEHICLE_CHECK][ACCIDENTS]",
+      {
+        vin,
+        success:
+          accidents?.success ?? null,
+        checked:
+          accidentsChecked,
+        hasAccidents:
+          accidentsChecked
+            ? hasAccidents
+            : null,
+        found:
+          accidentsChecked
+            ? accidentCount
+            : null,
+        notInArchive:
+          Boolean(
+            accidents?.notInArchive
+          ),
+        archival:
+          Boolean(
+            accidents?.archival
+          ),
+        checkedAt:
+          accidents?.checkedAt ||
+          null,
+      }
+    );
+
     const finalReport = {
       ok: true,
       provider: "avtovincode",
@@ -953,6 +1103,7 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       raw: {
         registration,
         score,
+        accidents,
       },
       result: {
         gibdd: {
@@ -981,7 +1132,27 @@ app.post("/api/vehicle-check/report", async (req, res) => {
           items: score?.restrictions || [],
           restricted: Boolean(score?.status?.restricted),
         },
-        dtp: null,
+        dtp:
+          accidentsChecked
+            ? {
+                available: true,
+                archival:
+                  Boolean(
+                    accidents?.archival
+                  ),
+                dataNote:
+                  accidents?.dataNote ||
+                  null,
+                checkedAt:
+                  accidents?.checkedAt ||
+                  null,
+                hasAccidents,
+                count:
+                  accidentCount,
+                items:
+                  accidentRecords,
+              }
+            : null,
         wanted: {
           items: score?.searches || [],
           wanted: Boolean(score?.status?.wanted),
@@ -990,27 +1161,42 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       },
       ai: {
         riskLevel:
-          score?.status?.restricted || score?.status?.wanted || score?.status?.spec_wanted
+          score?.status?.restricted ||
+          score?.status?.wanted ||
+          score?.status?.spec_wanted
             ? "high"
-            : ownershipPeriods.length >= 6
+            : hasAccidents ||
+                ownershipPeriods.length >= 6
               ? "medium"
               : "low",
+
         title:
-          score?.status?.restricted || score?.status?.wanted || score?.status?.spec_wanted
+          score?.status?.restricted ||
+          score?.status?.wanted ||
+          score?.status?.spec_wanted
             ? "Высокий риск"
-            : ownershipPeriods.length >= 6
+            : hasAccidents ||
+                ownershipPeriods.length >= 6
               ? "Средний риск"
               : "Низкий риск",
+
         summary:
-          score?.status?.restricted || score?.status?.wanted || score?.status?.spec_wanted
+          score?.status?.restricted ||
+          score?.status?.wanted ||
+          score?.status?.spec_wanted
             ? "Найдены ограничения или признаки розыска. Такой автомобиль нельзя покупать без дополнительной юридической проверки."
-            : ownershipPeriods.length >= 6
-              ? `Ограничений и розыска не найдено, но у автомобиля много периодов владения: ${ownershipPeriods.length}. Перед покупкой стоит проверить пробег, ДТП и сервисную историю.`
-              : "Ограничений и розыска не найдено. По базовым данным критических рисков не видно.",
+            : hasAccidents
+              ? `В доступном архиве найдены сведения о ДТП: ${accidentCount}. Ограничений и признаков розыска не найдено. Перед покупкой рекомендуется изучить даты и характер повреждений.`
+              : ownershipPeriods.length >= 6
+                ? `Ограничений и розыска не найдено, но у автомобиля много периодов владения: ${ownershipPeriods.length}. Перед покупкой стоит проверить пробег, ДТП и сервисную историю.`
+                : "Ограничений и розыска не найдено. По доступным данным критических рисков не видно.",
       },
     };
 
-    vehicleCheckCache.set(`vin:${vin}`, finalReport);
+    vehicleCheckCache.set(
+      `vin:v2:${vin}`,
+      finalReport
+    );
     return res.json(finalReport);
   } catch (error) {
     console.error("[AUTODEAR][VEHICLE_CHECK] error:", error);
