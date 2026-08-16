@@ -345,6 +345,117 @@ app.get("/api/vehicle-reports/balance", async (req, res) => {
   }
 });
 
+app.get("/api/vehicle-reports/products", async (req, res) => {
+  try {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const {
+      data,
+      error,
+    } = await supabase
+      .from("vehicle_report_products")
+      .select(
+        "id,report_type,quantity,unit_price_kopecks,total_price_kopecks,sort_order"
+      )
+      .eq("is_active", true)
+      .order("report_type", {
+        ascending: true,
+      })
+      .order("sort_order", {
+        ascending: true,
+      })
+      .order("quantity", {
+        ascending: true,
+      });
+
+    if (error) {
+      console.error(
+        "[AUTODEAR][VEHICLE_REPORT][PRODUCTS_ERROR]",
+        {
+          userId,
+          code: error.code,
+          message: error.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "VEHICLE_REPORT_PRODUCTS_ERROR",
+      });
+    }
+
+    const products =
+      Array.isArray(data)
+        ? data.map((item) => ({
+            id: item.id,
+            reportType:
+              item.report_type,
+            quantity:
+              Number(
+                item.quantity || 0
+              ),
+            unitPriceKopecks:
+              Number(
+                item.unit_price_kopecks || 0
+              ),
+            totalPriceKopecks:
+              Number(
+                item.total_price_kopecks || 0
+              ),
+          }))
+        : [];
+
+    console.log(
+      "[AUTODEAR][VEHICLE_REPORT][PRODUCTS_OK]",
+      {
+        userId,
+        count:
+          products.length,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      products,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][VEHICLE_REPORT][PRODUCTS_UNKNOWN_ERROR]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "VEHICLE_REPORT_PRODUCTS_UNKNOWN_ERROR",
+    });
+  }
+});
+
 app.get("/download", (req, res) => {
   const googlePlayUrl = String(process.env.AUTODEAR_GOOGLE_PLAY_URL || "").trim();
   const ruStoreUrl = String(process.env.AUTODEAR_RUSTORE_URL || "").trim();
