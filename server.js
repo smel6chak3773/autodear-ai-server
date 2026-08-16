@@ -2379,8 +2379,45 @@ app.post("/api/vehicle-check/report", async (req, res) => {
             : null,
 
         photos:
-          hasMaximumReport
-            ? photos
+          hasMaximumReport && photos
+            ? {
+                available:
+                  photos?.success === 1,
+                found:
+                  Number(
+                    photos?.totalPhotos ??
+                    photos?.found ??
+                    0
+                  ),
+                count:
+                  Array.isArray(
+                    photos?.photos
+                  )
+                    ? photos.photos.length
+                    : Number(
+                        photos?.totalPhotos ??
+                        photos?.found ??
+                        0
+                      ),
+                regNumber:
+                  photos?.regNumber ||
+                  plate ||
+                  null,
+                items:
+                  Array.isArray(
+                    photos?.photos
+                  )
+                    ? photos.photos
+                    : Array.isArray(
+                        photos?.records
+                      )
+                      ? photos.records
+                      : Array.isArray(
+                          photos?.items
+                        )
+                        ? photos.items
+                        : [],
+              }
             : null,
 
       },
