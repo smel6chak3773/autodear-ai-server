@@ -1241,6 +1241,10 @@ app.post("/api/vehicle/decode", async (req, res) => {
 
 
 app.post("/api/vehicle-check/report", async (req, res) => {
+  let vehicleCheckJobId = null;
+  let vehicleCheckRequestId = "";
+  let vehicleCheckAuthenticatedUserId = "";
+
   try {
     const authResult =
       await resolveAuthenticatedUser(req);
@@ -1275,14 +1279,390 @@ app.post("/api/vehicle-check/report", async (req, res) => {
 
     const token = process.env.AVTOVINCODE_TOKEN || "";
     const mode = String(req.body.mode || "").trim();
-    const inputVin = String(req.body.vin || "").trim().toUpperCase();
-    const plate = String(req.body.plate || req.body.gosnomer || "").trim().toUpperCase();
 
-    if (!token) {
+    const requestId =
+      String(
+        req.body.requestId || ""
+      ).trim();
+
+    vehicleCheckRequestId =
+      requestId;
+
+    vehicleCheckAuthenticatedUserId =
+      authenticatedUserId;
+
+    const reportType =
+      String(
+        req.body.reportType || "basic"
+      )
+        .trim()
+        .toLowerCase();
+
+    if (
+      ![
+        "basic",
+        "extended",
+        "maximum",
+      ].includes(reportType)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "INVALID_VEHICLE_REPORT_TYPE",
+      });
+    }
+
+    const hasExtendedReport =
+      reportType === "extended" ||
+      reportType === "maximum";
+
+    const hasMaximumReport =
+      reportType === "maximum";
+
+    if (!requestId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "VEHICLE_CHECK_REQUEST_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
       return res.status(500).json({
         ok: false,
-        error: "AVTOVINCODE_TOKEN_NOT_CONFIGURED_ON_SERVER",
+        error:
+          "SUPABASE_NOT_CONFIGURED",
       });
+    }
+
+    const inputVin =
+      String(
+        req.body.vin || ""
+      )
+        .trim()
+        .toUpperCase();
+
+    const plate =
+      String(
+        req.body.plate ||
+          req.body.gosnomer ||
+          ""
+      )
+        .trim()
+        .toUpperCase();
+
+    /*
+     * requestId делает запуск проверки
+     * идемпотентным.
+     *
+     * Если приложение потеряет интернет,
+     * закроется или повторит тот же запрос,
+     * второй job для этой проверки
+     * создавать нельзя.
+     */
+    const {
+      data: existingJob,
+      error: existingJobError,
+    } = await supabase
+      .from("vehicle_check_jobs")
+      .select(
+        [
+          "id",
+          "request_id",
+          "user_id",
+          "report_type",
+          "mode",
+          "vin",
+          "plate",
+          "status",
+          "report_id",
+          "error_code",
+          "error_message",
+          "created_at",
+          "started_at",
+          "completed_at",
+          "updated_at",
+        ].join(",")
+      )
+      .eq("request_id", requestId)
+      .maybeSingle();
+
+    if (existingJobError) {
+      console.error(
+        "[AUTODEAR][VEHICLE_CHECK][JOB_LOOKUP_ERROR]",
+        {
+          requestId,
+          userId:
+            authenticatedUserId,
+          code:
+            existingJobError.code,
+          message:
+            existingJobError.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "VEHICLE_CHECK_JOB_LOOKUP_ERROR",
+      });
+    }
+
+    if (existingJob) {
+      if (
+        String(existingJob.user_id) !==
+        authenticatedUserId
+      ) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "VEHICLE_CHECK_REQUEST_ID_OWNER_MISMATCH",
+        });
+      }
+
+      if (
+        existingJob.report_type !==
+          reportType ||
+        existingJob.mode !== mode
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "VEHICLE_CHECK_REQUEST_ID_MISMATCH",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][VEHICLE_CHECK][JOB_REUSED]",
+        {
+          requestId,
+          jobId:
+            existingJob.id,
+          status:
+            existingJob.status,
+          reportId:
+            existingJob.report_id ||
+            null,
+        }
+      );
+
+      /*
+       * Готовая проверка уже существует.
+       * Позже здесь будем возвращать
+       * сам сохранённый отчёт.
+       */
+      if (
+        existingJob.status ===
+          "completed" &&
+        existingJob.report_id
+      ) {
+        const {
+          data: existingReport,
+          error: existingReportError,
+        } = await supabase
+          .from("vehicle_check_reports")
+          .select("*")
+          .eq(
+            "id",
+            existingJob.report_id
+          )
+          .eq(
+            "user_id",
+            authenticatedUserId
+          )
+          .maybeSingle();
+
+        if (
+          existingReportError ||
+          !existingReport
+        ) {
+          console.error(
+            "[AUTODEAR][VEHICLE_CHECK][REPORT_RESTORE_ERROR]",
+            {
+              requestId,
+              reportId:
+                existingJob.report_id,
+              code:
+                existingReportError?.code ||
+                null,
+              message:
+                existingReportError?.message ||
+                null,
+            }
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              "VEHICLE_CHECK_REPORT_RESTORE_ERROR",
+          });
+        }
+
+        return res.json({
+          ok: true,
+          restored: true,
+          requestId,
+          jobId:
+            existingJob.id,
+          reportId:
+            existingReport.id,
+          reportType:
+            existingReport.report_type,
+          vin:
+            existingReport.vin,
+          plate:
+            existingReport.plate,
+          provider:
+            existingReport.provider,
+          result:
+            existingReport.normalized_json,
+          raw:
+            existingReport.raw_json,
+          ai: {
+            riskLevel:
+              existingReport.risk_level,
+            title:
+              existingReport.risk_title,
+            summary:
+              existingReport.ai_summary,
+          },
+        });
+      }
+
+      /*
+       * Один и тот же requestId уже
+       * выполняется. Не запускаем
+       * повторные платные запросы.
+       */
+      if (
+        existingJob.status ===
+          "queued" ||
+        existingJob.status ===
+          "processing"
+      ) {
+        return res.status(202).json({
+          ok: true,
+          pending: true,
+          requestId,
+          jobId:
+            existingJob.id,
+          status:
+            existingJob.status,
+        });
+      }
+
+      if (
+        existingJob.status ===
+        "failed"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          requestId,
+          jobId:
+            existingJob.id,
+          error:
+            existingJob.error_code ||
+            "VEHICLE_CHECK_JOB_FAILED",
+          message:
+            existingJob.error_message ||
+            null,
+        });
+      }
+    }
+
+    const {
+      data: createdJob,
+      error: createJobError,
+    } = await supabase
+      .from("vehicle_check_jobs")
+      .insert({
+        request_id:
+          requestId,
+        user_id:
+          authenticatedUserId,
+        report_type:
+          reportType,
+        mode,
+        vin:
+          inputVin || null,
+        plate:
+          plate || null,
+        status:
+          "processing",
+        started_at:
+          new Date().toISOString(),
+        updated_at:
+          new Date().toISOString(),
+      })
+      .select(
+        "id,request_id,status"
+      )
+      .single();
+
+    if (
+      createJobError ||
+      !createdJob
+    ) {
+      /*
+       * UNIQUE(request_id) защищает
+       * даже от двух почти
+       * одновременных запросов.
+       */
+      if (
+        createJobError?.code ===
+        "23505"
+      ) {
+        return res.status(202).json({
+          ok: true,
+          pending: true,
+          requestId,
+          status:
+            "processing",
+        });
+      }
+
+      console.error(
+        "[AUTODEAR][VEHICLE_CHECK][JOB_CREATE_ERROR]",
+        {
+          requestId,
+          userId:
+            authenticatedUserId,
+          code:
+            createJobError?.code ||
+            null,
+          message:
+            createJobError?.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "VEHICLE_CHECK_JOB_CREATE_ERROR",
+      });
+    }
+
+    vehicleCheckJobId =
+      createdJob.id;
+
+    console.log(
+      "[AUTODEAR][VEHICLE_CHECK][JOB_CREATED]",
+      {
+        requestId,
+        jobId:
+          vehicleCheckJobId,
+        userId:
+          authenticatedUserId,
+        reportType,
+        mode,
+      }
+    );
+
+    if (!token) {
+      throw new Error(
+        "AVTOVINCODE_TOKEN_NOT_CONFIGURED_ON_SERVER"
+      );
     }
 
     const callAvtoVinCod = async (path) => {
@@ -1297,12 +1677,35 @@ app.post("/api/vehicle-check/report", async (req, res) => {
 
       const json = await response.json().catch(() => null);
 
+      if (
+        response.status === 402 ||
+        json?.code === "INSUFFICIENT_BALANCE"
+      ) {
+        const balanceError =
+          new Error(
+            "VEHICLE_CHECK_PROVIDER_BALANCE_LOW"
+          );
+
+        balanceError.code =
+          "VEHICLE_CHECK_PROVIDER_BALANCE_LOW";
+
+        throw balanceError;
+      }
+
       if (!response.ok || !json) {
-        throw new Error(json?.error || `AVTOVINCODE_HTTP_${response.status}`);
+        throw new Error(
+          json?.error ||
+          json?.code ||
+          `AVTOVINCODE_HTTP_${response.status}`
+        );
       }
 
       if (json?.success === 0) {
-        throw new Error(json?.error || json?.code || "AVTOVINCODE_REQUEST_FAILED");
+        throw new Error(
+          json?.error ||
+          json?.code ||
+          "AVTOVINCODE_REQUEST_FAILED"
+        );
       }
 
       return json;
@@ -1351,6 +1754,39 @@ app.post("/api/vehicle-check/report", async (req, res) => {
           }
         );
 
+        if (
+          response.status === 402 ||
+          json?.code === "INSUFFICIENT_BALANCE"
+        ) {
+          console.error(
+            "[AUTODEAR][PROVIDER_BALANCE][CRITICAL]",
+            {
+              provider:
+                "avtovincode",
+              source:
+                sourceName,
+              status:
+                response.status,
+              code:
+                json?.code ||
+                "INSUFFICIENT_BALANCE",
+            }
+          );
+
+          return {
+            success: 0,
+            unavailable: true,
+            providerBalanceLow: true,
+            httpStatus:
+              response.status,
+            code:
+              json?.code ||
+              "INSUFFICIENT_BALANCE",
+            error:
+              "VEHICLE_CHECK_PROVIDER_BALANCE_LOW",
+          };
+        }
+
         if (!response.ok || !json) {
           return {
             success: 0,
@@ -1392,26 +1828,32 @@ app.post("/api/vehicle-check/report", async (req, res) => {
     let vin = inputVin;
     let numberResult = null;
 
-    const directCacheKey =
-      vin
-        ? `vin:v2:${vin}`
-        : "";
-    if (directCacheKey && vehicleCheckCache.has(directCacheKey)) {
-      return res.json(vehicleCheckCache.get(directCacheKey));
-    }
-
     if (mode === "number") {
-      if (!plate) return res.status(400).json({ ok: false, error: "PLATE_REQUIRED" });
+      if (!plate) {
+        const error =
+          new Error(
+            "PLATE_REQUIRED"
+          );
+
+        error.code =
+          "PLATE_REQUIRED";
+
+        throw error;
+      }
 
       numberResult = await callAvtoVinCod(`/gos2vin?plate=${encodeURIComponent(plate)}`);
 
       if (!numberResult?.success) {
-        return res.status(400).json({
-          ok: false,
-          error: numberResult?.error || "VIN_BY_PLATE_NOT_FOUND",
-          providerCode: numberResult?.code || null,
-          raw: { numberResult },
-        });
+        const error =
+          new Error(
+            numberResult?.error ||
+              "VIN_BY_PLATE_NOT_FOUND"
+          );
+
+        error.code =
+          "VIN_BY_PLATE_NOT_FOUND";
+
+        throw error;
       }
 
       vin =
@@ -1422,32 +1864,177 @@ app.post("/api/vehicle-check/report", async (req, res) => {
         "";
     }
 
-    if (!vin) return res.status(400).json({ ok: false, error: "VIN_REQUIRED" });
+    if (!vin) {
+      const error =
+        new Error(
+          "VIN_REQUIRED"
+        );
+
+      error.code =
+        "VIN_REQUIRED";
+
+      throw error;
+    }
+
+    console.log(
+      "[AUTODEAR][VEHICLE_CHECK][REPORT_TYPE]",
+      {
+        userId:
+          authenticatedUserId,
+        reportType,
+        hasExtendedReport,
+        hasMaximumReport,
+        vin,
+        plate:
+          plate || null,
+      }
+    );
+
+    const photoQuery =
+      plate
+        ? `plate=${encodeURIComponent(plate)}`
+        : `vin=${encodeURIComponent(vin)}`;
 
     const [
       registration,
       score,
       accidents,
+      mileage,
+      pledge,
+      elpts,
+      taxi,
+      sharing,
+      leasing,
+      photos,
+      serviceHistory,
     ] = await Promise.all([
       callAvtoVinCod(
         `/vin?vin=${encodeURIComponent(vin)}`
       ),
+
       callAvtoVinCod(
         `/score?vin=${encodeURIComponent(vin)}`
       ),
-      callOptionalAvtoVinCod(
-        `/accidents?vin=${encodeURIComponent(vin)}`,
-        "accidents"
-      ),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/accidents?vin=${encodeURIComponent(vin)}`,
+            "accidents"
+          )
+        : Promise.resolve(null),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/probeg?vin=${encodeURIComponent(vin)}`,
+            "mileage"
+          )
+        : Promise.resolve(null),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/pledge?vin=${encodeURIComponent(vin)}`,
+            "pledge"
+          )
+        : Promise.resolve(null),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/elpts?vin=${encodeURIComponent(vin)}`,
+            "elpts"
+          )
+        : Promise.resolve(null),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/taxi?vin=${encodeURIComponent(vin)}`,
+            "taxi"
+          )
+        : Promise.resolve(null),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/sharing?vin=${encodeURIComponent(vin)}`,
+            "sharing"
+          )
+        : Promise.resolve(null),
+
+      hasExtendedReport
+        ? callOptionalAvtoVinCod(
+            `/lizing?vin=${encodeURIComponent(vin)}`,
+            "leasing"
+          )
+        : Promise.resolve(null),
+
+      hasMaximumReport
+        ? callOptionalAvtoVinCod(
+            `/nomerogram?${photoQuery}`,
+            "photos"
+          )
+        : Promise.resolve(null),
+
+      hasMaximumReport
+        ? callOptionalAvtoVinCod(
+            `/service?vin=${encodeURIComponent(vin)}`,
+            "service"
+          )
+        : Promise.resolve(null),
     ]);
 
+    const purchasedSources = [
+      accidents,
+      mileage,
+      pledge,
+      elpts,
+      taxi,
+      sharing,
+      leasing,
+      photos,
+      serviceHistory,
+    ].filter(Boolean);
+
+    const providerBalanceLow =
+      purchasedSources.some(
+        (source) =>
+          source?.providerBalanceLow ===
+          true
+      );
+
+    if (providerBalanceLow) {
+      console.error(
+        "[AUTODEAR][PROVIDER_BALANCE][VEHICLE_CHECK_BLOCKED]",
+        {
+          provider:
+            "avtovincode",
+          userId:
+            authenticatedUserId,
+          reportType,
+          vin,
+        }
+      );
+
+      const error =
+        new Error(
+          "VEHICLE_CHECK_PROVIDER_BALANCE_LOW"
+        );
+
+      error.code =
+        "VEHICLE_CHECK_PROVIDER_BALANCE_LOW";
+
+      throw error;
+    }
+
     if (!registration?.success && !score?.success) {
-      return res.status(400).json({
-        ok: false,
-        error: registration?.error || score?.error || "VIN_CHECK_FAILED",
-        providerCode: registration?.code || score?.code || null,
-        raw: { numberResult, registration, score },
-      });
+      const error =
+        new Error(
+          registration?.error ||
+            score?.error ||
+            "VIN_CHECK_FAILED"
+        );
+
+      error.code =
+        "VIN_CHECK_FAILED";
+
+      throw error;
     }
 
     const registrationRecord = registration?.record || {};
@@ -1534,12 +2121,21 @@ app.post("/api/vehicle-check/report", async (req, res) => {
     const finalReport = {
       ok: true,
       provider: "avtovincode",
+      reportType,
       vin,
       numberResult,
       raw: {
         registration,
         score,
         accidents,
+        mileage,
+        pledge,
+        elpts,
+        taxi,
+        sharing,
+        leasing,
+        photos,
+        serviceHistory,
       },
       result: {
         gibdd: {
@@ -1594,6 +2190,46 @@ app.post("/api/vehicle-check/report", async (req, res) => {
           wanted: Boolean(score?.status?.wanted),
           specWanted: Boolean(score?.status?.spec_wanted),
         },
+
+        mileage:
+          hasExtendedReport
+            ? mileage
+            : null,
+
+        pledge:
+          hasExtendedReport
+            ? pledge
+            : null,
+
+        elpts:
+          hasExtendedReport
+            ? elpts
+            : null,
+
+        taxi:
+          hasExtendedReport
+            ? taxi
+            : null,
+
+        sharing:
+          hasExtendedReport
+            ? sharing
+            : null,
+
+        leasing:
+          hasExtendedReport
+            ? leasing
+            : null,
+
+        photos:
+          hasMaximumReport
+            ? photos
+            : null,
+
+        serviceHistory:
+          hasMaximumReport
+            ? serviceHistory
+            : null,
       },
       ai: {
         riskLevel:
@@ -1629,16 +2265,365 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       },
     };
 
-    vehicleCheckCache.set(
-      `vin:v2:${vin}`,
-      finalReport
+    /*
+     * Сначала сохраняем готовый отчёт на сервере.
+     *
+     * Это принципиально важно:
+     * результат проверки не зависит от того,
+     * дождалось ли приложение HTTP-ответа.
+     */
+    const {
+      data: savedReport,
+      error: savedReportError,
+    } = await supabase
+      .from("vehicle_check_reports")
+      .insert({
+        user_id:
+          authenticatedUserId,
+        vin:
+          record.vin ||
+          vin ||
+          null,
+        plate:
+          record.regNumber ||
+          plate ||
+          null,
+        provider:
+          "avtovincode",
+        price:
+          0,
+        status:
+          "success",
+        report_type:
+          reportType,
+        report_version:
+          1,
+        risk_level:
+          finalReport?.ai?.riskLevel ||
+          null,
+        risk_title:
+          finalReport?.ai?.title ||
+          null,
+        ai_summary:
+          finalReport?.ai?.summary ||
+          null,
+        normalized_json:
+          finalReport?.result ||
+          {},
+        raw_json:
+          finalReport?.raw ||
+          {},
+        completed_at:
+          new Date().toISOString(),
+      })
+      .select("*")
+      .single();
+
+    if (
+      savedReportError ||
+      !savedReport
+    ) {
+      console.error(
+        "[AUTODEAR][VEHICLE_CHECK][REPORT_SAVE_ERROR]",
+        {
+          requestId,
+          jobId:
+            vehicleCheckJobId,
+          userId:
+            authenticatedUserId,
+          reportType,
+          code:
+            savedReportError?.code ||
+            null,
+          message:
+            savedReportError?.message ||
+            null,
+        }
+      );
+
+      throw new Error(
+        "VEHICLE_CHECK_REPORT_SAVE_ERROR"
+      );
+    }
+
+    console.log(
+      "[AUTODEAR][VEHICLE_CHECK][REPORT_SAVED]",
+      {
+        requestId,
+        jobId:
+          vehicleCheckJobId,
+        reportId:
+          savedReport.id,
+        userId:
+          authenticatedUserId,
+        reportType,
+      }
     );
-    return res.json(finalReport);
+
+    /*
+     * Списываем ровно одну проверку.
+     *
+     * RPC уже идемпотентна:
+     * operation_key = consume:<report_id>.
+     */
+    const {
+      data: consumeResult,
+      error: consumeError,
+    } = await supabase.rpc(
+      "autodear_consume_vehicle_report",
+      {
+        p_user_id:
+          authenticatedUserId,
+        p_report_type:
+          reportType,
+        p_report_id:
+          savedReport.id,
+      }
+    );
+
+    if (consumeError) {
+      console.error(
+        "[AUTODEAR][VEHICLE_CHECK][CONSUME_ERROR]",
+        {
+          requestId,
+          jobId:
+            vehicleCheckJobId,
+          reportId:
+            savedReport.id,
+          userId:
+            authenticatedUserId,
+          reportType,
+          code:
+            consumeError.code ||
+            null,
+          message:
+            consumeError.message ||
+            null,
+        }
+      );
+
+      throw new Error(
+        consumeError.message ||
+          "VEHICLE_REPORT_CONSUME_ERROR"
+      );
+    }
+
+    console.log(
+      "[AUTODEAR][VEHICLE_CHECK][CONSUMED]",
+      {
+        requestId,
+        jobId:
+          vehicleCheckJobId,
+        reportId:
+          savedReport.id,
+        reportType,
+        result:
+          consumeResult ||
+          null,
+      }
+    );
+
+    /*
+     * Только после сохранения отчёта
+     * и успешного списания кредита
+     * проверка считается завершённой.
+     */
+    const {
+      error: completeJobError,
+    } = await supabase
+      .from("vehicle_check_jobs")
+      .update({
+        status:
+          "completed",
+        report_id:
+          savedReport.id,
+        completed_at:
+          new Date().toISOString(),
+        updated_at:
+          new Date().toISOString(),
+        error_code:
+          null,
+        error_message:
+          null,
+      })
+      .eq(
+        "id",
+        vehicleCheckJobId
+      )
+      .eq(
+        "user_id",
+        authenticatedUserId
+      );
+
+    if (completeJobError) {
+      console.error(
+        "[AUTODEAR][VEHICLE_CHECK][JOB_COMPLETE_ERROR]",
+        {
+          requestId,
+          jobId:
+            vehicleCheckJobId,
+          reportId:
+            savedReport.id,
+          code:
+            completeJobError.code ||
+            null,
+          message:
+            completeJobError.message ||
+            null,
+        }
+      );
+
+      throw new Error(
+        "VEHICLE_CHECK_JOB_COMPLETE_ERROR"
+      );
+    }
+
+    console.log(
+      "[AUTODEAR][VEHICLE_CHECK][JOB_COMPLETED]",
+      {
+        requestId,
+        jobId:
+          vehicleCheckJobId,
+        reportId:
+          savedReport.id,
+        reportType,
+      }
+    );
+
+    const responseReport = {
+      ...finalReport,
+      requestId,
+      jobId:
+        vehicleCheckJobId,
+      reportId:
+        savedReport.id,
+      saved:
+        true,
+    };
+
+    return res.json(
+      responseReport
+    );
   } catch (error) {
-    console.error("[AUTODEAR][VEHICLE_CHECK] error:", error);
+    console.error(
+      "[AUTODEAR][VEHICLE_CHECK] error:",
+      error
+    );
+
+    const vehicleCheckErrorCode =
+      String(
+        error?.code ||
+        error?.message ||
+        "VEHICLE_CHECK_UNKNOWN_ERROR"
+      ).slice(0, 500);
+
+    const vehicleCheckErrorMessage =
+      String(
+        error?.message ||
+        error ||
+        "Неизвестная ошибка проверки автомобиля"
+      ).slice(0, 2000);
+
+    if (
+      vehicleCheckJobId &&
+      supabase
+    ) {
+      try {
+        const {
+          error: failJobError,
+        } = await supabase
+          .from("vehicle_check_jobs")
+          .update({
+            status: "failed",
+            error_code:
+              vehicleCheckErrorCode,
+            error_message:
+              vehicleCheckErrorMessage,
+            completed_at:
+              new Date().toISOString(),
+            updated_at:
+              new Date().toISOString(),
+          })
+          .eq(
+            "id",
+            vehicleCheckJobId
+          )
+          .eq(
+            "status",
+            "processing"
+          );
+
+        if (failJobError) {
+          console.error(
+            "[AUTODEAR][VEHICLE_CHECK][JOB_FAIL_UPDATE_ERROR]",
+            {
+              requestId:
+                vehicleCheckRequestId ||
+                null,
+              jobId:
+                vehicleCheckJobId,
+              userId:
+                vehicleCheckAuthenticatedUserId ||
+                null,
+              code:
+                failJobError.code ||
+                null,
+              message:
+                failJobError.message ||
+                null,
+            }
+          );
+        } else {
+          console.log(
+            "[AUTODEAR][VEHICLE_CHECK][JOB_FAILED]",
+            {
+              requestId:
+                vehicleCheckRequestId ||
+                null,
+              jobId:
+                vehicleCheckJobId,
+              userId:
+                vehicleCheckAuthenticatedUserId ||
+                null,
+              errorCode:
+                vehicleCheckErrorCode,
+            }
+          );
+        }
+      } catch (failJobException) {
+        console.error(
+          "[AUTODEAR][VEHICLE_CHECK][JOB_FAIL_EXCEPTION]",
+          failJobException
+        );
+      }
+    }
+
+    if (
+      error?.code ===
+        "VEHICLE_CHECK_PROVIDER_BALANCE_LOW" ||
+      error?.message ===
+        "VEHICLE_CHECK_PROVIDER_BALANCE_LOW"
+    ) {
+      console.error(
+        "[AUTODEAR][PROVIDER_BALANCE][VEHICLE_CHECK_BLOCKED]",
+        {
+          provider:
+            "avtovincode",
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error:
+          "VEHICLE_CHECK_PROVIDER_BALANCE_LOW",
+      });
+    }
+
     return res.status(500).json({
       ok: false,
-      error: error?.message || "VEHICLE_CHECK_UNKNOWN_ERROR",
+      error:
+        error?.message ||
+        "VEHICLE_CHECK_UNKNOWN_ERROR",
     });
   }
 });
