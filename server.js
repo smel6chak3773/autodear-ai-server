@@ -1906,7 +1906,6 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       sharing,
       leasing,
       photos,
-      serviceHistory,
     ] = await Promise.all([
       callAvtoVinCod(
         `/vin?vin=${encodeURIComponent(vin)}`
@@ -1972,12 +1971,6 @@ app.post("/api/vehicle-check/report", async (req, res) => {
           )
         : Promise.resolve(null),
 
-      hasMaximumReport
-        ? callOptionalAvtoVinCod(
-            `/service?vin=${encodeURIComponent(vin)}`,
-            "service"
-          )
-        : Promise.resolve(null),
     ]);
 
     const purchasedSources = [
@@ -1989,7 +1982,6 @@ app.post("/api/vehicle-check/report", async (req, res) => {
       sharing,
       leasing,
       photos,
-      serviceHistory,
     ].filter(Boolean);
 
     const providerBalanceLow =
@@ -2135,25 +2127,69 @@ app.post("/api/vehicle-check/report", async (req, res) => {
         sharing,
         leasing,
         photos,
-        serviceHistory,
       },
       result: {
         gibdd: {
           vehicle: {
             vin: record.vin || vin,
-            bodyNumber: record.bodyNumber || null,
-            regNumber: record.regNumber || plate || null,
-            model: record.model || null,
-            year: record.year || null,
-            color: record.color || null,
-            engineVolume: record.engineVolume || null,
-            powerHp: record.powerHp || null,
-            powerKwt: record.powerKwt || null,
-            category: record.category || null,
-            maxWeight: record.maxWeight || null,
-            weightWithoutLoading: record.weightWithoutLoading || null,
-            recordStatus: record.recordStatus || null,
-            lastRegAction: record.lastRegAction || null,
+            bodyNumber:
+              record.bodyNumber || null,
+            regNumber:
+              record.regNumber ||
+              plate ||
+              null,
+            model:
+              record.model || null,
+            year:
+              record.year || null,
+            color:
+              record.color || null,
+
+            engineVolume:
+              record.engineVolume || null,
+            powerHp:
+              record.powerHp || null,
+            powerKwt:
+              record.powerKwt || null,
+            engineNum:
+              record.engineNum || null,
+            engineType:
+              record.engineType || null,
+
+            vehicleType:
+              record.vehicleType || null,
+            vehicleTypeTAM:
+              record.vehicleTypeTAM || null,
+            category:
+              record.category || null,
+
+            ecologyClass:
+              record.ecologyClass || null,
+            manufacturer:
+              record.manufacturer || null,
+
+            transmissionType:
+              record.transmissionType || null,
+            driveUnitType:
+              record.driveUnitType || null,
+            wheelLocation:
+              record.wheelLocation || null,
+
+            approval:
+              record.approval || null,
+
+            maxWeight:
+              record.maxWeight || null,
+            weightWithoutLoading:
+              record.weightWithoutLoading ||
+              null,
+
+            recordStatus:
+              record.recordStatus || null,
+            utilizStatus:
+              record.utilizStatus || null,
+            lastRegAction:
+              record.lastRegAction || null,
           },
           pts: record.pts || null,
           sts: record.sts || null,
@@ -2192,33 +2228,154 @@ app.post("/api/vehicle-check/report", async (req, res) => {
         },
 
         mileage:
-          hasExtendedReport
-            ? mileage
+          hasExtendedReport && mileage
+            ? {
+                available:
+                  mileage?.success === 1,
+                found:
+                  Number(
+                    mileage?.found || 0
+                  ),
+                count:
+                  Array.isArray(
+                    mileage?.records
+                  )
+                    ? mileage.records.length
+                    : Number(
+                        mileage?.found || 0
+                      ),
+                items:
+                  Array.isArray(
+                    mileage?.records
+                  )
+                    ? mileage.records
+                    : [],
+              }
             : null,
 
         pledge:
-          hasExtendedReport
-            ? pledge
+          hasExtendedReport && pledge
+            ? {
+                available:
+                  pledge?.success === 1,
+                found:
+                  Number(
+                    pledge?.found || 0
+                  ),
+                pledged:
+                  Number(
+                    pledge?.found || 0
+                  ) > 0,
+                items:
+                  Array.isArray(
+                    pledge?.records
+                  )
+                    ? pledge.records
+                    : [],
+              }
             : null,
 
         elpts:
-          hasExtendedReport
-            ? elpts
+          hasExtendedReport && elpts
+            ? {
+                available:
+                  elpts?.success === 1,
+                found:
+                  Number(
+                    elpts?.found || 0
+                  ),
+                status:
+                  elpts?.status || null,
+                items:
+                  Array.isArray(
+                    elpts?.records
+                  )
+                    ? elpts.records
+                    : [],
+              }
             : null,
 
         taxi:
-          hasExtendedReport
-            ? taxi
+          hasExtendedReport && taxi
+            ? {
+                available:
+                  taxi?.success === 1,
+                found:
+                  Number(
+                    taxi?.found || 0
+                  ),
+                isTaxi:
+                  Boolean(
+                    taxi?.isTaxi
+                  ),
+                items:
+                  Array.isArray(
+                    taxi?.records
+                  )
+                    ? taxi.records
+                    : [],
+              }
             : null,
 
         sharing:
-          hasExtendedReport
-            ? sharing
+          hasExtendedReport && sharing
+            ? {
+                available:
+                  sharing?.success === 1,
+                found:
+                  Number(
+                    sharing?.found || 0
+                  ),
+                isCarsharing:
+                  Boolean(
+                    sharing?.isCarsharing
+                  ),
+                company:
+                  sharing?.company || null,
+                archival:
+                  Boolean(
+                    sharing?.archival
+                  ) ||
+                  String(
+                    sharing?.dataNote || ""
+                  )
+                    .toLowerCase()
+                    .includes("архив"),
+                dataNote:
+                  sharing?.dataNote || null,
+                checkedAt:
+                  sharing?.checkedAt || null,
+                checkedBy:
+                  sharing?.checkedBy || null,
+                items:
+                  Array.isArray(
+                    sharing?.records
+                  )
+                    ? sharing.records
+                    : [],
+              }
             : null,
 
         leasing:
-          hasExtendedReport
-            ? leasing
+          hasExtendedReport && leasing
+            ? {
+                available:
+                  leasing?.success === 1,
+                found:
+                  Number(
+                    leasing?.found || 0
+                  ),
+                isLeasing:
+                  Boolean(
+                    leasing?.isLeasing
+                  ),
+                items:
+                  Array.isArray(
+                    leasing?.records
+                  )
+                    ? leasing.records
+                    : [],
+              }
             : null,
 
         photos:
@@ -2226,10 +2383,6 @@ app.post("/api/vehicle-check/report", async (req, res) => {
             ? photos
             : null,
 
-        serviceHistory:
-          hasMaximumReport
-            ? serviceHistory
-            : null,
       },
       ai: {
         riskLevel:
