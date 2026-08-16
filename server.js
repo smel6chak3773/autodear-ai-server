@@ -181,6 +181,170 @@ app.get("/api/auth/me", async (req, res) => {
   });
 });
 
+app.get("/api/vehicle-reports/balance", async (req, res) => {
+  try {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const {
+      data: balance,
+      error,
+    } = await supabase
+      .from("vehicle_report_balances")
+      .select(
+        [
+          "user_id",
+          "basic_purchased",
+          "basic_used",
+          "basic_remaining",
+          "extended_purchased",
+          "extended_used",
+          "extended_remaining",
+          "maximum_purchased",
+          "maximum_used",
+          "maximum_remaining",
+          "updated_at",
+        ].join(",")
+      )
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error(
+        "[AUTODEAR][VEHICLE_REPORT][BALANCE_ERROR]",
+        {
+          userId,
+          code: error.code,
+          message: error.message,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "VEHICLE_REPORT_BALANCE_ERROR",
+      });
+    }
+
+    const result =
+      balance || {
+        user_id: userId,
+        basic_purchased: 0,
+        basic_used: 0,
+        basic_remaining: 0,
+        extended_purchased: 0,
+        extended_used: 0,
+        extended_remaining: 0,
+        maximum_purchased: 0,
+        maximum_used: 0,
+        maximum_remaining: 0,
+        updated_at: null,
+      };
+
+    console.log(
+      "[AUTODEAR][VEHICLE_REPORT][BALANCE_OK]",
+      {
+        userId,
+        basic:
+          Number(
+            result.basic_remaining || 0
+          ),
+        extended:
+          Number(
+            result.extended_remaining || 0
+          ),
+        maximum:
+          Number(
+            result.maximum_remaining || 0
+          ),
+      }
+    );
+
+    return res.json({
+      ok: true,
+      balance: {
+        basic: {
+          purchased:
+            Number(
+              result.basic_purchased || 0
+            ),
+          used:
+            Number(
+              result.basic_used || 0
+            ),
+          remaining:
+            Number(
+              result.basic_remaining || 0
+            ),
+        },
+        extended: {
+          purchased:
+            Number(
+              result.extended_purchased || 0
+            ),
+          used:
+            Number(
+              result.extended_used || 0
+            ),
+          remaining:
+            Number(
+              result.extended_remaining || 0
+            ),
+        },
+        maximum: {
+          purchased:
+            Number(
+              result.maximum_purchased || 0
+            ),
+          used:
+            Number(
+              result.maximum_used || 0
+            ),
+          remaining:
+            Number(
+              result.maximum_remaining || 0
+            ),
+        },
+      },
+      updatedAt:
+        result.updated_at || null,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][VEHICLE_REPORT][BALANCE_UNKNOWN_ERROR]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "VEHICLE_REPORT_BALANCE_UNKNOWN_ERROR",
+    });
+  }
+});
+
 app.get("/download", (req, res) => {
   const googlePlayUrl = String(process.env.AUTODEAR_GOOGLE_PLAY_URL || "").trim();
   const ruStoreUrl = String(process.env.AUTODEAR_RUSTORE_URL || "").trim();
@@ -988,6 +1152,15 @@ app.post("/api/vehicle-check/report", async (req, res) => {
           null,
       }
     );
+
+    if (!authenticatedUserId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
 
     const token = process.env.AVTOVINCODE_TOKEN || "";
     const mode = String(req.body.mode || "").trim();
