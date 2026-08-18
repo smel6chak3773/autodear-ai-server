@@ -901,7 +901,7 @@ app.post("/api/vehicle/read-sts", async (req, res) => {
             {
               type: "input_image",
               image_url: dataUrl,
-              detail: "high",
+              detail: "low",
             },
           ],
         },
