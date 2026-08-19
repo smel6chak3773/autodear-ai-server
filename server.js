@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+const multer = require("multer");
 
 const { processMessage } = require("./assistant/brain");
 const memoryStore = require("./assistant/memoryStore");
@@ -11,6 +12,14 @@ const cacheStore = require("./assistant/cacheStore");
 const { diagnoseDeveloperSnapshot } = require("./developer/diagnose");
 
 const app = express();
+
+const stsMultipartUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024,
+  },
+});
+
 const vehicleCheckCache = new Map();
 const geocodeCache = new Map();
 
@@ -945,7 +954,32 @@ app.post("/api/vehicle/read-sts-upload-probe", (req, res) => {
   });
 });
 
-app.post("/api/vehicle/read-sts", async (req, res) => {
+const parseStsMultipartIfNeeded = (
+  req,
+  res,
+  next
+) => {
+  const contentType = String(
+    req.headers["content-type"] || ""
+  ).toLowerCase();
+
+  if (
+    !contentType.startsWith(
+      "multipart/form-data"
+    )
+  ) {
+    return next();
+  }
+
+  return stsMultipartUpload.single(
+    "image"
+  )(req, res, next);
+};
+
+app.post(
+  "/api/vehicle/read-sts",
+  parseStsMultipartIfNeeded,
+  async (req, res) => {
   const stsStartedAt = Date.now();
 
   const stsLog = (stage, extra = {}) => {
@@ -971,16 +1005,38 @@ app.post("/api/vehicle/read-sts", async (req, res) => {
       });
     }
 
-    const imageBase64 = String(
-      req.body?.imageBase64 ||
-      req.body?.base64 ||
-      ""
-    ).trim();
+    const multipartFile =
+      req.file || null;
 
-    const mimeType = String(
-      req.body?.mimeType ||
-      "image/jpeg"
-    ).trim();
+    const imageBase64 = multipartFile
+      ? multipartFile.buffer.toString(
+          "base64"
+        )
+      : String(
+          req.body?.imageBase64 ||
+          req.body?.base64 ||
+          ""
+        ).trim();
+
+    const mimeType = multipartFile
+      ? String(
+          multipartFile.mimetype ||
+          "image/jpeg"
+        ).trim()
+      : String(
+          req.body?.mimeType ||
+          "image/jpeg"
+        ).trim();
+
+    stsLog("INPUT_READY", {
+      transport:
+        multipartFile
+          ? "multipart"
+          : "json_base64",
+      fileBytes:
+        multipartFile?.size || null,
+      mimeType,
+    });
 
     if (!imageBase64) {
       return res.status(400).json({
