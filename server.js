@@ -897,6 +897,54 @@ app.post("/api/geocode", async (req, res) => {
   }
 });
 
+/*
+ * Временный диагностический endpoint.
+ *
+ * Принимает ТОЧНО такое же тело, как настоящее
+ * распознавание СТС, но не обращается к OpenAI.
+ *
+ * Нужен, чтобы отделить:
+ * iPhone -> AUTODEAR API upload
+ * от
+ * AUTODEAR API -> OpenAI Vision.
+ */
+app.post("/api/vehicle/read-sts-upload-probe", (req, res) => {
+  const startedAt = Date.now();
+
+  const imageBase64 = String(
+    req.body?.imageBase64 ||
+    req.body?.base64 ||
+    ""
+  ).trim();
+
+  const mimeType = String(
+    req.body?.mimeType ||
+    ""
+  ).trim();
+
+  console.log(
+    "[AUTODEAR][STS_UPLOAD_PROBE][OK]",
+    {
+      base64Chars: imageBase64.length,
+      approxBytes: Math.round(
+        imageBase64.length * 0.75
+      ),
+      mimeType,
+      ms: Date.now() - startedAt,
+    }
+  );
+
+  return res.json({
+    ok: true,
+    received: true,
+    base64Chars: imageBase64.length,
+    approxBytes: Math.round(
+      imageBase64.length * 0.75
+    ),
+    mimeType,
+  });
+});
+
 app.post("/api/vehicle/read-sts", async (req, res) => {
   const stsStartedAt = Date.now();
 
