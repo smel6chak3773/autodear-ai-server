@@ -1102,7 +1102,15 @@ app.post(
     const multipartFile =
       req.file || null;
 
-    const imageBase64 = multipartFile
+    const storageBucket = String(
+      req.body?.storageBucket || ""
+    ).trim();
+
+    const storagePath = String(
+      req.body?.storagePath || ""
+    ).trim();
+
+    let imageBase64 = multipartFile
       ? multipartFile.buffer.toString(
           "base64"
         )
@@ -1112,7 +1120,7 @@ app.post(
           ""
         ).trim();
 
-    const mimeType = multipartFile
+    let mimeType = multipartFile
       ? String(
           multipartFile.mimetype ||
           "image/jpeg"
@@ -1122,14 +1130,121 @@ app.post(
           "image/jpeg"
         ).trim();
 
+    let storageDownloadedBytes = null;
+
+    if (
+      !imageBase64 &&
+      storageBucket &&
+      storagePath
+    ) {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      if (storageBucket !== "ai-temp") {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STS_STORAGE_BUCKET_INVALID",
+        });
+      }
+
+      if (
+        storagePath.includes("..") ||
+        storagePath.startsWith("/") ||
+        !storagePath.endsWith(".jpg")
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STS_STORAGE_PATH_INVALID",
+        });
+      }
+
+      stsLog("STORAGE_DOWNLOAD_BEGIN", {
+        storageBucket,
+        storagePath,
+      });
+
+      const {
+        data: storageFile,
+        error: storageDownloadError,
+      } = await supabase.storage
+        .from(storageBucket)
+        .download(storagePath);
+
+      if (
+        storageDownloadError ||
+        !storageFile
+      ) {
+        stsLog("STORAGE_DOWNLOAD_FAILED", {
+          storageBucket,
+          storagePath,
+          error:
+            storageDownloadError?.message ||
+            "FILE_MISSING",
+        });
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "STS_STORAGE_DOWNLOAD_FAILED",
+          details:
+            storageDownloadError?.message ||
+            "FILE_MISSING",
+        });
+      }
+
+      const storageArrayBuffer =
+        await storageFile.arrayBuffer();
+
+      const storageBuffer =
+        Buffer.from(storageArrayBuffer);
+
+      storageDownloadedBytes =
+        storageBuffer.length;
+
+      imageBase64 =
+        storageBuffer.toString("base64");
+
+      mimeType =
+        storageFile.type ||
+        "image/jpeg";
+
+      stsLog("STORAGE_DOWNLOAD_OK", {
+        storageBucket,
+        storagePath,
+        bytes:
+          storageDownloadedBytes,
+        mimeType,
+      });
+    }
+
+    const transport = multipartFile
+      ? "multipart"
+      : storageBucket && storagePath
+        ? "supabase_storage"
+        : "json_base64";
+
     stsLog("INPUT_READY", {
-      transport:
-        multipartFile
-          ? "multipart"
-          : "json_base64",
+      transport,
       fileBytes:
-        multipartFile?.size || null,
+        multipartFile?.size ||
+        storageDownloadedBytes ||
+        null,
       mimeType,
+      storageBucket:
+        transport === "supabase_storage"
+          ? storageBucket
+          : null,
+      storagePath:
+        transport === "supabase_storage"
+          ? storagePath
+          : null,
     });
 
     if (!imageBase64) {
