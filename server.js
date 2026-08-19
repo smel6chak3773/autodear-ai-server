@@ -917,6 +917,100 @@ app.post("/api/geocode", async (req, res) => {
  * от
  * AUTODEAR API -> OpenAI Vision.
  */
+/*
+ * Выдаёт одноразовый signed upload token для временного СТС.
+ *
+ * Файл остаётся в приватном bucket ai-temp.
+ * Телефону не требуется Supabase Auth-сессия для самого upload.
+ */
+app.post("/api/vehicle/sts-upload-url", async (req, res) => {
+  try {
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const userId = String(
+      req.body?.userId || ""
+    ).trim();
+
+    if (
+      !userId ||
+      !/^[a-zA-Z0-9_-]{8,128}$/.test(userId)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_USER_ID",
+      });
+    }
+
+    const storageBucket = "ai-temp";
+
+    const storagePath =
+      `${userId}/sts/sts-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 10)}.jpg`;
+
+    const {
+      data,
+      error,
+    } = await supabase.storage
+      .from(storageBucket)
+      .createSignedUploadUrl(
+        storagePath
+      );
+
+    if (
+      error ||
+      !data?.token
+    ) {
+      console.error(
+        "[AUTODEAR][STS_SIGNED_UPLOAD][CREATE_ERROR]",
+        error?.message ||
+          "SIGNED_UPLOAD_TOKEN_MISSING"
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error:
+          "STS_SIGNED_UPLOAD_CREATE_FAILED",
+        details:
+          error?.message ||
+          "SIGNED_UPLOAD_TOKEN_MISSING",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][STS_SIGNED_UPLOAD][CREATED]",
+      {
+        userId,
+        storageBucket,
+        storagePath,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      storageBucket,
+      storagePath,
+      token: data.token,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][STS_SIGNED_UPLOAD][ERROR]",
+      error?.message || error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "STS_SIGNED_UPLOAD_CREATE_FAILED",
+    });
+  }
+});
+
 app.post("/api/vehicle/read-sts-upload-probe", (req, res) => {
   const startedAt = Date.now();
 
