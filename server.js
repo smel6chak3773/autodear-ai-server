@@ -831,7 +831,24 @@ app.post("/api/geocode", async (req, res) => {
 });
 
 app.post("/api/vehicle/read-sts", async (req, res) => {
+  const stsStartedAt = Date.now();
+
+  const stsLog = (stage, extra = {}) => {
+    console.log(
+      `[AUTODEAR][STS_SERVER][${stage}]`,
+      {
+        ms: Date.now() - stsStartedAt,
+        ...extra,
+      }
+    );
+  };
+
   try {
+    stsLog("REQUEST_RECEIVED", {
+      contentLength:
+        req.headers["content-length"] || null,
+    });
+
     if (!openai) {
       return res.status(500).json({
         ok: false,
@@ -871,9 +888,23 @@ app.post("/api/vehicle/read-sts", async (req, res) => {
       });
     }
 
+    stsLog("IMAGE_READY", {
+      mimeType,
+      base64Chars: imageBase64.length,
+      approxBytes: Math.round(
+        imageBase64.length * 0.75
+      ),
+    });
+
     const dataUrl = imageBase64.startsWith("data:")
       ? imageBase64
       : `data:${mimeType};base64,${imageBase64}`;
+
+    stsLog("OPENAI_BEGIN", {
+      model:
+        process.env.OPENAI_STS_MODEL ||
+        "gpt-4o-mini",
+    });
 
     const response = await openai.responses.create({
       model:
@@ -910,10 +941,18 @@ app.post("/api/vehicle/read-sts", async (req, res) => {
       max_output_tokens: 1200,
     });
 
+    stsLog("OPENAI_DONE", {
+      responseId: response?.id || null,
+    });
+
     const rawText = String(
       response.output_text ||
       ""
     );
+
+    stsLog("OUTPUT_RECEIVED", {
+      outputChars: rawText.length,
+    });
 
     let parsed = null;
 
@@ -1025,6 +1064,12 @@ app.post("/api/vehicle/read-sts", async (req, res) => {
       });
     }
 
+    stsLog("RESPONSE_SENT", {
+      ok: true,
+      confidence:
+        parsed?.confidence || "medium",
+    });
+
     return res.json({
       ok: true,
       provider: "openai_vision",
@@ -1039,6 +1084,14 @@ app.post("/api/vehicle/read-sts", async (req, res) => {
         : [],
     });
   } catch (error) {
+    stsLog("ERROR", {
+      message:
+        error?.message ||
+        String(error),
+      name:
+        error?.name || null,
+    });
+
     console.error(
       "[AUTODEAR][STS_RECOGNITION]",
       error?.message || error
