@@ -53,6 +53,73 @@ const supabaseAuth =
     : null;
 
 app.use(cors());
+
+/*
+ * Диагностика СТС ДО express.json().
+ *
+ * Это принципиально важно:
+ * route /api/vehicle/read-sts запускается только после того,
+ * как Express полностью получил и разобрал JSON body.
+ *
+ * Если большой base64-запрос с телефона зависнет при загрузке
+ * или оборвётся раньше, route-логов мы вообще не увидим.
+ */
+app.use((req, res, next) => {
+  if (
+    req.method === "POST" &&
+    req.originalUrl?.startsWith(
+      "/api/vehicle/read-sts"
+    )
+  ) {
+    const startedAt = Date.now();
+
+    console.log(
+      "[AUTODEAR][STS_RAW][REQUEST_BEGIN]",
+      {
+        contentLength:
+          req.headers["content-length"] || null,
+        contentType:
+          req.headers["content-type"] || null,
+        userAgent:
+          req.headers["user-agent"] || null,
+      }
+    );
+
+    req.on("aborted", () => {
+      console.warn(
+        "[AUTODEAR][STS_RAW][REQUEST_ABORTED]",
+        {
+          ms: Date.now() - startedAt,
+          complete: req.complete,
+          readableEnded: req.readableEnded,
+        }
+      );
+    });
+
+    req.on("end", () => {
+      console.log(
+        "[AUTODEAR][STS_RAW][REQUEST_BODY_END]",
+        {
+          ms: Date.now() - startedAt,
+          complete: req.complete,
+        }
+      );
+    });
+
+    res.on("finish", () => {
+      console.log(
+        "[AUTODEAR][STS_RAW][RESPONSE_FINISH]",
+        {
+          ms: Date.now() - startedAt,
+          statusCode: res.statusCode,
+        }
+      );
+    });
+  }
+
+  next();
+});
+
 app.use(express.json({ limit: "12mb" }));
 
 async function resolveAuthenticatedUser(req) {
