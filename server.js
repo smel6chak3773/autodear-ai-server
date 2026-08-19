@@ -1102,6 +1102,25 @@ app.post(
     const multipartFile =
       req.file || null;
 
+    stsLog("BODY_DEBUG", {
+      bodyType: typeof req.body,
+      bodyKeys:
+        req.body && typeof req.body === "object"
+          ? Object.keys(req.body)
+          : [],
+      storageBucket:
+        req.body?.storageBucket || null,
+      storagePath:
+        req.body?.storagePath || null,
+      mimeType:
+        req.body?.mimeType || null,
+      hasImageBase64:
+        Boolean(
+          req.body?.imageBase64 ||
+          req.body?.base64
+        ),
+    });
+
     const storageBucket = String(
       req.body?.storageBucket || ""
     ).trim();
