@@ -3359,6 +3359,22 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
 
     let vehicleReportOrder = null;
 
+    if (purpose === "ads_wallet_topup") {
+      const adsUser =
+        await requireAdsAuthUser(req);
+
+      if (
+        String(adsUser.id) !==
+        targetId
+      ) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "ADS_WALLET_TOPUP_FORBIDDEN",
+        });
+      }
+    }
+
     if (purpose === "vehicle_report_package") {
       if (!supabase) {
         return res.status(500).json({
@@ -3506,13 +3522,9 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
         }
       );
     } else {
-      // TEMP 2026-08-13:
-      // CKassa integration test minimum = 50 RUB.
-      // Restore Ads minimum to 500 RUB
-      // after the payment integration test.
       const minimumAmountKopecks =
         purpose === "ads_wallet_topup"
-          ? 5000
+          ? 50000
           : 10000;
 
       if (
