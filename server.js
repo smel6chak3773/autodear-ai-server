@@ -5059,12 +5059,17 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
       ...result,
     });
   } catch (error) {
+    const status =
+      Number(
+        error?.statusCode || 500
+      );
+
     console.error(
       "[AUTODEAR][ADS][WALLET_GET_FATAL]",
       error
     );
 
-    return res.status(500).json({
+    return res.status(status).json({
       ok: false,
       error:
         error?.message ||
