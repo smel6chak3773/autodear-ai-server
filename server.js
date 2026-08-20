@@ -4889,6 +4889,9 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
       });
     }
 
+    const user =
+      await requireAdsAuthUser(req);
+
     const ownerId = String(
       req.params?.ownerId || ""
     ).trim();
@@ -4897,6 +4900,15 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "OWNER_ID_REQUIRED",
+      });
+    }
+
+    if (
+      String(user.id) !== ownerId
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "ADS_WALLET_FORBIDDEN",
       });
     }
 
