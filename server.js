@@ -3830,12 +3830,23 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       amountKopecks,
     });
   } catch (error) {
+    const status =
+      Number(
+        error?.statusCode ||
+        (
+          error?.name ===
+          "AbortError"
+            ? 504
+            : 500
+        )
+      );
+
     console.error(
       "[AUTODEAR][CKASSA][CREATE_ERROR]",
       error
     );
 
-    return res.status(500).json({
+    return res.status(status).json({
       ok: false,
       error:
         error?.name ===
