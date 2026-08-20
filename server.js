@@ -5062,6 +5062,759 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
 });
 
 
+
+
+
+// ============================================================
+// AUTODEAR ADS — SERVER CAMPAIGNS
+//
+// Supabase is the source of truth.
+// Browser and mobile app use the same authenticated owner.
+// AsyncStorage may remain only as a mobile cache.
+// ============================================================
+
+async function requireAdsAuthUser(req) {
+  if (!supabaseAuth) {
+    const error = new Error(
+      "SUPABASE_AUTH_NOT_CONFIGURED"
+    );
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const authorization = String(
+    req.headers?.authorization || ""
+  ).trim();
+
+  const match =
+    authorization.match(/^Bearer\s+(.+)$/i);
+
+  const token =
+    match?.[1]
+      ? String(match[1]).trim()
+      : "";
+
+  if (!token) {
+    const error = new Error(
+      "ADS_AUTH_REQUIRED"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const {
+    data,
+    error: authError,
+  } = await supabaseAuth.auth.getUser(token);
+
+  if (
+    authError ||
+    !data?.user?.id
+  ) {
+    const error = new Error(
+      "ADS_AUTH_INVALID"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return data.user;
+}
+
+
+function normalizeAdsInteger(value) {
+  const number = Number(value || 0);
+
+  if (
+    !Number.isFinite(number) ||
+    number < 0
+  ) {
+    return 0;
+  }
+
+  return Math.round(number);
+}
+
+
+function normalizeAdsStringArray(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      value
+        .map((item) =>
+          String(item || "").trim()
+        )
+        .filter(Boolean)
+    ),
+  ];
+}
+
+
+function mapAdsPlacementRow(row) {
+  return {
+    id: row.id,
+    campaignId: row.campaign_id,
+
+    format: row.format,
+    title: row.title || "",
+    status: row.status,
+
+    billingModel:
+      row.billing_model || "cpc",
+
+    pricePerClickKopecks:
+      Number(
+        row.price_per_click_kopecks || 0
+      ),
+
+    pricePerThousandImpressionsKopecks:
+      Number(
+        row
+          .price_per_thousand_impressions_kopecks ||
+        0
+      ),
+
+    pricePerViewKopecks:
+      row.price_per_view_kopecks == null
+        ? undefined
+        : Number(
+            row.price_per_view_kopecks
+          ),
+
+    billableVideoEvent:
+      row.billable_video_event ||
+      undefined,
+
+    budgetLimitKopecks:
+      Number(
+        row.budget_limit_kopecks || 0
+      ),
+
+    dailyLimitKopecks:
+      Number(
+        row.daily_limit_kopecks || 0
+      ),
+
+    destinationUrl:
+      row.destination_url || "",
+
+    ctaText:
+      row.cta_text || "",
+
+    imageUri:
+      row.image_uri || null,
+
+    videoUri:
+      row.video_uri || null,
+
+    createdAt:
+      row.created_at,
+
+    updatedAt:
+      row.updated_at,
+  };
+}
+
+
+function mapAdsCampaignRow(
+  row,
+  placements = []
+) {
+  return {
+    id: row.id,
+    ownerId: row.owner_id,
+
+    name: row.name || "",
+    clientName:
+      row.client_name || "",
+
+    status: row.status,
+
+    totalBudgetKopecks:
+      Number(
+        row.total_budget_kopecks || 0
+      ),
+
+    dailyBudgetKopecks:
+      Number(
+        row.daily_budget_kopecks || 0
+      ),
+
+    startsAt:
+      row.starts_at || null,
+
+    endsAt:
+      row.ends_at || null,
+
+    cityIds:
+      normalizeAdsStringArray(
+        row.city_ids
+      ),
+
+    placements:
+      placements.map(
+        mapAdsPlacementRow
+      ),
+
+    createdAt:
+      row.created_at,
+
+    updatedAt:
+      row.updated_at,
+  };
+}
+
+
+async function loadAdsCampaignPlacements(
+  ownerId,
+  campaignIds
+) {
+  if (
+    !Array.isArray(campaignIds) ||
+    campaignIds.length === 0
+  ) {
+    return new Map();
+  }
+
+  const {
+    data,
+    error,
+  } = await supabase
+    .from("ads_placements")
+    .select("*")
+    .eq("owner_id", ownerId)
+    .in("campaign_id", campaignIds)
+    .order(
+      "created_at",
+      {
+        ascending: true,
+      }
+    );
+
+  if (error) {
+    throw new Error(
+      `ADS_PLACEMENTS_LOAD_ERROR:${error.message}`
+    );
+  }
+
+  const byCampaign =
+    new Map();
+
+  for (const row of data || []) {
+    const campaignId =
+      String(
+        row.campaign_id || ""
+      );
+
+    const current =
+      byCampaign.get(campaignId) ||
+      [];
+
+    current.push(row);
+
+    byCampaign.set(
+      campaignId,
+      current
+    );
+  }
+
+  return byCampaign;
+}
+
+
+// ------------------------------------------------------------
+// LIST CAMPAIGNS
+// ------------------------------------------------------------
+
+app.get(
+  "/api/ads/campaigns",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const user =
+        await requireAdsAuthUser(req);
+
+      const ownerId =
+        String(user.id);
+
+      const {
+        data: rows,
+        error,
+      } = await supabase
+        .from("ads_campaigns")
+        .select("*")
+        .eq(
+          "owner_id",
+          ownerId
+        )
+        .order(
+          "created_at",
+          {
+            ascending: false,
+          }
+        );
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ADS][CAMPAIGNS_LIST_ERROR]",
+          {
+            ownerId,
+            code: error.code,
+            message:
+              error.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGNS_LIST_ERROR",
+        });
+      }
+
+      const campaignIds =
+        (rows || []).map(
+          (row) => row.id
+        );
+
+      const placements =
+        await loadAdsCampaignPlacements(
+          ownerId,
+          campaignIds
+        );
+
+      const campaigns =
+        (rows || []).map(
+          (row) =>
+            mapAdsCampaignRow(
+              row,
+              placements.get(
+                row.id
+              ) || []
+            )
+        );
+
+      return res.json({
+        ok: true,
+        campaigns,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][CAMPAIGNS_LIST_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_CAMPAIGNS_LIST_FATAL",
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// CREATE CAMPAIGN
+// ------------------------------------------------------------
+
+app.post(
+  "/api/ads/campaigns",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const user =
+        await requireAdsAuthUser(req);
+
+      const ownerId =
+        String(user.id);
+
+      const id =
+        String(
+          req.body?.id || ""
+        ).trim();
+
+      if (!id) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_ID_REQUIRED",
+        });
+      }
+
+      const name =
+        String(
+          req.body?.name || ""
+        ).trim() ||
+        "Новая кампания";
+
+      const payload = {
+        id,
+        owner_id:
+          ownerId,
+
+        name,
+
+        client_name:
+          String(
+            req.body?.clientName ||
+            ""
+          ).trim(),
+
+        status:
+          "draft",
+
+        total_budget_kopecks:
+          normalizeAdsInteger(
+            req.body
+              ?.totalBudgetKopecks
+          ),
+
+        daily_budget_kopecks:
+          normalizeAdsInteger(
+            req.body
+              ?.dailyBudgetKopecks
+          ),
+
+        starts_at:
+          req.body?.startsAt ||
+          null,
+
+        ends_at:
+          req.body?.endsAt ||
+          null,
+
+        city_ids:
+          normalizeAdsStringArray(
+            req.body?.cityIds
+          ),
+      };
+
+      const {
+        data,
+        error,
+      } = await supabase
+        .from("ads_campaigns")
+        .insert(payload)
+        .select("*")
+        .single();
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ADS][CAMPAIGN_CREATE_ERROR]",
+          {
+            ownerId,
+            id,
+            code: error.code,
+            message:
+              error.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            error.code === "23505"
+              ? "ADS_CAMPAIGN_ALREADY_EXISTS"
+              : "ADS_CAMPAIGN_CREATE_ERROR",
+        });
+      }
+
+      return res.status(201).json({
+        ok: true,
+        campaign:
+          mapAdsCampaignRow(
+            data,
+            []
+          ),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][CAMPAIGN_CREATE_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_CAMPAIGN_CREATE_FATAL",
+      });
+    }
+  }
+);
+
+
+// ------------------------------------------------------------
+// UPDATE CAMPAIGN
+// ------------------------------------------------------------
+
+app.put(
+  "/api/ads/campaigns/:campaignId",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const user =
+        await requireAdsAuthUser(req);
+
+      const ownerId =
+        String(user.id);
+
+      const campaignId =
+        String(
+          req.params?.campaignId ||
+          ""
+        ).trim();
+
+      if (!campaignId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_ID_REQUIRED",
+        });
+      }
+
+      const patch = {};
+
+      if (
+        req.body?.name !==
+        undefined
+      ) {
+        patch.name =
+          String(
+            req.body.name || ""
+          ).trim();
+      }
+
+      if (
+        req.body?.clientName !==
+        undefined
+      ) {
+        patch.client_name =
+          String(
+            req.body.clientName ||
+            ""
+          ).trim();
+      }
+
+      if (
+        req.body?.status !==
+        undefined
+      ) {
+        const allowedStatuses =
+          new Set([
+            "draft",
+            "moderation",
+            "active",
+            "paused",
+            "completed",
+            "rejected",
+            "archived",
+          ]);
+
+        const status =
+          String(
+            req.body.status || ""
+          );
+
+        if (
+          !allowedStatuses.has(
+            status
+          )
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "ADS_CAMPAIGN_STATUS_INVALID",
+            });
+        }
+
+        patch.status =
+          status;
+      }
+
+      if (
+        req.body
+          ?.totalBudgetKopecks !==
+        undefined
+      ) {
+        patch.total_budget_kopecks =
+          normalizeAdsInteger(
+            req.body
+              .totalBudgetKopecks
+          );
+      }
+
+      if (
+        req.body
+          ?.dailyBudgetKopecks !==
+        undefined
+      ) {
+        patch.daily_budget_kopecks =
+          normalizeAdsInteger(
+            req.body
+              .dailyBudgetKopecks
+          );
+      }
+
+      if (
+        req.body?.startsAt !==
+        undefined
+      ) {
+        patch.starts_at =
+          req.body.startsAt ||
+          null;
+      }
+
+      if (
+        req.body?.endsAt !==
+        undefined
+      ) {
+        patch.ends_at =
+          req.body.endsAt ||
+          null;
+      }
+
+      if (
+        req.body?.cityIds !==
+        undefined
+      ) {
+        patch.city_ids =
+          normalizeAdsStringArray(
+            req.body.cityIds
+          );
+      }
+
+      if (
+        Object.keys(patch)
+          .length === 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_PATCH_EMPTY",
+        });
+      }
+
+      const {
+        data,
+        error,
+      } = await supabase
+        .from("ads_campaigns")
+        .update(patch)
+        .eq(
+          "id",
+          campaignId
+        )
+        .eq(
+          "owner_id",
+          ownerId
+        )
+        .select("*")
+        .maybeSingle();
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ADS][CAMPAIGN_UPDATE_ERROR]",
+          {
+            ownerId,
+            campaignId,
+            code: error.code,
+            message:
+              error.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_UPDATE_ERROR",
+        });
+      }
+
+      if (!data) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_NOT_FOUND",
+        });
+      }
+
+      const placements =
+        await loadAdsCampaignPlacements(
+          ownerId,
+          [campaignId]
+        );
+
+      return res.json({
+        ok: true,
+        campaign:
+          mapAdsCampaignRow(
+            data,
+            placements.get(
+              campaignId
+            ) || []
+          ),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][CAMPAIGN_UPDATE_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_CAMPAIGN_UPDATE_FATAL",
+      });
+    }
+  }
+);
+
+
 app.post("/api/push/register-token", async (req, res) => {
   try {
     if (!supabase) {
