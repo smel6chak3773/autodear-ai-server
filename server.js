@@ -5918,6 +5918,20 @@ app.post(
         listings: "Объявления",
       };
 
+      /*
+       * Формат креатива должен соответствовать
+       * реальному UI-слоту мобильного приложения.
+       *
+       * feed      -> главный Hero AUTODEAR
+       * search    -> большая карточка в поиске
+       * listings  -> нативная карточка объявлений
+       */
+      const placementFormats = {
+        feed: "hero_image",
+        search: "large_card",
+        listings: "feed_native",
+      };
+
       const creative = {
         advertisedObjectType,
         advertisedObjectName,
@@ -5988,13 +6002,15 @@ app.post(
                 ownerId,
 
               /*
-               * Веб-мастер сейчас создаёт
-               * нативный image+text+CTA креатив.
-               * feed/search/listings — поверхность,
-               * она хранится в settings.
+               * placementKey описывает поверхность,
+               * format — реальный рекламный формат,
+               * который понимает мобильный Ads Engine.
                */
               format:
-                "native",
+                placementFormats[
+                  placementKey
+                ] ||
+                "feed_native",
 
               title:
                 `${title} · ${
@@ -6050,11 +6066,22 @@ app.post(
 
               settings: {
                 placementKey,
+
                 placementLabel:
                   placementLabels[
                     placementKey
                   ] ||
                   placementKey,
+
+                adFormat:
+                  placementFormats[
+                    placementKey
+                  ] ||
+                  "feed_native",
+
+                masterAspectRatio:
+                  "16:9",
+
                 weight:
                   weights[
                     placementKey
