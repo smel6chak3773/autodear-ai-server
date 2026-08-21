@@ -5613,6 +5613,648 @@ app.post(
 );
 
 
+
+// ------------------------------------------------------------
+// SUBMIT CAMPAIGN TO MODERATION
+// ------------------------------------------------------------
+
+app.post(
+  "/api/ads/campaigns/:campaignId/submit",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const user =
+        await requireAdsAuthUser(req);
+
+      const ownerId =
+        String(user.id);
+
+      const campaignId =
+        String(
+          req.params?.campaignId ||
+          ""
+        ).trim();
+
+      if (!campaignId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: campaign,
+        error: campaignLoadError,
+      } = await supabase
+        .from("ads_campaigns")
+        .select("*")
+        .eq("id", campaignId)
+        .eq("owner_id", ownerId)
+        .maybeSingle();
+
+      if (campaignLoadError) {
+        console.error(
+          "[AUTODEAR][ADS][SUBMIT_CAMPAIGN_LOAD_ERROR]",
+          {
+            ownerId,
+            campaignId,
+            code:
+              campaignLoadError.code,
+            message:
+              campaignLoadError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_LOAD_ERROR",
+        });
+      }
+
+      if (!campaign) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_NOT_FOUND",
+        });
+      }
+
+      const allowedSourceStatuses =
+        new Set([
+          "draft",
+          "rejected",
+          "moderation",
+        ]);
+
+      if (
+        !allowedSourceStatuses.has(
+          String(
+            campaign.status ||
+            ""
+          )
+        )
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_NOT_EDITABLE",
+        });
+      }
+
+      const title =
+        String(
+          req.body?.title || ""
+        ).trim();
+
+      const description =
+        String(
+          req.body?.description ||
+          ""
+        ).trim();
+
+      const ctaText =
+        String(
+          req.body?.ctaText ||
+          "Подробнее"
+        ).trim();
+
+      const destinationUrl =
+        String(
+          req.body?.destinationUrl ||
+          ""
+        ).trim();
+
+      const imageUri =
+        String(
+          req.body?.imageUri || ""
+        ).trim() || null;
+
+      const advertisedObjectType =
+        String(
+          req.body
+            ?.advertisedObjectType ||
+          ""
+        ).trim();
+
+      const advertisedObjectName =
+        String(
+          req.body
+            ?.advertisedObjectName ||
+          ""
+        ).trim();
+
+      const selectedPlacements =
+        normalizeAdsStringArray(
+          req.body?.placements
+        );
+
+      const allowedPlacementKeys =
+        new Set([
+          "feed",
+          "search",
+          "listings",
+        ]);
+
+      const placementKeys =
+        selectedPlacements.filter(
+          (item) =>
+            allowedPlacementKeys.has(
+              item
+            )
+        );
+
+      const cityIds =
+        normalizeAdsStringArray(
+          req.body?.cityIds
+        );
+
+      const dailyBudgetKopecks =
+        normalizeAdsInteger(
+          req.body
+            ?.dailyBudgetKopecks
+        );
+
+      const totalBudgetKopecks =
+        normalizeAdsInteger(
+          req.body
+            ?.totalBudgetKopecks
+        );
+
+      const durationDays =
+        Math.max(
+          1,
+          Math.min(
+            365,
+            normalizeAdsInteger(
+              req.body?.durationDays
+            )
+          )
+        );
+
+      if (!title) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_TITLE_REQUIRED",
+        });
+      }
+
+      if (!destinationUrl) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_DESTINATION_URL_REQUIRED",
+        });
+      }
+
+      let parsedUrl = null;
+
+      try {
+        parsedUrl =
+          new URL(
+            destinationUrl
+          );
+      } catch {
+        parsedUrl = null;
+      }
+
+      if (
+        !parsedUrl ||
+        ![
+          "http:",
+          "https:",
+        ].includes(
+          parsedUrl.protocol
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_DESTINATION_URL_INVALID",
+        });
+      }
+
+      if (
+        placementKeys.length === 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_PLACEMENTS_REQUIRED",
+        });
+      }
+
+      if (cityIds.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CITIES_REQUIRED",
+        });
+      }
+
+      if (
+        dailyBudgetKopecks <
+        10000
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_DAILY_BUDGET_TOO_LOW",
+        });
+      }
+
+      if (
+        totalBudgetKopecks <
+        dailyBudgetKopecks
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_TOTAL_BUDGET_INVALID",
+        });
+      }
+
+      const startsAt =
+        new Date();
+
+      const endsAt =
+        new Date(
+          startsAt.getTime() +
+          durationDays *
+            24 *
+            60 *
+            60 *
+            1000
+        );
+
+      const weights = {
+        feed: 55,
+        search: 25,
+        listings: 20,
+      };
+
+      const totalWeight =
+        placementKeys.reduce(
+          (sum, key) =>
+            sum +
+            Number(
+              weights[key] || 0
+            ),
+          0
+        ) || 1;
+
+      const placementLabels = {
+        feed: "Главная",
+        search: "Поиск",
+        listings: "Объявления",
+      };
+
+      const creative = {
+        advertisedObjectType,
+        advertisedObjectName,
+        title,
+        description,
+        ctaText,
+        destinationUrl,
+      };
+
+      /*
+       * Сначала удаляем старый набор размещений.
+       * Кампания всё это время остаётся draft /
+       * rejected / moderation и НЕ становится
+       * moderation из-за этой операции.
+       */
+      const {
+        error: deletePlacementsError,
+      } = await supabase
+        .from("ads_placements")
+        .delete()
+        .eq(
+          "campaign_id",
+          campaignId
+        )
+        .eq(
+          "owner_id",
+          ownerId
+        );
+
+      if (deletePlacementsError) {
+        console.error(
+          "[AUTODEAR][ADS][SUBMIT_PLACEMENTS_DELETE_ERROR]",
+          {
+            ownerId,
+            campaignId,
+            code:
+              deletePlacementsError.code,
+            message:
+              deletePlacementsError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_PLACEMENTS_DELETE_ERROR",
+        });
+      }
+
+      const placementRows =
+        placementKeys.map(
+          (placementKey) => {
+            const share =
+              Number(
+                weights[
+                  placementKey
+                ] || 0
+              ) / totalWeight;
+
+            return {
+              id:
+                `ads_placement_${campaignId}_${placementKey}`,
+
+              campaign_id:
+                campaignId,
+
+              owner_id:
+                ownerId,
+
+              /*
+               * Веб-мастер сейчас создаёт
+               * нативный image+text+CTA креатив.
+               * feed/search/listings — поверхность,
+               * она хранится в settings.
+               */
+              format:
+                "native",
+
+              title:
+                `${title} · ${
+                  placementLabels[
+                    placementKey
+                  ] ||
+                  placementKey
+                }`,
+
+              status:
+                "draft",
+
+              billing_model:
+                "cpc",
+
+              price_per_click_kopecks:
+                0,
+
+              price_per_thousand_impressions_kopecks:
+                0,
+
+              price_per_view_kopecks:
+                null,
+
+              billable_video_event:
+                null,
+
+              budget_limit_kopecks:
+                Math.round(
+                  totalBudgetKopecks *
+                    share
+                ),
+
+              daily_limit_kopecks:
+                Math.round(
+                  dailyBudgetKopecks *
+                    share
+                ),
+
+              destination_url:
+                destinationUrl,
+
+              cta_text:
+                ctaText,
+
+              image_uri:
+                imageUri,
+
+              video_uri:
+                null,
+
+              creative,
+
+              settings: {
+                placementKey,
+                placementLabel:
+                  placementLabels[
+                    placementKey
+                  ] ||
+                  placementKey,
+                weight:
+                  weights[
+                    placementKey
+                  ] || 0,
+              },
+            };
+          }
+        );
+
+      const {
+        error: insertPlacementsError,
+      } = await supabase
+        .from("ads_placements")
+        .insert(
+          placementRows
+        );
+
+      if (insertPlacementsError) {
+        console.error(
+          "[AUTODEAR][ADS][SUBMIT_PLACEMENTS_INSERT_ERROR]",
+          {
+            ownerId,
+            campaignId,
+            code:
+              insertPlacementsError.code,
+            message:
+              insertPlacementsError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_PLACEMENTS_INSERT_ERROR",
+        });
+      }
+
+      /*
+       * Подготовленные placements переводим
+       * на модерацию до самой кампании.
+       * Если следующий UPDATE кампании упадёт,
+       * кампания не будет ложно отмечена
+       * как отправленная.
+       */
+      const {
+        error:
+          placementModerationError,
+      } = await supabase
+        .from("ads_placements")
+        .update({
+          status:
+            "moderation",
+        })
+        .eq(
+          "campaign_id",
+          campaignId
+        )
+        .eq(
+          "owner_id",
+          ownerId
+        );
+
+      if (placementModerationError) {
+        console.error(
+          "[AUTODEAR][ADS][SUBMIT_PLACEMENT_STATUS_ERROR]",
+          {
+            ownerId,
+            campaignId,
+            code:
+              placementModerationError.code,
+            message:
+              placementModerationError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_PLACEMENT_STATUS_ERROR",
+        });
+      }
+
+      /*
+       * КАМПАНИЯ ПЕРЕХОДИТ В MODERATION
+       * ТОЛЬКО ПОСЛЕДНИМ ШАГОМ.
+       */
+      const {
+        data: updatedCampaign,
+        error: updateCampaignError,
+      } = await supabase
+        .from("ads_campaigns")
+        .update({
+          total_budget_kopecks:
+            totalBudgetKopecks,
+
+          daily_budget_kopecks:
+            dailyBudgetKopecks,
+
+          starts_at:
+            startsAt.toISOString(),
+
+          ends_at:
+            endsAt.toISOString(),
+
+          city_ids:
+            cityIds,
+
+          status:
+            "moderation",
+        })
+        .eq(
+          "id",
+          campaignId
+        )
+        .eq(
+          "owner_id",
+          ownerId
+        )
+        .select("*")
+        .maybeSingle();
+
+      if (updateCampaignError) {
+        console.error(
+          "[AUTODEAR][ADS][SUBMIT_CAMPAIGN_UPDATE_ERROR]",
+          {
+            ownerId,
+            campaignId,
+            code:
+              updateCampaignError.code,
+            message:
+              updateCampaignError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_SUBMIT_UPDATE_ERROR",
+        });
+      }
+
+      if (!updatedCampaign) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_NOT_FOUND",
+        });
+      }
+
+      const placements =
+        await loadAdsCampaignPlacements(
+          ownerId,
+          [campaignId]
+        );
+
+      console.log(
+        "[AUTODEAR][ADS][CAMPAIGN_SUBMITTED]",
+        {
+          ownerId,
+          campaignId,
+          placements:
+            placementKeys,
+          cityIds,
+          dailyBudgetKopecks,
+          totalBudgetKopecks,
+        }
+      );
+
+      return res.json({
+        ok: true,
+        campaign:
+          mapAdsCampaignRow(
+            updatedCampaign,
+            placements.get(
+              campaignId
+            ) || []
+          ),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][CAMPAIGN_SUBMIT_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_CAMPAIGN_SUBMIT_FATAL",
+      });
+    }
+  }
+);
+
+
 // ------------------------------------------------------------
 // UPDATE CAMPAIGN
 // ------------------------------------------------------------
