@@ -5162,6 +5162,61 @@ async function requireAdsAuthUser(req) {
 }
 
 
+function getAdsStaffRole(user) {
+  const protectedRole =
+    String(
+      user?.app_metadata?.role ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const compatibilityRole =
+    String(
+      user?.user_metadata?.role ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const role =
+    protectedRole ||
+    compatibilityRole;
+
+  return [
+    "admin",
+    "director",
+    "developer",
+  ].includes(role)
+    ? role
+    : "";
+}
+
+
+async function requireAdsStaffUser(req) {
+  const user =
+    await requireAdsAuthUser(req);
+
+  const role =
+    getAdsStaffRole(user);
+
+  if (!role) {
+    const error =
+      new Error(
+        "ADS_STAFF_ACCESS_REQUIRED"
+      );
+
+    error.statusCode = 403;
+    throw error;
+  }
+
+  return {
+    user,
+    role,
+  };
+}
+
+
 function normalizeAdsInteger(value) {
   const number = Number(value || 0);
 
@@ -5249,6 +5304,18 @@ function mapAdsPlacementRow(row) {
 
     videoUri:
       row.video_uri || null,
+
+    creative:
+      row.creative &&
+      typeof row.creative === "object"
+        ? row.creative
+        : {},
+
+    settings:
+      row.settings &&
+      typeof row.settings === "object"
+        ? row.settings
+        : {},
 
     createdAt:
       row.created_at,
@@ -5363,6 +5430,597 @@ async function loadAdsCampaignPlacements(
 
   return byCampaign;
 }
+
+
+// ------------------------------------------------------------
+// ADS STAFF MODERATION
+// ------------------------------------------------------------
+
+app.get(
+  "/api/ads/moderation/campaigns",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+        role,
+      } =
+        await requireAdsStaffUser(req);
+
+      const {
+        data: rows,
+        error,
+      } = await supabase
+        .from("ads_campaigns")
+        .select("*")
+        .eq(
+          "status",
+          "moderation"
+        )
+        .order(
+          "updated_at",
+          {
+            ascending: true,
+          }
+        );
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ADS][MODERATION_LIST_ERROR]",
+          {
+            moderatorId:
+              user.id,
+            role,
+            code:
+              error.code,
+            message:
+              error.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_MODERATION_LIST_ERROR",
+        });
+      }
+
+      const campaignIds =
+        (rows || []).map(
+          (row) => row.id
+        );
+
+      /*
+       * Staff moderation deliberately loads
+       * placements without owner filtering,
+       * because the queue contains campaigns
+       * belonging to many advertisers.
+       */
+      const {
+        data: placementRows,
+        error:
+          placementLoadError,
+      } = campaignIds.length
+        ? await supabase
+            .from(
+              "ads_placements"
+            )
+            .select("*")
+            .in(
+              "campaign_id",
+              campaignIds
+            )
+            .order(
+              "created_at",
+              {
+                ascending: true,
+              }
+            )
+        : {
+            data: [],
+            error: null,
+          };
+
+      if (placementLoadError) {
+        console.error(
+          "[AUTODEAR][ADS][MODERATION_PLACEMENTS_LOAD_ERROR]",
+          {
+            moderatorId:
+              user.id,
+            role,
+            code:
+              placementLoadError.code,
+            message:
+              placementLoadError.message,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_MODERATION_PLACEMENTS_LOAD_ERROR",
+        });
+      }
+
+      const byCampaign =
+        new Map();
+
+      for (
+        const row
+        of placementRows || []
+      ) {
+        const campaignId =
+          String(
+            row.campaign_id || ""
+          );
+
+        const current =
+          byCampaign.get(
+            campaignId
+          ) || [];
+
+        current.push(row);
+
+        byCampaign.set(
+          campaignId,
+          current
+        );
+      }
+
+      const campaigns =
+        (rows || []).map(
+          (row) =>
+            mapAdsCampaignRow(
+              row,
+              byCampaign.get(
+                row.id
+              ) || []
+            )
+        );
+
+      return res.json({
+        ok: true,
+        moderator: {
+          id:
+            String(user.id),
+          role,
+        },
+        campaigns,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][MODERATION_LIST_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_MODERATION_LIST_FATAL",
+      });
+    }
+  }
+);
+
+
+app.get(
+  "/api/ads/moderation/campaigns/:campaignId",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+        role,
+      } =
+        await requireAdsStaffUser(req);
+
+      const campaignId =
+        String(
+          req.params
+            ?.campaignId ||
+          ""
+        ).trim();
+
+      if (!campaignId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: campaign,
+        error,
+      } = await supabase
+        .from("ads_campaigns")
+        .select("*")
+        .eq(
+          "id",
+          campaignId
+        )
+        .maybeSingle();
+
+      if (error) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_MODERATION_CAMPAIGN_LOAD_ERROR",
+        });
+      }
+
+      if (!campaign) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_NOT_FOUND",
+        });
+      }
+
+      const {
+        data: placements,
+        error:
+          placementsError,
+      } = await supabase
+        .from("ads_placements")
+        .select("*")
+        .eq(
+          "campaign_id",
+          campaignId
+        )
+        .order(
+          "created_at",
+          {
+            ascending: true,
+          }
+        );
+
+      if (placementsError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_MODERATION_PLACEMENTS_LOAD_ERROR",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][ADS][MODERATION_CAMPAIGN_OPENED]",
+        {
+          moderatorId:
+            user.id,
+          role,
+          campaignId,
+        }
+      );
+
+      return res.json({
+        ok: true,
+        campaign:
+          mapAdsCampaignRow(
+            campaign,
+            placements || []
+          ),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_MODERATION_CAMPAIGN_FATAL",
+      });
+    }
+  }
+);
+
+
+async function applyAdsModerationDecision({
+  campaignId,
+  moderatorId,
+  moderatorRole,
+  decision,
+  comment,
+}) {
+  const allowed =
+    new Set([
+      "approve",
+      "changes",
+      "reject",
+    ]);
+
+  if (!allowed.has(decision)) {
+    const error =
+      new Error(
+        "ADS_MODERATION_DECISION_INVALID"
+      );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const {
+    data: campaign,
+    error: loadError,
+  } = await supabase
+    .from("ads_campaigns")
+    .select("*")
+    .eq(
+      "id",
+      campaignId
+    )
+    .maybeSingle();
+
+  if (loadError) {
+    throw new Error(
+      `ADS_MODERATION_CAMPAIGN_LOAD_ERROR:${loadError.message}`
+    );
+  }
+
+  if (!campaign) {
+    const error =
+      new Error(
+        "ADS_CAMPAIGN_NOT_FOUND"
+      );
+
+    error.statusCode = 404;
+    throw error;
+  }
+
+  if (
+    String(
+      campaign.status || ""
+    ) !== "moderation"
+  ) {
+    const error =
+      new Error(
+        "ADS_CAMPAIGN_NOT_IN_MODERATION"
+      );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const cleanComment =
+    String(
+      comment || ""
+    ).trim();
+
+  if (
+    (
+      decision === "changes" ||
+      decision === "reject"
+    ) &&
+    !cleanComment
+  ) {
+    const error =
+      new Error(
+        "ADS_MODERATION_COMMENT_REQUIRED"
+      );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  /*
+   * Existing campaign status model:
+   * approve -> active
+   * changes -> draft
+   * reject  -> rejected
+   *
+   * Placement statuses follow the same
+   * operational state.
+   */
+  const campaignStatus =
+    decision === "approve"
+      ? "active"
+      : decision === "changes"
+        ? "draft"
+        : "rejected";
+
+  const placementStatus =
+    decision === "approve"
+      ? "active"
+      : decision === "changes"
+        ? "draft"
+        : "rejected";
+
+  const {
+    error: placementError,
+  } = await supabase
+    .from("ads_placements")
+    .update({
+      status:
+        placementStatus,
+    })
+    .eq(
+      "campaign_id",
+      campaignId
+    );
+
+  if (placementError) {
+    throw new Error(
+      `ADS_MODERATION_PLACEMENT_UPDATE_ERROR:${placementError.message}`
+    );
+  }
+
+  const {
+    data: updatedCampaign,
+    error: campaignError,
+  } = await supabase
+    .from("ads_campaigns")
+    .update({
+      status:
+        campaignStatus,
+    })
+    .eq(
+      "id",
+      campaignId
+    )
+    .select("*")
+    .maybeSingle();
+
+  if (campaignError) {
+    throw new Error(
+      `ADS_MODERATION_CAMPAIGN_UPDATE_ERROR:${campaignError.message}`
+    );
+  }
+
+  console.log(
+    "[AUTODEAR][ADS][MODERATION_DECISION]",
+    {
+      moderatorId,
+      moderatorRole,
+      campaignId,
+      decision,
+      comment:
+        cleanComment,
+      campaignStatus,
+    }
+  );
+
+  return updatedCampaign;
+}
+
+
+app.post(
+  "/api/ads/moderation/campaigns/:campaignId/decision",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+        role,
+      } =
+        await requireAdsStaffUser(req);
+
+      const campaignId =
+        String(
+          req.params
+            ?.campaignId ||
+          ""
+        ).trim();
+
+      const decision =
+        String(
+          req.body?.decision ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      const comment =
+        String(
+          req.body?.comment ||
+          ""
+        ).trim();
+
+      if (!campaignId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_ID_REQUIRED",
+        });
+      }
+
+      const updatedCampaign =
+        await applyAdsModerationDecision({
+          campaignId,
+          moderatorId:
+            String(user.id),
+          moderatorRole:
+            role,
+          decision,
+          comment,
+        });
+
+      const {
+        data: placements,
+        error:
+          placementsError,
+      } = await supabase
+        .from("ads_placements")
+        .select("*")
+        .eq(
+          "campaign_id",
+          campaignId
+        )
+        .order(
+          "created_at",
+          {
+            ascending: true,
+          }
+        );
+
+      if (placementsError) {
+        throw new Error(
+          `ADS_MODERATION_PLACEMENTS_LOAD_ERROR:${placementsError.message}`
+        );
+      }
+
+      return res.json({
+        ok: true,
+        decision,
+        comment,
+        campaign:
+          mapAdsCampaignRow(
+            updatedCampaign,
+            placements || []
+          ),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][MODERATION_DECISION_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_MODERATION_DECISION_FATAL",
+      });
+    }
+  }
+);
 
 
 // ------------------------------------------------------------
