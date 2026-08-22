@@ -497,6 +497,438 @@ app.get("/api/business/bookings", async (req, res) => {
 });
 
 
+
+app.patch("/api/business/bookings/:id", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  const bookingId =
+    String(
+      req.params?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!bookingId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "BOOKING_ID_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  const allowedStatuses =
+    new Set([
+      "new",
+      "confirmed",
+      "in_progress",
+      "completed",
+      "cancelled",
+    ]);
+
+  try {
+    /*
+     * SECURITY:
+     * The authenticated user may update
+     * bookings only for stations they own.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("id")
+      .eq("owner_id", userId);
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][BOOKING_PATCH_STATIONS_ERROR]",
+        stationsError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const stationIds =
+      (
+        Array.isArray(stations)
+          ? stations
+          : []
+      )
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const {
+      data: current,
+      error: currentError,
+    } = await supabase
+      .from("business_bookings")
+      .select("*")
+      .eq("id", bookingId)
+      .in(
+        "business_id",
+        stationIds
+      )
+      .maybeSingle();
+
+    if (currentError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][BOOKING_LOOKUP_ERROR]",
+        currentError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BOOKING_LOOKUP_FAILED",
+      });
+    }
+
+    if (!current) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BOOKING_NOT_FOUND",
+      });
+    }
+
+    const patch = {};
+
+    if (
+      req.body?.status != null
+    ) {
+      const status =
+        String(
+          req.body.status
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        !allowedStatuses.has(
+          status
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_STATUS_INVALID",
+        });
+      }
+
+      patch.status =
+        status;
+    }
+
+    if (
+      req.body?.date != null
+    ) {
+      const date =
+        String(
+          req.body.date
+        )
+          .trim()
+          .slice(0, 10);
+
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(
+          date
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_DATE_INVALID",
+        });
+      }
+
+      patch.booking_date =
+        date;
+    }
+
+    if (
+      req.body?.startTime != null
+    ) {
+      const startTime =
+        String(
+          req.body.startTime
+        )
+          .trim()
+          .slice(0, 5);
+
+      if (
+        !/^\d{2}:\d{2}$/.test(
+          startTime
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_TIME_INVALID",
+        });
+      }
+
+      patch.start_time =
+        startTime;
+    }
+
+    if (
+      req.body?.durationMinutes != null
+    ) {
+      const durationMinutes =
+        Number(
+          req.body.durationMinutes
+        );
+
+      if (
+        !Number.isFinite(
+          durationMinutes
+        ) ||
+        durationMinutes < 15
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_DURATION_INVALID",
+        });
+      }
+
+      patch.duration_minutes =
+        Math.round(
+          durationMinutes
+        );
+    }
+
+    if (
+      req.body?.postNumber != null
+    ) {
+      const postNumber =
+        Number(
+          req.body.postNumber
+        );
+
+      if (
+        !Number.isInteger(
+          postNumber
+        ) ||
+        postNumber < 1
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_POST_INVALID",
+        });
+      }
+
+      patch.post_number =
+        postNumber;
+    }
+
+    if (
+      !Object.keys(patch).length
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "BOOKING_PATCH_EMPTY",
+      });
+    }
+
+    patch.updated_at =
+      new Date().toISOString();
+
+    const {
+      data: updated,
+      error: updateError,
+    } = await supabase
+      .from("business_bookings")
+      .update(patch)
+      .eq("id", bookingId)
+      .in(
+        "business_id",
+        stationIds
+      )
+      .select("*")
+      .single();
+
+    if (updateError) {
+      const isConflict =
+        updateError.code ===
+          "23P01" ||
+        String(
+          updateError.message || ""
+        ).includes(
+          "business_bookings_no_overlap"
+        );
+
+      if (isConflict) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BOOKING_CONFLICT",
+        });
+      }
+
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][BOOKING_PATCH_ERROR]",
+        {
+          bookingId,
+          userId,
+          code:
+            updateError.code ||
+            null,
+          message:
+            updateError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BOOKING_UPDATE_FAILED",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][WEB_BUSINESS][BOOKING_UPDATED]",
+      {
+        userId,
+        bookingId,
+        status:
+          updated?.status ||
+          null,
+      }
+    );
+
+    return res.json({
+      ok: true,
+
+      booking: {
+        id:
+          updated.id,
+
+        businessId:
+          updated.business_id,
+
+        customerName:
+          updated.customer_name ||
+          "Клиент AUTODEAR",
+
+        customerPhone:
+          updated.customer_phone ||
+          null,
+
+        car:
+          updated.car ||
+          null,
+
+        plate:
+          updated.plate ||
+          null,
+
+        vin:
+          updated.vin ||
+          null,
+
+        service:
+          updated.service ||
+          null,
+
+        comment:
+          updated.comment ||
+          null,
+
+        date:
+          updated.booking_date ||
+          null,
+
+        startTime:
+          updated.start_time ||
+          null,
+
+        durationMinutes:
+          Number(
+            updated.duration_minutes ||
+            60
+          ),
+
+        postNumber:
+          Number(
+            updated.post_number ||
+            1
+          ),
+
+        status:
+          updated.status ||
+          "confirmed",
+
+        updatedAt:
+          updated.updated_at ||
+          null,
+      },
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][BOOKING_PATCH_FATAL]",
+      {
+        userId,
+        bookingId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BOOKING_UPDATE_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/auth/me", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
