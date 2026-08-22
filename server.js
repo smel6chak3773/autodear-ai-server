@@ -20,6 +20,13 @@ const stsMultipartUpload = multer({
   },
 });
 
+const adsCreativeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 8 * 1024 * 1024,
+  },
+});
+
 const vehicleCheckCache = new Map();
 const geocodeCache = new Map();
 
@@ -5248,6 +5255,7 @@ function normalizeAdsStringArray(value) {
 }
 
 
+
 function mapAdsPlacementRow(row) {
   return {
     id: row.id,
@@ -5430,6 +5438,248 @@ async function loadAdsCampaignPlacements(
 
   return byCampaign;
 }
+
+
+// ------------------------------------------------------------
+// UPLOAD ADS CREATIVE IMAGE
+// ------------------------------------------------------------
+
+app.post(
+  "/api/ads/campaigns/:campaignId/creative-image",
+  adsCreativeUpload.single("file"),
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const user =
+        await requireAdsAuthUser(req);
+
+      const ownerId =
+        String(user.id);
+
+      const campaignId =
+        String(
+          req.params?.campaignId || ""
+        ).trim();
+
+      if (!campaignId) {
+        return res.status(400).json({
+          ok: false,
+          error: "ADS_CAMPAIGN_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: campaign,
+        error: campaignError,
+      } = await supabase
+        .from("ads_campaigns")
+        .select("id,owner_id,status")
+        .eq("id", campaignId)
+        .eq("owner_id", ownerId)
+        .maybeSingle();
+
+      if (campaignError) {
+        console.error(
+          "[AUTODEAR][ADS][CREATIVE_CAMPAIGN_LOAD_ERROR]",
+          campaignError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ADS_CREATIVE_CAMPAIGN_LOAD_ERROR",
+        });
+      }
+
+      if (!campaign) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "ADS_CAMPAIGN_NOT_FOUND",
+        });
+      }
+
+      const file =
+        req.file;
+
+      if (!file?.buffer?.length) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "ADS_CREATIVE_FILE_REQUIRED",
+        });
+      }
+
+      const mimeType =
+        String(
+          file.mimetype || ""
+        ).toLowerCase();
+
+      const extensionByMime = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+      };
+
+      const extension =
+        extensionByMime[mimeType];
+
+      if (!extension) {
+        return res.status(415).json({
+          ok: false,
+          error:
+            "ADS_CREATIVE_IMAGE_TYPE_UNSUPPORTED",
+        });
+      }
+
+      const bucket =
+        "ads-creatives";
+
+      /*
+       * Bucket создаётся один раз.
+       * Дальше этот блок просто увидит,
+       * что он уже существует.
+       */
+      const {
+        data: buckets,
+        error: bucketListError,
+      } =
+        await supabase.storage
+          .listBuckets();
+
+      if (bucketListError) {
+        throw new Error(
+          `ADS_CREATIVE_BUCKET_LIST_ERROR:${bucketListError.message}`
+        );
+      }
+
+      const bucketExists =
+        (buckets || []).some(
+          (item) =>
+            item.name === bucket
+        );
+
+      if (!bucketExists) {
+        const {
+          error: createBucketError,
+        } =
+          await supabase.storage
+            .createBucket(
+              bucket,
+              {
+                public: true,
+                fileSizeLimit:
+                  8 * 1024 * 1024,
+                allowedMimeTypes: [
+                  "image/jpeg",
+                  "image/png",
+                  "image/webp",
+                ],
+              }
+            );
+
+        if (createBucketError) {
+          throw new Error(
+            `ADS_CREATIVE_BUCKET_CREATE_ERROR:${createBucketError.message}`
+          );
+        }
+      }
+
+      const storagePath =
+        `${ownerId}/${campaignId}/creative-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 10)}.${extension}`;
+
+      const {
+        error: uploadError,
+      } =
+        await supabase.storage
+          .from(bucket)
+          .upload(
+            storagePath,
+            file.buffer,
+            {
+              contentType:
+                mimeType,
+              cacheControl:
+                "3600",
+              upsert: false,
+            }
+          );
+
+      if (uploadError) {
+        throw new Error(
+          `ADS_CREATIVE_UPLOAD_ERROR:${uploadError.message}`
+        );
+      }
+
+      const {
+        data: publicData,
+      } =
+        supabase.storage
+          .from(bucket)
+          .getPublicUrl(
+            storagePath
+          );
+
+      const imageUrl =
+        String(
+          publicData?.publicUrl ||
+          ""
+        ).trim();
+
+      if (!imageUrl) {
+        throw new Error(
+          "ADS_CREATIVE_PUBLIC_URL_MISSING"
+        );
+      }
+
+      console.log(
+        "[AUTODEAR][ADS][CREATIVE_UPLOADED]",
+        {
+          ownerId,
+          campaignId,
+          bucket,
+          storagePath,
+          bytes:
+            file.buffer.length,
+          mimeType,
+        }
+      );
+
+      return res.json({
+        ok: true,
+        imageUrl,
+        bucket,
+        storagePath,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][ADS][CREATIVE_UPLOAD_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "ADS_CREATIVE_UPLOAD_FATAL",
+      });
+    }
+  }
+);
 
 
 // ------------------------------------------------------------
