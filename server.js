@@ -237,6 +237,266 @@ app.get("/health", (req, res) => {
   });
 });
 
+
+app.get("/api/business/bookings", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * The browser never chooses business_id.
+     * We first resolve stations owned by the
+     * authenticated Supabase user.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("id,owner_id,name,legal_name")
+      .eq("owner_id", userId);
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][BOOKINGS_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code || null,
+          message:
+            stationsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    if (!ownedStations.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const stationIds =
+      ownedStations
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    const {
+      data: bookings,
+      error: bookingsError,
+    } = await supabase
+      .from("business_bookings")
+      .select("*")
+      .in(
+        "business_id",
+        stationIds
+      )
+      .order(
+        "booking_date",
+        {
+          ascending: true,
+        }
+      )
+      .order(
+        "start_time",
+        {
+          ascending: true,
+        }
+      );
+
+    if (bookingsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][BOOKINGS_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            bookingsError.code || null,
+          message:
+            bookingsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_BOOKINGS_LOAD_FAILED",
+      });
+    }
+
+    const rows =
+      Array.isArray(bookings)
+        ? bookings
+        : [];
+
+    return res.json({
+      ok: true,
+
+      businesses:
+        ownedStations.map(
+          (station) => ({
+            id:
+              station.id,
+            name:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+          })
+        ),
+
+      bookings:
+        rows.map(
+          (booking) => ({
+            id:
+              booking.id,
+
+            businessId:
+              booking.business_id,
+
+            requestId:
+              booking.request_id ||
+              null,
+
+            customerId:
+              booking.customer_id ||
+              null,
+
+            customerName:
+              booking.customer_name ||
+              "Клиент AUTODEAR",
+
+            customerPhone:
+              booking.customer_phone ||
+              null,
+
+            car:
+              booking.car ||
+              null,
+
+            plate:
+              booking.plate ||
+              null,
+
+            vin:
+              booking.vin ||
+              null,
+
+            service:
+              booking.service ||
+              null,
+
+            comment:
+              booking.comment ||
+              null,
+
+            date:
+              booking.booking_date ||
+              null,
+
+            startTime:
+              booking.start_time ||
+              null,
+
+            durationMinutes:
+              Number(
+                booking.duration_minutes ||
+                60
+              ),
+
+            postNumber:
+              Number(
+                booking.post_number ||
+                1
+              ),
+
+            source:
+              booking.source ||
+              null,
+
+            status:
+              booking.status ||
+              "confirmed",
+
+            customerConfirmationStatus:
+              booking.customer_confirmation_status ||
+              null,
+
+            createdAt:
+              booking.created_at ||
+              null,
+
+            updatedAt:
+              booking.updated_at ||
+              null,
+          })
+        ),
+
+      count:
+        rows.length,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][BOOKINGS_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_BOOKINGS_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/auth/me", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
