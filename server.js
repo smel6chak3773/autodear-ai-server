@@ -241,9 +241,12 @@ app.get("/api/auth/me", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
 
+  const authUser =
+    authResult?.user || null;
+
   const userId =
     String(
-      authResult?.user?.id || ""
+      authUser?.id || ""
     ).trim();
 
   if (!userId) {
@@ -255,13 +258,276 @@ app.get("/api/auth/me", async (req, res) => {
     });
   }
 
-  return res.json({
-    ok: true,
-    userId,
-    email:
-      authResult?.user?.email ||
-      null,
-  });
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: profile,
+      error: profileError,
+    } = await supabase
+      .from("profiles")
+      .select(
+        [
+          "id",
+          "auth_user_id",
+          "name",
+          "email",
+          "phone",
+          "role",
+          "city",
+          "avatar_url",
+        ].join(",")
+      )
+      .or(
+        `auth_user_id.eq.${userId},id.eq.${userId}`
+      )
+      .limit(1)
+      .maybeSingle();
+
+    if (profileError) {
+      console.error(
+        "[AUTODEAR][WEB_AUTH][PROFILE_ERROR]",
+        {
+          userId,
+          code:
+            profileError.code ||
+            null,
+          message:
+            profileError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "AUTH_PROFILE_LOOKUP_FAILED",
+      });
+    }
+
+    /*
+     * SECURITY:
+     * Web permissions come only from profiles.role
+     * loaded by the trusted server-side Supabase client.
+     *
+     * Never trust a role sent by the browser.
+     */
+    const allowedRoles =
+      new Set([
+        "user",
+        "business",
+        "admin",
+        "director",
+        "developer",
+      ]);
+
+    const rawRole =
+      String(
+        profile?.role || "user"
+      )
+        .trim()
+        .toLowerCase();
+
+    const role =
+      allowedRoles.has(rawRole)
+        ? rawRole
+        : "user";
+
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        [
+          "id",
+          "owner_id",
+          "name",
+          "legal_name",
+          "business_type",
+          "city",
+          "address",
+          "phone",
+          "email",
+          "photo_url",
+          "status",
+          "is_active",
+          "is_verified",
+        ].join(",")
+      )
+      .eq("owner_id", userId)
+      .order(
+        "created_at",
+        {
+          ascending: true,
+        }
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_AUTH][STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "AUTH_BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    const hasBusiness =
+      ownedStations.length > 0;
+
+    /*
+     * A real station owned by this authenticated
+     * user grants access to the business workspace.
+     *
+     * Staff workspaces still require profiles.role.
+     */
+    const workspaces = [];
+
+    if (
+      hasBusiness ||
+      role === "business"
+    ) {
+      workspaces.push("business");
+    }
+
+    if (role === "admin") {
+      workspaces.push("admin");
+    }
+
+    if (role === "director") {
+      workspaces.push("director");
+    }
+
+    if (role === "developer") {
+      workspaces.push("developer");
+    }
+
+    console.log(
+      "[AUTODEAR][WEB_AUTH][ME_OK]",
+      {
+        userId,
+        role,
+        hasBusiness,
+        stations:
+          ownedStations.length,
+        workspaces,
+      }
+    );
+
+    return res.json({
+      ok: true,
+
+      user: {
+        id:
+          userId,
+        email:
+          profile?.email ||
+          authUser?.email ||
+          null,
+        name:
+          profile?.name ||
+          authUser?.user_metadata?.name ||
+          null,
+        phone:
+          profile?.phone ||
+          null,
+        city:
+          profile?.city ||
+          null,
+        avatarUrl:
+          profile?.avatar_url ||
+          null,
+        role,
+      },
+
+      access: {
+        role,
+        hasBusiness,
+        workspaces,
+      },
+
+      businesses:
+        ownedStations.map(
+          (station) => ({
+            id:
+              station.id,
+            ownerId:
+              station.owner_id,
+            name:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+            legalName:
+              station.legal_name ||
+              null,
+            businessType:
+              station.business_type ||
+              null,
+            city:
+              station.city ||
+              null,
+            address:
+              station.address ||
+              null,
+            phone:
+              station.phone ||
+              null,
+            email:
+              station.email ||
+              null,
+            photoUrl:
+              station.photo_url ||
+              null,
+            status:
+              station.status ||
+              null,
+            isActive:
+              station.is_active !== false,
+            isVerified:
+              station.is_verified === true,
+          })
+        ),
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_AUTH][ME_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "AUTH_ME_FAILED",
+    });
+  }
 });
 
 app.get("/api/vehicle-reports/balance", async (req, res) => {
