@@ -239,6 +239,753 @@ app.get("/health", (req, res) => {
 
 
 
+
+app.get("/api/business/services", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        [
+          "id",
+          "owner_id",
+          "name",
+          "legal_name",
+          "services",
+          "directions",
+          "service_prices",
+        ].join(",")
+      )
+      .eq("owner_id", userId)
+      .order(
+        "created_at",
+        {
+          ascending: true,
+        }
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SERVICES_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_SERVICES_STATIONS_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    const stationIds =
+      ownedStations
+        .map(
+          (station) =>
+            String(
+              station?.id || ""
+            ).trim()
+        )
+        .filter(Boolean);
+
+    let links = [];
+
+    if (stationIds.length) {
+      const {
+        data: serviceLinks,
+        error: linksError,
+      } = await supabase
+        .from("station_services")
+        .select(
+          [
+            "id",
+            "station_id",
+            "service_id",
+            "title",
+            "direction",
+          ].join(",")
+        )
+        .in(
+          "station_id",
+          stationIds
+        );
+
+      if (linksError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][SERVICES_LINKS_ERROR]",
+          {
+            userId,
+            code:
+              linksError.code ||
+              null,
+            message:
+              linksError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_SERVICES_LINKS_FAILED",
+        });
+      }
+
+      links =
+        Array.isArray(serviceLinks)
+          ? serviceLinks
+          : [];
+    }
+
+    const businesses =
+      ownedStations.map(
+        (station) => {
+          const stationId =
+            String(
+              station?.id || ""
+            );
+
+          const stationLinks =
+            links
+              .filter(
+                (link) =>
+                  String(
+                    link?.station_id ||
+                    ""
+                  ) === stationId
+              )
+              .map(
+                (link) => ({
+                  id:
+                    link.id ||
+                    null,
+
+                  stationId:
+                    link.station_id ||
+                    stationId,
+
+                  serviceId:
+                    link.service_id ||
+                    null,
+
+                  title:
+                    link.title ||
+                    "Услуга",
+
+                  direction:
+                    link.direction ||
+                    null,
+                })
+              );
+
+          return {
+            id:
+              stationId,
+
+            name:
+              station?.name ||
+              station?.legal_name ||
+              "Бизнес AUTODEAR",
+
+            directions:
+              Array.isArray(
+                station?.directions
+              )
+                ? station.directions
+                : [],
+
+            services:
+              stationLinks,
+
+            servicePrices:
+              station?.service_prices &&
+              typeof station.service_prices ===
+                "object"
+                ? station.service_prices
+                : {},
+          };
+        }
+      );
+
+    console.log(
+      "[AUTODEAR][WEB_BUSINESS][SERVICES_OK]",
+      {
+        userId,
+        businesses:
+          businesses.length,
+        links:
+          links.length,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      businesses,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][SERVICES_UNEXPECTED]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_SERVICES_FAILED",
+    });
+  }
+});
+
+
+app.patch(
+  "/api/business/services/:businessId",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const userId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    const businessId =
+      String(
+        req.params.businessId || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!businessId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "BUSINESS_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      /*
+       * SECURITY:
+       * Never trust businessId from browser.
+       * The station must belong to the
+       * authenticated Supabase user.
+       */
+      const {
+        data: station,
+        error: stationError,
+      } = await supabase
+        .from("stations")
+        .select(
+          [
+            "id",
+            "owner_id",
+            "name",
+            "legal_name",
+            "service_prices",
+          ].join(",")
+        )
+        .eq(
+          "id",
+          businessId
+        )
+        .eq(
+          "owner_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (stationError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][SERVICES_OWNER_ERROR]",
+          {
+            userId,
+            businessId,
+            code:
+              stationError.code ||
+              null,
+            message:
+              stationError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCESS_DENIED",
+        });
+      }
+
+      const requestedServices =
+        Array.isArray(
+          req.body?.services
+        )
+          ? req.body.services
+          : null;
+
+      if (!requestedServices) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "SERVICES_REQUIRED",
+        });
+      }
+
+      /*
+       * Browser may select only services that
+       * already exist in the global catalog.
+       * Creating new global services is reserved
+       * for the moderation/admin workflow.
+       */
+      const requestedMap =
+        new Map();
+
+      for (
+        const raw of
+        requestedServices
+      ) {
+        const serviceId =
+          String(
+            raw?.serviceId ||
+            raw?.id ||
+            ""
+          ).trim();
+
+        if (!serviceId) {
+          continue;
+        }
+
+        requestedMap.set(
+          serviceId,
+          {
+            serviceId,
+
+            title:
+              String(
+                raw?.title || ""
+              ).trim(),
+
+            direction:
+              String(
+                raw?.direction || ""
+              ).trim(),
+          }
+        );
+      }
+
+      const requestedIds =
+        Array.from(
+          requestedMap.keys()
+        );
+
+      let catalogRows = [];
+
+      if (requestedIds.length) {
+        const {
+          data: catalog,
+          error: catalogError,
+        } = await supabase
+          .from("services")
+          .select(
+            [
+              "id",
+              "title",
+              "category",
+            ].join(",")
+          )
+          .in(
+            "id",
+            requestedIds
+          );
+
+        if (catalogError) {
+          console.error(
+            "[AUTODEAR][WEB_BUSINESS][SERVICE_CATALOG_ERROR]",
+            {
+              userId,
+              businessId,
+              code:
+                catalogError.code ||
+                null,
+              message:
+                catalogError.message ||
+                null,
+            }
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              "SERVICE_CATALOG_LOOKUP_FAILED",
+          });
+        }
+
+        catalogRows =
+          Array.isArray(catalog)
+            ? catalog
+            : [];
+
+        const validIds =
+          new Set(
+            catalogRows.map(
+              (item) =>
+                String(
+                  item?.id || ""
+                )
+            )
+          );
+
+        const invalidIds =
+          requestedIds.filter(
+            (id) =>
+              !validIds.has(id)
+          );
+
+        if (invalidIds.length) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "UNKNOWN_SERVICE",
+            invalidServiceIds:
+              invalidIds,
+          });
+        }
+      }
+
+      const {
+        error: deleteError,
+      } = await supabase
+        .from("station_services")
+        .delete()
+        .eq(
+          "station_id",
+          businessId
+        );
+
+      if (deleteError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][SERVICES_CLEAR_ERROR]",
+          {
+            userId,
+            businessId,
+            code:
+              deleteError.code ||
+              null,
+            message:
+              deleteError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_SERVICES_CLEAR_FAILED",
+        });
+      }
+
+      const rows =
+        catalogRows.map(
+          (catalogItem) => {
+            const serviceId =
+              String(
+                catalogItem?.id || ""
+              );
+
+            const requested =
+              requestedMap.get(
+                serviceId
+              ) || {};
+
+            const title =
+              String(
+                catalogItem?.title ||
+                requested.title ||
+                "Услуга"
+              ).trim();
+
+            const direction =
+              String(
+                requested.direction ||
+                catalogItem?.category ||
+                ""
+              ).trim();
+
+            return {
+              id:
+                `${businessId}_${serviceId}`,
+
+              station_id:
+                businessId,
+
+              service_id:
+                serviceId,
+
+              title,
+
+              direction,
+            };
+          }
+        );
+
+      if (rows.length) {
+        const {
+          error: insertError,
+        } = await supabase
+          .from("station_services")
+          .upsert(rows);
+
+        if (insertError) {
+          console.error(
+            "[AUTODEAR][WEB_BUSINESS][SERVICES_SAVE_ERROR]",
+            {
+              userId,
+              businessId,
+              code:
+                insertError.code ||
+                null,
+              message:
+                insertError.message ||
+                null,
+            }
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              "BUSINESS_SERVICES_SAVE_FAILED",
+          });
+        }
+      }
+
+      const titles =
+        rows.map(
+          (row) =>
+            row.title
+        );
+
+      const directions =
+        Array.from(
+          new Set(
+            rows
+              .map(
+                (row) =>
+                  row.direction
+              )
+              .filter(Boolean)
+          )
+        );
+
+      const stationPatch = {
+        services:
+          titles,
+
+        directions,
+
+        updated_at:
+          new Date()
+            .toISOString(),
+      };
+
+      if (
+        req.body?.servicePrices &&
+        typeof req.body.servicePrices ===
+          "object" &&
+        !Array.isArray(
+          req.body.servicePrices
+        )
+      ) {
+        stationPatch.service_prices =
+          req.body.servicePrices;
+      }
+
+      const {
+        error: stationUpdateError,
+      } = await supabase
+        .from("stations")
+        .update(
+          stationPatch
+        )
+        .eq(
+          "id",
+          businessId
+        )
+        .eq(
+          "owner_id",
+          userId
+        );
+
+      if (stationUpdateError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][SERVICES_STATION_UPDATE_ERROR]",
+          {
+            userId,
+            businessId,
+            code:
+              stationUpdateError.code ||
+              null,
+            message:
+              stationUpdateError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_SERVICES_STATION_UPDATE_FAILED",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][WEB_BUSINESS][SERVICES_UPDATED]",
+        {
+          userId,
+          businessId,
+          services:
+            rows.length,
+          directions:
+            directions.length,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        business: {
+          id:
+            businessId,
+
+          name:
+            station?.name ||
+            station?.legal_name ||
+            "Бизнес AUTODEAR",
+
+          services:
+            rows.map(
+              (row) => ({
+                id:
+                  row.id,
+
+                stationId:
+                  row.station_id,
+
+                serviceId:
+                  row.service_id,
+
+                title:
+                  row.title,
+
+                direction:
+                  row.direction,
+              })
+            ),
+
+          directions,
+
+          servicePrices:
+            stationPatch.service_prices ||
+            station?.service_prices ||
+            {},
+        },
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SERVICES_UPDATE_UNEXPECTED]",
+        {
+          userId,
+          businessId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_SERVICES_UPDATE_FAILED",
+      });
+    }
+  }
+);
+
+
 app.get("/api/business/availability", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
