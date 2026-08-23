@@ -2358,6 +2358,463 @@ app.patch("/api/business/bookings/:id", async (req, res) => {
 
 
 
+
+app.post("/api/account/link-existing", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const currentUser =
+    authResult?.user || null;
+
+  const currentAuthUserId =
+    String(
+      currentUser?.id || ""
+    ).trim();
+
+  if (!currentAuthUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase || !supabaseAuth) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "AUTH_SERVICE_NOT_CONFIGURED",
+    });
+  }
+
+  const email =
+    String(
+      req.body?.email || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const password =
+    String(
+      req.body?.password || ""
+    );
+
+  if (!email || !password) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "CREDENTIALS_REQUIRED",
+    });
+  }
+
+  try {
+    /*
+     * Проверяем пароль подключаемого аккаунта
+     * отдельным server-side auth client.
+     *
+     * Текущая мобильная сессия при этом
+     * НЕ меняется.
+     */
+    const {
+      data: signInData,
+      error: signInError,
+    } =
+      await supabaseAuth.auth
+        .signInWithPassword({
+          email,
+          password,
+        });
+
+    const linkedUser =
+      signInData?.user || null;
+
+    const linkedAuthUserId =
+      String(
+        linkedUser?.id || ""
+      ).trim();
+
+    /*
+     * Серверному auth client сессия
+     * после проверки больше не нужна.
+     */
+    try {
+      await supabaseAuth.auth.signOut();
+    } catch (_) {
+      // ignore
+    }
+
+    if (
+      signInError ||
+      !linkedAuthUserId
+    ) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          "INVALID_CREDENTIALS",
+      });
+    }
+
+    if (
+      linkedAuthUserId ===
+      currentAuthUserId
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "SAME_ACCOUNT",
+      });
+    }
+
+    /*
+     * Определяем профиль подключаемого
+     * auth user.
+     */
+    const {
+      data: linkedProfile,
+      error: linkedProfileError,
+    } = await supabase
+      .from("profiles")
+      .select(
+        [
+          "id",
+          "auth_user_id",
+          "name",
+          "email",
+          "phone",
+          "role",
+        ].join(",")
+      )
+      .or(
+        [
+          `auth_user_id.eq.${linkedAuthUserId}`,
+          `id.eq.${linkedAuthUserId}`,
+        ].join(",")
+      )
+      .limit(1)
+      .maybeSingle();
+
+    if (linkedProfileError) {
+      console.error(
+        "[AUTODEAR][ACCOUNT_LINK][PROFILE_ERROR]",
+        {
+          currentAuthUserId,
+          linkedAuthUserId,
+          message:
+            linkedProfileError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "LINKED_PROFILE_LOOKUP_FAILED",
+      });
+    }
+
+    /*
+     * Ищем бизнес подключаемого пользователя.
+     * Бизнес может существовать даже если
+     * legacy profile имеет неточную role.
+     */
+    const {
+      data: linkedStations,
+      error: linkedStationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        [
+          "id",
+          "owner_id",
+          "name",
+          "legal_name",
+          "business_type",
+          "phone",
+          "email",
+        ].join(",")
+      )
+      .eq(
+        "owner_id",
+        linkedAuthUserId
+      )
+      .order(
+        "created_at",
+        {
+          ascending: true,
+        }
+      );
+
+    if (linkedStationsError) {
+      console.error(
+        "[AUTODEAR][ACCOUNT_LINK][BUSINESS_ERROR]",
+        {
+          currentAuthUserId,
+          linkedAuthUserId,
+          message:
+            linkedStationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "LINKED_BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const businesses =
+      Array.isArray(linkedStations)
+        ? linkedStations
+        : [];
+
+    const linkedRole =
+      String(
+        linkedProfile?.role ||
+        linkedUser?.user_metadata?.role ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    if (
+      !linkedProfile &&
+      businesses.length === 0
+    ) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "AUTODEAR_ACCOUNT_NOT_FOUND",
+      });
+    }
+
+    /*
+     * Если у auth user есть бизнесы,
+     * создаём связь для каждого бизнеса.
+     *
+     * Если это обычный личный профиль —
+     * создаём account-level связь без
+     * business_id.
+     */
+    const rows = [];
+
+    if (businesses.length) {
+      for (const business of businesses) {
+        rows.push({
+          owner_auth_user_id:
+            currentAuthUserId,
+
+          linked_auth_user_id:
+            linkedAuthUserId,
+
+          business_id:
+            business.id,
+
+          link_type:
+            "business",
+
+          owner_email:
+            currentUser?.email || null,
+
+          owner_phone:
+            currentUser?.phone || null,
+
+          linked_email:
+            linkedUser?.email ||
+            linkedProfile?.email ||
+            null,
+
+          linked_phone:
+            linkedUser?.phone ||
+            linkedProfile?.phone ||
+            null,
+
+          verified_at:
+            new Date().toISOString(),
+
+          updated_at:
+            new Date().toISOString(),
+        });
+      }
+    } else {
+      rows.push({
+        owner_auth_user_id:
+          currentAuthUserId,
+
+        linked_auth_user_id:
+          linkedAuthUserId,
+
+        business_id:
+          null,
+
+        link_type:
+          linkedRole === "business"
+            ? "business"
+            : "personal",
+
+        owner_email:
+          currentUser?.email || null,
+
+        owner_phone:
+          currentUser?.phone || null,
+
+        linked_email:
+          linkedUser?.email ||
+          linkedProfile?.email ||
+          null,
+
+        linked_phone:
+          linkedUser?.phone ||
+          linkedProfile?.phone ||
+          null,
+
+        verified_at:
+          new Date().toISOString(),
+
+        updated_at:
+          new Date().toISOString(),
+      });
+    }
+
+    /*
+     * Не полагаемся пока на неизвестный
+     * unique constraint account_links:
+     * сначала проверяем существующую связь.
+     */
+    const createdLinks = [];
+
+    for (const row of rows) {
+      let query =
+        supabase
+          .from("account_links")
+          .select("*")
+          .eq(
+            "owner_auth_user_id",
+            row.owner_auth_user_id
+          )
+          .eq(
+            "linked_auth_user_id",
+            row.linked_auth_user_id
+          )
+          .eq(
+            "link_type",
+            row.link_type
+          );
+
+      if (row.business_id) {
+        query =
+          query.eq(
+            "business_id",
+            row.business_id
+          );
+      } else {
+        query =
+          query.is(
+            "business_id",
+            null
+          );
+      }
+
+      const {
+        data: existingLink,
+        error: existingLinkError,
+      } =
+        await query
+          .limit(1)
+          .maybeSingle();
+
+      if (existingLinkError) {
+        throw existingLinkError;
+      }
+
+      if (existingLink) {
+        createdLinks.push(
+          existingLink
+        );
+        continue;
+      }
+
+      const {
+        data: insertedLink,
+        error: insertError,
+      } = await supabase
+        .from("account_links")
+        .insert(row)
+        .select("*")
+        .single();
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      createdLinks.push(
+        insertedLink
+      );
+    }
+
+    console.log(
+      "[AUTODEAR][ACCOUNT_LINK][OK]",
+      {
+        currentAuthUserId,
+        linkedAuthUserId,
+        businesses:
+          businesses.length,
+        links:
+          createdLinks.length,
+      }
+    );
+
+    return res.json({
+      ok: true,
+
+      linkedAuthUserId,
+
+      accountType:
+        businesses.length
+          ? "business"
+          : "personal",
+
+      businesses:
+        businesses.map(
+          (business) => ({
+            id:
+              business.id,
+
+            name:
+              business.name ||
+              business.legal_name ||
+              "Бизнес AUTODEAR",
+
+            businessType:
+              business.business_type ||
+              null,
+          })
+        ),
+
+      links:
+        createdLinks,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][ACCOUNT_LINK][UNEXPECTED]",
+      {
+        currentAuthUserId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "ACCOUNT_LINK_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/account/workspaces", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
