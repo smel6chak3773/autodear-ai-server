@@ -238,6 +238,590 @@ app.get("/health", (req, res) => {
 });
 
 
+
+app.get("/api/business/availability", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,owner_id,name,legal_name"
+      )
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_STATIONS_ERROR]",
+        stationsError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    if (!ownedStations.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const stationIds =
+      ownedStations
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    const {
+      data: rows,
+      error: availabilityError,
+    } = await supabase
+      .from("business_availability")
+      .select("*")
+      .in(
+        "business_id",
+        stationIds
+      );
+
+    if (availabilityError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_LOAD_ERROR]",
+        availabilityError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_AVAILABILITY_LOAD_FAILED",
+      });
+    }
+
+    const availabilityByBusiness =
+      new Map(
+        (
+          Array.isArray(rows)
+            ? rows
+            : []
+        ).map((row) => [
+          String(
+            row.business_id
+          ),
+          row,
+        ])
+      );
+
+    const availability =
+      ownedStations.map(
+        (station) => {
+          const businessId =
+            String(
+              station.id
+            );
+
+          const row =
+            availabilityByBusiness.get(
+              businessId
+            );
+
+          return {
+            businessId,
+
+            businessName:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+
+            workingDays:
+              row?.working_days || {
+                mon: true,
+                tue: true,
+                wed: true,
+                thu: true,
+                fri: true,
+                sat: true,
+                sun: false,
+              },
+
+            openTime:
+              row?.open_time ||
+              "09:00",
+
+            closeTime:
+              row?.close_time ||
+              "18:00",
+
+            breakEnabled:
+              row?.break_enabled !==
+              false,
+
+            breakStart:
+              row?.break_start ||
+              "13:00",
+
+            breakEnd:
+              row?.break_end ||
+              "14:00",
+
+            slotMinutes:
+              Number(
+                row?.slot_minutes ||
+                60
+              ),
+
+            postsCount:
+              Number(
+                row?.posts_count ||
+                1
+              ),
+
+            closedDates:
+              row?.closed_dates ||
+              {},
+
+            fullyBookedDates:
+              row?.fully_booked_dates ||
+              {},
+
+            blockedSlots:
+              row?.blocked_slots ||
+              {},
+
+            updatedAt:
+              row?.updated_at ||
+              null,
+          };
+        }
+      );
+
+    return res.json({
+      ok: true,
+      availability,
+      count:
+        availability.length,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_AVAILABILITY_FAILED",
+    });
+  }
+});
+
+
+app.patch("/api/business/availability/:businessId", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  const businessId =
+    String(
+      req.params?.businessId ||
+      ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!businessId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "BUSINESS_ID_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * Never trust a business id merely
+     * because it came from the browser.
+     * The station must belong to the
+     * authenticated Supabase user.
+     */
+    const {
+      data: station,
+      error: stationError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,owner_id,name,legal_name"
+      )
+      .eq(
+        "id",
+        businessId
+      )
+      .eq(
+        "owner_id",
+        userId
+      )
+      .maybeSingle();
+
+    if (stationError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_PATCH_STATION_ERROR]",
+        stationError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    if (!station) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const {
+      data: current,
+      error: currentError,
+    } = await supabase
+      .from("business_availability")
+      .select("*")
+      .eq(
+        "business_id",
+        businessId
+      )
+      .maybeSingle();
+
+    if (currentError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_PATCH_LOAD_ERROR]",
+        currentError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_AVAILABILITY_LOAD_FAILED",
+      });
+    }
+
+    const body =
+      req.body || {};
+
+    const next = {
+      business_id:
+        businessId,
+
+      working_days:
+        body.workingDays ??
+        current?.working_days ??
+        {
+          mon: true,
+          tue: true,
+          wed: true,
+          thu: true,
+          fri: true,
+          sat: true,
+          sun: false,
+        },
+
+      open_time:
+        body.openTime ??
+        current?.open_time ??
+        "09:00",
+
+      close_time:
+        body.closeTime ??
+        current?.close_time ??
+        "18:00",
+
+      break_enabled:
+        body.breakEnabled ??
+        current?.break_enabled ??
+        true,
+
+      break_start:
+        body.breakStart ??
+        current?.break_start ??
+        "13:00",
+
+      break_end:
+        body.breakEnd ??
+        current?.break_end ??
+        "14:00",
+
+      slot_minutes:
+        Number(
+          body.slotMinutes ??
+          current?.slot_minutes ??
+          60
+        ),
+
+      posts_count:
+        Number(
+          body.postsCount ??
+          current?.posts_count ??
+          1
+        ),
+
+      closed_dates:
+        body.closedDates ??
+        current?.closed_dates ??
+        {},
+
+      fully_booked_dates:
+        body.fullyBookedDates ??
+        current?.fully_booked_dates ??
+        {},
+
+      blocked_slots:
+        body.blockedSlots ??
+        current?.blocked_slots ??
+        {},
+
+      updated_at:
+        new Date().toISOString(),
+    };
+
+    if (
+      !Number.isInteger(
+        next.slot_minutes
+      ) ||
+      next.slot_minutes < 15
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "SLOT_MINUTES_INVALID",
+      });
+    }
+
+    if (
+      !Number.isInteger(
+        next.posts_count
+      ) ||
+      next.posts_count < 1
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "POSTS_COUNT_INVALID",
+      });
+    }
+
+    const timePattern =
+      /^\d{2}:\d{2}$/;
+
+    for (
+      const value
+      of [
+        next.open_time,
+        next.close_time,
+        next.break_start,
+        next.break_end,
+      ]
+    ) {
+      if (
+        !timePattern.test(
+          String(value)
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_TIME_INVALID",
+        });
+      }
+    }
+
+    const {
+      data: saved,
+      error: saveError,
+    } = await supabase
+      .from(
+        "business_availability"
+      )
+      .upsert(
+        next,
+        {
+          onConflict:
+            "business_id",
+        }
+      )
+      .select("*")
+      .single();
+
+    if (saveError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_SAVE_ERROR]",
+        saveError
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_AVAILABILITY_SAVE_FAILED",
+      });
+    }
+
+    return res.json({
+      ok: true,
+
+      availability: {
+        businessId:
+          saved.business_id,
+
+        businessName:
+          station.name ||
+          station.legal_name ||
+          "Бизнес AUTODEAR",
+
+        workingDays:
+          saved.working_days ||
+          {},
+
+        openTime:
+          saved.open_time,
+
+        closeTime:
+          saved.close_time,
+
+        breakEnabled:
+          saved.break_enabled !==
+          false,
+
+        breakStart:
+          saved.break_start,
+
+        breakEnd:
+          saved.break_end,
+
+        slotMinutes:
+          Number(
+            saved.slot_minutes ||
+            60
+          ),
+
+        postsCount:
+          Number(
+            saved.posts_count ||
+            1
+          ),
+
+        closedDates:
+          saved.closed_dates ||
+          {},
+
+        fullyBookedDates:
+          saved.fully_booked_dates ||
+          {},
+
+        blockedSlots:
+          saved.blocked_slots ||
+          {},
+
+        updatedAt:
+          saved.updated_at ||
+          null,
+      },
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][AVAILABILITY_PATCH_FATAL]",
+      {
+        userId,
+        businessId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_AVAILABILITY_SAVE_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/business/bookings", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
