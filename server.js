@@ -2357,6 +2357,706 @@ app.patch("/api/business/bookings/:id", async (req, res) => {
 });
 
 
+
+app.get("/api/account/workspaces", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const authUserId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * 1. Current profile.
+     */
+    const {
+      data: currentProfile,
+      error: currentProfileError,
+    } = await supabase
+      .from("profiles")
+      .select(
+        [
+          "id",
+          "auth_user_id",
+          "name",
+          "email",
+          "phone",
+          "role",
+          "city",
+          "avatar_url",
+        ].join(",")
+      )
+      .or(
+        `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+      )
+      .limit(1)
+      .maybeSingle();
+
+    if (currentProfileError) {
+      console.error(
+        "[AUTODEAR][ACCOUNT_WORKSPACES][PROFILE_ERROR]",
+        {
+          authUserId,
+          code:
+            currentProfileError.code ||
+            null,
+          message:
+            currentProfileError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "ACCOUNT_PROFILE_LOOKUP_FAILED",
+      });
+    }
+
+
+    /*
+     * 2. Find every account link where this auth
+     * user participates on either side.
+     */
+    const {
+      data: directLinks,
+      error: linksError,
+    } = await supabase
+      .from("account_links")
+      .select("*")
+      .or(
+        [
+          `owner_auth_user_id.eq.${authUserId}`,
+          `linked_auth_user_id.eq.${authUserId}`,
+        ].join(",")
+      );
+
+    if (linksError) {
+      console.error(
+        "[AUTODEAR][ACCOUNT_WORKSPACES][LINKS_ERROR]",
+        {
+          authUserId,
+          code:
+            linksError.code ||
+            null,
+          message:
+            linksError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "ACCOUNT_LINKS_LOOKUP_FAILED",
+      });
+    }
+
+
+    const links =
+      Array.isArray(directLinks)
+        ? directLinks
+        : [];
+
+
+    /*
+     * 3. Resolve the canonical owner ids participating
+     * in the same group.
+     *
+     * For now one hop is enough because every confirmed
+     * relation points to the primary owner.
+     */
+    const ownerIds =
+      new Set([authUserId]);
+
+    links.forEach(
+      (link) => {
+        const ownerId =
+          String(
+            link?.owner_auth_user_id ||
+            ""
+          ).trim();
+
+        if (ownerId) {
+          ownerIds.add(ownerId);
+        }
+      }
+    );
+
+
+    const canonicalOwnerIds =
+      Array.from(ownerIds);
+
+
+    /*
+     * 4. Load all links of those owners.
+     */
+    let groupLinks = [];
+
+    if (canonicalOwnerIds.length) {
+      const {
+        data,
+        error,
+      } = await supabase
+        .from("account_links")
+        .select("*")
+        .in(
+          "owner_auth_user_id",
+          canonicalOwnerIds
+        );
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ACCOUNT_WORKSPACES][GROUP_LINKS_ERROR]",
+          {
+            authUserId,
+            code:
+              error.code ||
+              null,
+            message:
+              error.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ACCOUNT_GROUP_LOOKUP_FAILED",
+        });
+      }
+
+      groupLinks =
+        Array.isArray(data)
+          ? data
+          : [];
+    }
+
+
+    /*
+     * 5. Collect all auth users in the group.
+     */
+    const authIds =
+      new Set(
+        canonicalOwnerIds
+      );
+
+    groupLinks.forEach(
+      (link) => {
+        const linkedId =
+          String(
+            link?.linked_auth_user_id ||
+            ""
+          ).trim();
+
+        if (linkedId) {
+          authIds.add(linkedId);
+        }
+      }
+    );
+
+
+    const authIdList =
+      Array.from(authIds);
+
+
+    /*
+     * 6. Profiles for personal / legacy linked auths.
+     */
+    let profiles = [];
+
+    if (authIdList.length) {
+      const {
+        data,
+        error,
+      } = await supabase
+        .from("profiles")
+        .select(
+          [
+            "id",
+            "auth_user_id",
+            "name",
+            "email",
+            "phone",
+            "role",
+            "city",
+            "avatar_url",
+          ].join(",")
+        )
+        .in(
+          "auth_user_id",
+          authIdList
+        );
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ACCOUNT_WORKSPACES][PROFILES_ERROR]",
+          {
+            authUserId,
+            code:
+              error.code ||
+              null,
+            message:
+              error.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ACCOUNT_PROFILES_LOOKUP_FAILED",
+        });
+      }
+
+      profiles =
+        Array.isArray(data)
+          ? data
+          : [];
+    }
+
+
+    /*
+     * 7. Businesses owned by any confirmed auth owner.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        [
+          "id",
+          "owner_id",
+          "name",
+          "legal_name",
+          "business_type",
+          "phone",
+          "email",
+          "city",
+          "photo_url",
+          "status",
+          "is_active",
+          "is_verified",
+        ].join(",")
+      )
+      .in(
+        "owner_id",
+        authIdList
+      )
+      .order(
+        "created_at",
+        {
+          ascending: true,
+        }
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][ACCOUNT_WORKSPACES][STATIONS_ERROR]",
+        {
+          authUserId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "ACCOUNT_BUSINESSES_LOOKUP_FAILED",
+      });
+    }
+
+
+    /*
+     * 8. Businesses explicitly linked through account_links.
+     */
+    const linkedBusinessIds =
+      Array.from(
+        new Set(
+          groupLinks
+            .map(
+              (link) =>
+                String(
+                  link?.business_id ||
+                  ""
+                ).trim()
+            )
+            .filter(Boolean)
+        )
+      );
+
+
+    let explicitlyLinkedStations = [];
+
+    if (linkedBusinessIds.length) {
+      const {
+        data,
+        error,
+      } = await supabase
+        .from("stations")
+        .select(
+          [
+            "id",
+            "owner_id",
+            "name",
+            "legal_name",
+            "business_type",
+            "phone",
+            "email",
+            "city",
+            "photo_url",
+            "status",
+            "is_active",
+            "is_verified",
+          ].join(",")
+        )
+        .in(
+          "id",
+          linkedBusinessIds
+        );
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][ACCOUNT_WORKSPACES][LINKED_STATIONS_ERROR]",
+          {
+            authUserId,
+            code:
+              error.code ||
+              null,
+            message:
+              error.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ACCOUNT_LINKED_BUSINESSES_FAILED",
+        });
+      }
+
+      explicitlyLinkedStations =
+        Array.isArray(data)
+          ? data
+          : [];
+    }
+
+
+    const stationMap =
+      new Map();
+
+    [
+      ...(
+        Array.isArray(stations)
+          ? stations
+          : []
+      ),
+      ...explicitlyLinkedStations,
+    ].forEach(
+      (station) => {
+        const id =
+          String(
+            station?.id || ""
+          ).trim();
+
+        if (id) {
+          stationMap.set(
+            id,
+            station
+          );
+        }
+      }
+    );
+
+
+    const businessWorkspaces =
+      Array.from(
+        stationMap.values()
+      ).map(
+        (station) => ({
+          type:
+            "business",
+
+          id:
+            station.id,
+
+          ownerId:
+            station.owner_id,
+
+          name:
+            station.name ||
+            station.legal_name ||
+            "Бизнес AUTODEAR",
+
+          legalName:
+            station.legal_name ||
+            null,
+
+          businessType:
+            station.business_type ||
+            null,
+
+          phone:
+            station.phone ||
+            null,
+
+          email:
+            station.email ||
+            null,
+
+          city:
+            station.city ||
+            null,
+
+          avatarUrl:
+            station.photo_url ||
+            null,
+
+          status:
+            station.status ||
+            null,
+
+          isActive:
+            Boolean(
+              station.is_active
+            ),
+
+          isVerified:
+            Boolean(
+              station.is_verified
+            ),
+        })
+      );
+
+
+    const personalProfiles =
+      profiles
+        .filter(
+          (profile) =>
+            String(
+              profile?.role ||
+              "user"
+            )
+              .trim()
+              .toLowerCase() ===
+            "user"
+        )
+        .map(
+          (profile) => ({
+            type:
+              "personal",
+
+            id:
+              profile.auth_user_id ||
+              profile.id,
+
+            profileId:
+              profile.id,
+
+            authUserId:
+              profile.auth_user_id ||
+              profile.id,
+
+            name:
+              profile.name ||
+              "Пользователь AUTODEAR",
+
+            email:
+              profile.email ||
+              null,
+
+            phone:
+              profile.phone ||
+              null,
+
+            city:
+              profile.city ||
+              null,
+
+            avatarUrl:
+              profile.avatar_url ||
+              null,
+          })
+        );
+
+
+    /*
+     * Current profile may have old id/auth_user_id shape,
+     * so keep it visible even if the .in(auth_user_id)
+     * lookup missed it.
+     */
+    if (
+      currentProfile &&
+      String(
+        currentProfile.role ||
+        "user"
+      )
+        .trim()
+        .toLowerCase() ===
+        "user"
+    ) {
+      const currentPersonalId =
+        currentProfile.auth_user_id ||
+        currentProfile.id;
+
+      const exists =
+        personalProfiles.some(
+          (profile) =>
+            String(
+              profile.authUserId
+            ) ===
+            String(
+              currentPersonalId
+            )
+        );
+
+      if (!exists) {
+        personalProfiles.unshift({
+          type:
+            "personal",
+
+          id:
+            currentPersonalId,
+
+          profileId:
+            currentProfile.id,
+
+          authUserId:
+            currentPersonalId,
+
+          name:
+            currentProfile.name ||
+            "Пользователь AUTODEAR",
+
+          email:
+            currentProfile.email ||
+            null,
+
+          phone:
+            currentProfile.phone ||
+            null,
+
+          city:
+            currentProfile.city ||
+            null,
+
+          avatarUrl:
+            currentProfile.avatar_url ||
+            null,
+        });
+      }
+    }
+
+
+    const workspaces = [
+      ...personalProfiles,
+      ...businessWorkspaces,
+    ];
+
+
+    console.log(
+      "[AUTODEAR][ACCOUNT_WORKSPACES][OK]",
+      {
+        authUserId,
+        personals:
+          personalProfiles.length,
+        businesses:
+          businessWorkspaces.length,
+        links:
+          groupLinks.length,
+      }
+    );
+
+
+    return res.json({
+      ok: true,
+
+      currentAuthUserId:
+        authUserId,
+
+      personalProfiles,
+
+      businesses:
+        businessWorkspaces,
+
+      workspaces,
+
+      links:
+        groupLinks.map(
+          (link) => ({
+            id:
+              link.id,
+
+            ownerAuthUserId:
+              link.owner_auth_user_id,
+
+            linkedAuthUserId:
+              link.linked_auth_user_id ||
+              null,
+
+            businessId:
+              link.business_id ||
+              null,
+
+            linkType:
+              link.link_type,
+
+            verifiedAt:
+              link.verified_at ||
+              null,
+          })
+        ),
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][ACCOUNT_WORKSPACES][UNEXPECTED]",
+      {
+        authUserId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "ACCOUNT_WORKSPACES_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/auth/me", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
