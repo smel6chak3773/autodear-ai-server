@@ -379,6 +379,49 @@ app.get("/api/business/services", async (req, res) => {
           : [];
     }
 
+    const {
+      data: catalogRows,
+      error: catalogError,
+    } = await supabase
+      .from("services")
+      .select(
+        [
+          "id",
+          "title",
+          "category",
+          "price_from",
+          "moderation_required",
+        ].join(",")
+      )
+      .order(
+        "title",
+        {
+          ascending: true,
+        }
+      );
+
+    if (catalogError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SERVICES_CATALOG_LOAD_ERROR]",
+        {
+          userId,
+          code:
+            catalogError.code ||
+            null,
+          message:
+            catalogError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SERVICE_CATALOG_LOAD_FAILED",
+      });
+    }
+
+
     const businesses =
       ownedStations.map(
         (station) => {
@@ -460,9 +503,63 @@ app.get("/api/business/services", async (req, res) => {
       }
     );
 
+    const catalog =
+      (
+        Array.isArray(
+          catalogRows
+        )
+          ? catalogRows
+          : []
+      )
+        /*
+         * Business UI shows only approved
+         * global catalog entries.
+         *
+         * moderation_required=true remains
+         * outside normal business selection
+         * until moderation approves it.
+         */
+        .filter(
+          (service) =>
+            service
+              ?.moderation_required !==
+            true
+        )
+        .map(
+          (service) => ({
+            id:
+              service.id,
+
+            serviceId:
+              service.id,
+
+            title:
+              service.title ||
+              "Услуга",
+
+            direction:
+              service.category ||
+              "autoservice",
+
+            priceFrom:
+              service.price_from != null
+                ? Number(
+                    service.price_from
+                  )
+                : null,
+          })
+        );
+
+
     return res.json({
       ok: true,
+
       businesses,
+
+      catalog,
+
+      catalogCount:
+        catalog.length,
     });
 
   } catch (error) {
