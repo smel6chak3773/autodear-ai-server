@@ -2846,6 +2846,431 @@ app.get("/api/account/workspaces", async (req, res) => {
 
   try {
     /*
+     * AUTO-LINK:
+     *
+     * If personal and business auth accounts have
+     * the same normalized email AND phone, AUTODEAR
+     * can safely connect them automatically.
+     *
+     * One matching field alone is NOT enough.
+     */
+
+    const normalizeAccountEmail =
+      (value) =>
+        String(value || "")
+          .trim()
+          .toLowerCase();
+
+    const normalizeAccountPhone =
+      (value) => {
+        let digits =
+          String(value || "")
+            .replace(/\D/g, "");
+
+        if (
+          digits.length === 11 &&
+          digits.startsWith("8")
+        ) {
+          digits =
+            `7${digits.slice(1)}`;
+        }
+
+        if (
+          digits.length === 10
+        ) {
+          digits =
+            `7${digits}`;
+        }
+
+        return digits;
+      };
+
+
+    const currentEmail =
+      normalizeAccountEmail(
+        authUser?.email ||
+        authUser?.user_metadata?.email ||
+        ""
+      );
+
+    const currentPhone =
+      normalizeAccountPhone(
+        authUser?.phone ||
+        authUser?.user_metadata?.phone ||
+        ""
+      );
+
+
+    /*
+     * We only attempt automatic discovery when
+     * BOTH confirmed contact identifiers exist.
+     */
+    if (
+      currentEmail &&
+      currentPhone
+    ) {
+      const {
+        data: matchingProfiles,
+        error: matchingProfilesError,
+      } = await supabase
+        .from("profiles")
+        .select(
+          [
+            "id",
+            "auth_user_id",
+            "name",
+            "email",
+            "phone",
+            "role",
+          ].join(",")
+        )
+        .neq(
+          "auth_user_id",
+          authUserId
+        );
+
+      if (matchingProfilesError) {
+        console.warn(
+          "[AUTODEAR][ACCOUNT_AUTO_LINK][PROFILE_SCAN_ERROR]",
+          {
+            authUserId,
+            message:
+              matchingProfilesError.message ||
+              null,
+          }
+        );
+      } else {
+        const exactMatches =
+          (
+            Array.isArray(
+              matchingProfiles
+            )
+              ? matchingProfiles
+              : []
+          ).filter(
+            (profile) => {
+              const profileAuthId =
+                String(
+                  profile?.auth_user_id ||
+                  profile?.id ||
+                  ""
+                ).trim();
+
+              if (!profileAuthId) {
+                return false;
+              }
+
+              const profileEmail =
+                normalizeAccountEmail(
+                  profile?.email
+                );
+
+              const profilePhone =
+                normalizeAccountPhone(
+                  profile?.phone
+                );
+
+              return (
+                profileEmail ===
+                  currentEmail &&
+                profilePhone ===
+                  currentPhone
+              );
+            }
+          );
+
+
+        for (
+          const matchedProfile of
+          exactMatches
+        ) {
+          const matchedAuthUserId =
+            String(
+              matchedProfile
+                ?.auth_user_id ||
+              matchedProfile?.id ||
+              ""
+            ).trim();
+
+          if (
+            !matchedAuthUserId ||
+            matchedAuthUserId ===
+              authUserId
+          ) {
+            continue;
+          }
+
+
+          const currentProfileRole =
+            String(
+              authUser?.user_metadata
+                ?.role ||
+              ""
+            )
+              .trim()
+              .toLowerCase();
+
+          const matchedRole =
+            String(
+              matchedProfile?.role ||
+              ""
+            )
+              .trim()
+              .toLowerCase();
+
+
+          /*
+           * Only opposite personal/business sides
+           * are eligible for automatic linking.
+           *
+           * Legacy data may have inaccurate role,
+           * therefore actual station ownership is
+           * also checked below.
+           */
+          const {
+            data: matchedStations,
+            error: matchedStationsError,
+          } = await supabase
+            .from("stations")
+            .select(
+              [
+                "id",
+                "owner_id",
+                "name",
+                "legal_name",
+              ].join(",")
+            )
+            .eq(
+              "owner_id",
+              matchedAuthUserId
+            );
+
+          if (matchedStationsError) {
+            console.warn(
+              "[AUTODEAR][ACCOUNT_AUTO_LINK][STATIONS_ERROR]",
+              {
+                authUserId,
+                matchedAuthUserId,
+                message:
+                  matchedStationsError
+                    .message ||
+                  null,
+              }
+            );
+
+            continue;
+          }
+
+
+          const matchedBusinesses =
+            Array.isArray(
+              matchedStations
+            )
+              ? matchedStations
+              : [];
+
+
+          /*
+           * Determine which auth id should be the
+           * canonical personal owner of the link.
+           *
+           * If current auth user is personal, it
+           * remains owner.
+           *
+           * If current auth user is business and
+           * matched profile is personal, matched
+           * auth user becomes owner.
+           */
+          let ownerAuthUserId =
+            authUserId;
+
+          let linkedAuthUserId =
+            matchedAuthUserId;
+
+
+          if (
+            currentProfileRole ===
+              "business" &&
+            matchedRole ===
+              "user"
+          ) {
+            ownerAuthUserId =
+              matchedAuthUserId;
+
+            linkedAuthUserId =
+              authUserId;
+          }
+
+
+          /*
+           * Auto-link only when one side clearly
+           * represents business ownership.
+           */
+          const businessSideExists =
+            matchedBusinesses.length > 0 ||
+            matchedRole ===
+              "business" ||
+            currentProfileRole ===
+              "business";
+
+          if (!businessSideExists) {
+            continue;
+          }
+
+
+          if (
+            matchedBusinesses.length
+          ) {
+            for (
+              const business of
+              matchedBusinesses
+            ) {
+              const businessId =
+                String(
+                  business?.id || ""
+                ).trim();
+
+              if (!businessId) {
+                continue;
+              }
+
+              const {
+                data: existingLink,
+                error: existingLinkError,
+              } = await supabase
+                .from("account_links")
+                .select("id")
+                .eq(
+                  "owner_auth_user_id",
+                  ownerAuthUserId
+                )
+                .eq(
+                  "linked_auth_user_id",
+                  linkedAuthUserId
+                )
+                .eq(
+                  "business_id",
+                  businessId
+                )
+                .limit(1)
+                .maybeSingle();
+
+              if (existingLinkError) {
+                console.warn(
+                  "[AUTODEAR][ACCOUNT_AUTO_LINK][EXISTING_LINK_ERROR]",
+                  {
+                    ownerAuthUserId,
+                    linkedAuthUserId,
+                    businessId,
+                    message:
+                      existingLinkError
+                        .message ||
+                      null,
+                  }
+                );
+
+                continue;
+              }
+
+              if (existingLink) {
+                continue;
+              }
+
+              const {
+                error: insertError,
+              } = await supabase
+                .from("account_links")
+                .insert({
+                  owner_auth_user_id:
+                    ownerAuthUserId,
+
+                  linked_auth_user_id:
+                    linkedAuthUserId,
+
+                  business_id:
+                    businessId,
+
+                  link_type:
+                    "business",
+
+                  owner_email:
+                    ownerAuthUserId ===
+                    authUserId
+                      ? currentEmail
+                      : normalizeAccountEmail(
+                          matchedProfile
+                            ?.email
+                        ),
+
+                  owner_phone:
+                    ownerAuthUserId ===
+                    authUserId
+                      ? currentPhone
+                      : normalizeAccountPhone(
+                          matchedProfile
+                            ?.phone
+                        ),
+
+                  linked_email:
+                    linkedAuthUserId ===
+                    authUserId
+                      ? currentEmail
+                      : normalizeAccountEmail(
+                          matchedProfile
+                            ?.email
+                        ),
+
+                  linked_phone:
+                    linkedAuthUserId ===
+                    authUserId
+                      ? currentPhone
+                      : normalizeAccountPhone(
+                          matchedProfile
+                            ?.phone
+                        ),
+
+                  verified_at:
+                    new Date()
+                      .toISOString(),
+
+                  updated_at:
+                    new Date()
+                      .toISOString(),
+                });
+
+              if (insertError) {
+                console.warn(
+                  "[AUTODEAR][ACCOUNT_AUTO_LINK][INSERT_ERROR]",
+                  {
+                    ownerAuthUserId,
+                    linkedAuthUserId,
+                    businessId,
+                    message:
+                      insertError.message ||
+                      null,
+                  }
+                );
+
+                continue;
+              }
+
+              console.log(
+                "[AUTODEAR][ACCOUNT_AUTO_LINK][CREATED]",
+                {
+                  ownerAuthUserId,
+                  linkedAuthUserId,
+                  businessId,
+                  reason:
+                    "email_and_phone_match",
+                }
+              );
+            }
+          }
+        }
+      }
+    }
+
+    /*
      * 1. Current profile.
      */
     const {
