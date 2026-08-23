@@ -389,7 +389,6 @@ app.get("/api/business/services", async (req, res) => {
           "id",
           "title",
           "category",
-          "price_from",
           "moderation_required",
         ].join(",")
       )
@@ -542,11 +541,7 @@ app.get("/api/business/services", async (req, res) => {
               "autoservice",
 
             priceFrom:
-              service.price_from != null
-                ? Number(
-                    service.price_from
-                  )
-                : null,
+              null,
           })
         );
 
