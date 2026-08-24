@@ -1662,6 +1662,444 @@ app.patch("/api/business/availability/:businessId", async (req, res) => {
 
 
 
+
+app.get("/api/business/reviews", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * Never trust a station id supplied by
+     * the browser. Resolve every business
+     * through the authenticated owner.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,name,legal_name,city,address"
+      )
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVIEWS_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    const stationIds =
+      ownedStations
+        .map(
+          (station) =>
+            String(
+              station?.id || ""
+            ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    /*
+     * Reviews historically support both
+     * target_type = station/business and
+     * station_id. Fetch the owner's review
+     * universe using both relationships,
+     * then de-duplicate by review id.
+     */
+    const [
+      stationReviewsResult,
+      targetReviewsResult,
+    ] = await Promise.all([
+      supabase
+        .from("reviews")
+        .select(
+          [
+            "id",
+            "target_type",
+            "target_id",
+            "author_id",
+            "source_type",
+            "source_id",
+            "station_id",
+            "stars",
+            "text",
+            "verified",
+            "status",
+            "created_at",
+            "updated_at",
+          ].join(",")
+        )
+        .in(
+          "station_id",
+          stationIds
+        )
+        .eq(
+          "status",
+          "published"
+        )
+        .order(
+          "created_at",
+          {
+            ascending: false,
+          }
+        ),
+
+      supabase
+        .from("reviews")
+        .select(
+          [
+            "id",
+            "target_type",
+            "target_id",
+            "author_id",
+            "source_type",
+            "source_id",
+            "station_id",
+            "stars",
+            "text",
+            "verified",
+            "status",
+            "created_at",
+            "updated_at",
+          ].join(",")
+        )
+        .in(
+          "target_type",
+          [
+            "station",
+            "business",
+          ]
+        )
+        .in(
+          "target_id",
+          stationIds
+        )
+        .eq(
+          "status",
+          "published"
+        )
+        .order(
+          "created_at",
+          {
+            ascending: false,
+          }
+        ),
+    ]);
+
+    if (stationReviewsResult.error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVIEWS_STATION_QUERY_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            stationReviewsResult.error.code ||
+            null,
+          message:
+            stationReviewsResult.error.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REVIEWS_LOAD_FAILED",
+      });
+    }
+
+    if (targetReviewsResult.error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVIEWS_TARGET_QUERY_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            targetReviewsResult.error.code ||
+            null,
+          message:
+            targetReviewsResult.error.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REVIEWS_LOAD_FAILED",
+      });
+    }
+
+    const stationMap =
+      new Map(
+        ownedStations.map(
+          (station) => [
+            String(station.id),
+            station,
+          ]
+        )
+      );
+
+    const reviewMap =
+      new Map();
+
+    [
+      ...(Array.isArray(
+        stationReviewsResult.data
+      )
+        ? stationReviewsResult.data
+        : []),
+
+      ...(Array.isArray(
+        targetReviewsResult.data
+      )
+        ? targetReviewsResult.data
+        : []),
+    ].forEach((review) => {
+      const reviewId =
+        String(
+          review?.id || ""
+        ).trim();
+
+      if (reviewId) {
+        reviewMap.set(
+          reviewId,
+          review
+        );
+      }
+    });
+
+    const reviews =
+      Array.from(
+        reviewMap.values()
+      )
+        .map((review) => {
+          const stationId =
+            String(
+              review?.station_id ||
+              (
+                [
+                  "station",
+                  "business",
+                ].includes(
+                  String(
+                    review?.target_type ||
+                    ""
+                  )
+                )
+                  ? review?.target_id
+                  : ""
+              ) ||
+              ""
+            ).trim();
+
+          const station =
+            stationMap.get(
+              stationId
+            ) || null;
+
+          return {
+            id:
+              review.id,
+
+            stationId,
+
+            stationName:
+              station?.name ||
+              station?.legal_name ||
+              "Бизнес AUTODEAR",
+
+            authorId:
+              review.author_id ||
+              null,
+
+            sourceType:
+              review.source_type ||
+              null,
+
+            sourceId:
+              review.source_id ||
+              null,
+
+            stars:
+              Number(
+                review.stars ||
+                0
+              ),
+
+            text:
+              String(
+                review.text ||
+                ""
+              ),
+
+            verified:
+              review.verified ===
+              true,
+
+            status:
+              review.status ||
+              "published",
+
+            createdAt:
+              review.created_at ||
+              null,
+
+            updatedAt:
+              review.updated_at ||
+              review.created_at ||
+              null,
+          };
+        })
+        .sort(
+          (a, b) =>
+            String(
+              b.createdAt || ""
+            ).localeCompare(
+              String(
+                a.createdAt || ""
+              )
+            )
+        );
+
+    const total =
+      reviews.length;
+
+    const verified =
+      reviews.filter(
+        (review) =>
+          review.verified === true
+      ).length;
+
+    const rating =
+      total
+        ? Math.round(
+            (
+              reviews.reduce(
+                (sum, review) =>
+                  sum +
+                  Number(
+                    review.stars ||
+                    0
+                  ),
+                0
+              ) /
+              total
+            ) *
+            10
+          ) / 10
+        : 0;
+
+    return res.json({
+      ok: true,
+
+      summary: {
+        total,
+        verified,
+        rating,
+      },
+
+      reviews,
+
+      businesses:
+        ownedStations.map(
+          (station) => ({
+            id:
+              station.id,
+
+            name:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+
+            city:
+              station.city ||
+              "",
+
+            address:
+              station.address ||
+              "",
+          })
+        ),
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REVIEWS_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_REVIEWS_LOAD_FAILED",
+    });
+  }
+});
+
+
 app.patch("/api/business/reviews/read", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
