@@ -1661,6 +1661,320 @@ app.patch("/api/business/availability/:businessId", async (req, res) => {
 });
 
 
+
+app.get("/api/business/signals", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * Browser never supplies business ids.
+     * Resolve every business from the
+     * authenticated Supabase owner first.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,owner_id,name,legal_name"
+      )
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SIGNALS_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    if (!ownedStations.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const stationIds =
+      ownedStations
+        .map(
+          (station) =>
+            String(
+              station?.id || ""
+            ).trim()
+        )
+        .filter(Boolean);
+
+    /*
+     * New bookings:
+     * only bookings belonging to one of
+     * the authenticated owner's stations.
+     */
+    const bookingsPromise =
+      supabase
+        .from("business_bookings")
+        .select(
+          "id",
+          {
+            count: "exact",
+            head: true,
+          }
+        )
+        .in(
+          "business_id",
+          stationIds
+        )
+        .eq(
+          "status",
+          "new"
+        );
+
+    /*
+     * Unread business chats:
+     * chats use business_owner_id = auth user id.
+     *
+     * We count conversations requiring attention,
+     * not the number of individual messages.
+     */
+    const messagesPromise =
+      supabase
+        .from("chats")
+        .select(
+          "id",
+          {
+            count: "exact",
+            head: true,
+          }
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        )
+        .gt(
+          "business_unread",
+          0
+        );
+
+    /*
+     * Business notifications:
+     * recipient_id is the concrete station/business id.
+     *
+     * Global business notifications with recipient_id NULL
+     * are intentionally NOT included here because they are
+     * not tied to a specific authenticated business yet.
+     */
+    const notificationsPromise =
+      supabase
+        .from("notifications")
+        .select(
+          "id",
+          {
+            count: "exact",
+            head: true,
+          }
+        )
+        .eq(
+          "recipient_role",
+          "business"
+        )
+        .eq(
+          "is_read",
+          false
+        )
+        .in(
+          "recipient_id",
+          stationIds
+        );
+
+    const [
+      bookingsResult,
+      messagesResult,
+      notificationsResult,
+    ] = await Promise.all([
+      bookingsPromise,
+      messagesPromise,
+      notificationsPromise,
+    ]);
+
+    if (bookingsResult.error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SIGNALS_BOOKINGS_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            bookingsResult.error.code ||
+            null,
+          message:
+            bookingsResult.error.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_SIGNALS_BOOKINGS_FAILED",
+      });
+    }
+
+    if (messagesResult.error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SIGNALS_MESSAGES_ERROR]",
+        {
+          userId,
+          code:
+            messagesResult.error.code ||
+            null,
+          message:
+            messagesResult.error.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_SIGNALS_MESSAGES_FAILED",
+      });
+    }
+
+    if (notificationsResult.error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SIGNALS_NOTIFICATIONS_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            notificationsResult.error.code ||
+            null,
+          message:
+            notificationsResult.error.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_SIGNALS_NOTIFICATIONS_FAILED",
+      });
+    }
+
+    const signals = {
+      bookings:
+        Number(
+          bookingsResult.count ||
+          0
+        ),
+
+      messages:
+        Number(
+          messagesResult.count ||
+          0
+        ),
+
+      notifications:
+        Number(
+          notificationsResult.count ||
+          0
+        ),
+    };
+
+    return res.json({
+      ok: true,
+
+      signals,
+
+      total:
+        signals.bookings +
+        signals.messages +
+        signals.notifications,
+
+      businesses:
+        ownedStations.map(
+          (station) => ({
+            id:
+              station.id,
+
+            name:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+          })
+        ),
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][SIGNALS_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_SIGNALS_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/business/bookings", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
