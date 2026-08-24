@@ -1662,6 +1662,189 @@ app.patch("/api/business/availability/:businessId", async (req, res) => {
 
 
 
+app.patch("/api/business/reviews/read", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * The browser does not send station ids.
+     * Resolve businesses only through the
+     * authenticated owner.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("id,owner_id")
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVIEWS_READ_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const stationIds =
+      (
+        Array.isArray(stations)
+          ? stations
+          : []
+      )
+        .map(
+          (station) =>
+            String(
+              station?.id || ""
+            ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    /*
+     * Mark only unread review events belonging
+     * to this authenticated owner's businesses.
+     *
+     * The review rows themselves are untouched.
+     */
+    const {
+      data: updatedRows,
+      error: updateError,
+    } = await supabase
+      .from("notifications")
+      .update({
+        is_read: true,
+      })
+      .eq(
+        "recipient_role",
+        "business"
+      )
+      .eq(
+        "type",
+        "business_new_review"
+      )
+      .eq(
+        "is_read",
+        false
+      )
+      .in(
+        "recipient_id",
+        stationIds
+      )
+      .select("id");
+
+    if (updateError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVIEWS_READ_UPDATE_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            updateError.code ||
+            null,
+          message:
+            updateError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REVIEWS_MARK_READ_FAILED",
+      });
+    }
+
+    const markedRead =
+      Array.isArray(updatedRows)
+        ? updatedRows.length
+        : 0;
+
+    console.log(
+      "[AUTODEAR][WEB_BUSINESS][REVIEWS_MARKED_READ]",
+      {
+        userId,
+        stationIds,
+        markedRead,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      markedRead,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REVIEWS_READ_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_REVIEWS_MARK_READ_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/business/signals", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
@@ -1813,6 +1996,41 @@ app.get("/api/business/signals", async (req, res) => {
      * are intentionally NOT included here because they are
      * not tied to a specific authenticated business yet.
      */
+    /*
+     * New business reviews are stored as
+     * dedicated unread notification events.
+     *
+     * Keep them separate from the generic
+     * notifications counter so one review
+     * does not light up two menu badges.
+     */
+    const reviewsPromise =
+      supabase
+        .from("notifications")
+        .select(
+          "id",
+          {
+            count: "exact",
+            head: true,
+          }
+        )
+        .eq(
+          "recipient_role",
+          "business"
+        )
+        .eq(
+          "is_read",
+          false
+        )
+        .eq(
+          "type",
+          "business_new_review"
+        )
+        .in(
+          "recipient_id",
+          stationIds
+        );
+
     const notificationsPromise =
       supabase
         .from("notifications")
@@ -1831,6 +2049,10 @@ app.get("/api/business/signals", async (req, res) => {
           "is_read",
           false
         )
+        .neq(
+          "type",
+          "business_new_review"
+        )
         .in(
           "recipient_id",
           stationIds
@@ -1839,10 +2061,12 @@ app.get("/api/business/signals", async (req, res) => {
     const [
       bookingsResult,
       messagesResult,
+      reviewsResult,
       notificationsResult,
     ] = await Promise.all([
       bookingsPromise,
       messagesPromise,
+      reviewsPromise,
       notificationsPromise,
     ]);
 
@@ -1889,6 +2113,28 @@ app.get("/api/business/signals", async (req, res) => {
       });
     }
 
+    if (reviewsResult.error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][SIGNALS_REVIEWS_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            reviewsResult.error.code ||
+            null,
+          message:
+            reviewsResult.error.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_SIGNALS_REVIEWS_FAILED",
+      });
+    }
+
     if (notificationsResult.error) {
       console.error(
         "[AUTODEAR][WEB_BUSINESS][SIGNALS_NOTIFICATIONS_ERROR]",
@@ -1924,6 +2170,12 @@ app.get("/api/business/signals", async (req, res) => {
           0
         ),
 
+      reviews:
+        Number(
+          reviewsResult.count ||
+          0
+        ),
+
       notifications:
         Number(
           notificationsResult.count ||
@@ -1939,6 +2191,7 @@ app.get("/api/business/signals", async (req, res) => {
       total:
         signals.bookings +
         signals.messages +
+        signals.reviews +
         signals.notifications,
 
       businesses:
