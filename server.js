@@ -1663,6 +1663,992 @@ app.patch("/api/business/availability/:businessId", async (req, res) => {
 
 
 
+
+app.get("/api/business/card", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * Source of truth for the public business
+     * card is stations.
+     *
+     * Browser does not supply an owner id.
+     * We always resolve stations using the
+     * authenticated Supabase user.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("*")
+      .eq(
+        "owner_id",
+        userId
+      )
+      .order(
+        "created_at",
+        {
+          ascending: true,
+        }
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][CARD_LOAD_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CARD_LOAD_FAILED",
+      });
+    }
+
+    const businesses =
+      (
+        Array.isArray(stations)
+          ? stations
+          : []
+      ).map((station) => ({
+        id:
+          station.id,
+
+        name:
+          station.name ||
+          "",
+
+        legalName:
+          station.legal_name ||
+          "",
+
+        businessType:
+          station.business_type ||
+          "",
+
+        phone:
+          station.phone ||
+          "",
+
+        email:
+          station.email ||
+          "",
+
+        city:
+          station.city ||
+          "",
+
+        address:
+          station.address ||
+          "",
+
+        addressFull:
+          station.address_full ||
+          station.address ||
+          "",
+
+        latitude:
+          station.latitude == null
+            ? null
+            : Number(
+                station.latitude
+              ),
+
+        longitude:
+          station.longitude == null
+            ? null
+            : Number(
+                station.longitude
+              ),
+
+        timezone:
+          station.timezone ||
+          "",
+
+        workHours:
+          station.work_hours ||
+          "",
+
+        workSchedule:
+          Array.isArray(
+            station.work_schedule
+          )
+            ? station.work_schedule
+            : [],
+
+        works24x7:
+          station.works_24_7 === true,
+
+        description:
+          station.description ||
+          "",
+
+        priceVisible:
+          station.price_visible === true,
+
+        onlineBookingEnabled:
+          station.online_booking_enabled === true,
+
+        internalCalendarEnabled:
+          station.internal_calendar_enabled !==
+          false,
+
+        experienceYears:
+          Number(
+            station.experience_years ||
+            0
+          ),
+
+        warrantyDays:
+          Number(
+            station.warranty_days ||
+            0
+          ),
+
+        photo:
+          station.photo_url ||
+          station.photo ||
+          station.image ||
+          "",
+
+        gallery:
+          Array.isArray(
+            station.gallery
+          )
+            ? station.gallery
+            : (
+                Array.isArray(
+                  station.photos
+                )
+                  ? station.photos
+                  : (
+                      Array.isArray(
+                        station.images
+                      )
+                        ? station.images
+                        : []
+                    )
+              ),
+
+        siteUrl:
+          station.site_url ||
+          "",
+
+        vkUrl:
+          station.vk_url ||
+          "",
+
+        maxUrl:
+          station.max_url ||
+          "",
+
+        isActive:
+          station.is_active === true,
+
+        status:
+          station.status ||
+          "",
+
+        createdAt:
+          station.created_at ||
+          null,
+
+        updatedAt:
+          station.updated_at ||
+          null,
+      }));
+
+    return res.json({
+      ok: true,
+      businesses,
+      count:
+        businesses.length,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][CARD_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_CARD_LOAD_FAILED",
+    });
+  }
+});
+
+
+app.patch("/api/business/card/:businessId", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  const businessId =
+    String(
+      req.params?.businessId ||
+      ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!businessId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "BUSINESS_ID_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * businessId from browser is never trusted
+     * by itself. The requested station must
+     * belong to the authenticated owner.
+     */
+    const {
+      data: station,
+      error: stationError,
+    } = await supabase
+      .from("stations")
+      .select("*")
+      .eq(
+        "id",
+        businessId
+      )
+      .eq(
+        "owner_id",
+        userId
+      )
+      .maybeSingle();
+
+    if (stationError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][CARD_OWNER_ERROR]",
+        {
+          userId,
+          businessId,
+          code:
+            stationError.code ||
+            null,
+          message:
+            stationError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CARD_LOOKUP_FAILED",
+      });
+    }
+
+    if (!station) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const body =
+      req.body &&
+      typeof req.body === "object" &&
+      !Array.isArray(req.body)
+        ? req.body
+        : {};
+
+    const patch = {};
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "name"
+      )
+    ) {
+      const name =
+        String(
+          body.name || ""
+        ).trim();
+
+      if (!name) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_NAME_REQUIRED",
+        });
+      }
+
+      patch.name = name;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "phone"
+      )
+    ) {
+      const phone =
+        String(
+          body.phone || ""
+        ).trim();
+
+      if (
+        phone.replace(
+          /\D/g,
+          ""
+        ).length < 11
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_PHONE_INVALID",
+        });
+      }
+
+      patch.phone = phone;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "city"
+      )
+    ) {
+      patch.city =
+        String(
+          body.city || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "address"
+      )
+    ) {
+      const address =
+        String(
+          body.address || ""
+        ).trim();
+
+      if (!address) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_ADDRESS_REQUIRED",
+        });
+      }
+
+      patch.address =
+        address;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "addressFull"
+      )
+    ) {
+      patch.address_full =
+        String(
+          body.addressFull || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "description"
+      )
+    ) {
+      patch.description =
+        String(
+          body.description || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "workHours"
+      )
+    ) {
+      patch.work_hours =
+        String(
+          body.workHours || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "workSchedule"
+      )
+    ) {
+      if (
+        !Array.isArray(
+          body.workSchedule
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_WORK_SCHEDULE_INVALID",
+        });
+      }
+
+      patch.work_schedule =
+        body.workSchedule;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "works24x7"
+      )
+    ) {
+      patch.works_24_7 =
+        body.works24x7 === true;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "priceVisible"
+      )
+    ) {
+      patch.price_visible =
+        body.priceVisible === true;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "onlineBookingEnabled"
+      )
+    ) {
+      patch.online_booking_enabled =
+        body.onlineBookingEnabled ===
+        true;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "isActive"
+      )
+    ) {
+      const isActive =
+        body.isActive === true;
+
+      patch.is_active =
+        isActive;
+
+      patch.status =
+        isActive
+          ? "active"
+          : "inactive";
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "experienceYears"
+      )
+    ) {
+      const value =
+        Number(
+          body.experienceYears
+        );
+
+      if (
+        !Number.isFinite(value) ||
+        value < 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_EXPERIENCE_INVALID",
+        });
+      }
+
+      patch.experience_years =
+        value;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "warrantyDays"
+      )
+    ) {
+      const value =
+        Number(
+          body.warrantyDays
+        );
+
+      if (
+        !Number.isFinite(value) ||
+        value < 0
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_WARRANTY_INVALID",
+        });
+      }
+
+      patch.warranty_days =
+        value;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "siteUrl"
+      )
+    ) {
+      patch.site_url =
+        String(
+          body.siteUrl || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "vkUrl"
+      )
+    ) {
+      patch.vk_url =
+        String(
+          body.vkUrl || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "maxUrl"
+      )
+    ) {
+      patch.max_url =
+        String(
+          body.maxUrl || ""
+        ).trim();
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "latitude"
+      )
+    ) {
+      const latitude =
+        body.latitude == null ||
+        body.latitude === ""
+          ? null
+          : Number(
+              body.latitude
+            );
+
+      if (
+        latitude != null &&
+        (
+          !Number.isFinite(latitude) ||
+          latitude < -90 ||
+          latitude > 90
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LATITUDE_INVALID",
+        });
+      }
+
+      patch.latitude =
+        latitude;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "longitude"
+      )
+    ) {
+      const longitude =
+        body.longitude == null ||
+        body.longitude === ""
+          ? null
+          : Number(
+              body.longitude
+            );
+
+      if (
+        longitude != null &&
+        (
+          !Number.isFinite(longitude) ||
+          longitude < -180 ||
+          longitude > 180
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LONGITUDE_INVALID",
+        });
+      }
+
+      patch.longitude =
+        longitude;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "timezone"
+      )
+    ) {
+      patch.timezone =
+        String(
+          body.timezone || ""
+        ).trim();
+    }
+
+    /*
+     * Photo upload itself will be handled
+     * separately. This endpoint accepts only
+     * already stored/public photo URLs.
+     */
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "photo"
+      )
+    ) {
+      const photo =
+        String(
+          body.photo || ""
+        ).trim();
+
+      patch.image =
+        photo;
+
+      patch.photo =
+        photo;
+
+      patch.photo_url =
+        photo;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        body,
+        "gallery"
+      )
+    ) {
+      if (
+        !Array.isArray(
+          body.gallery
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_GALLERY_INVALID",
+        });
+      }
+
+      const gallery =
+        body.gallery
+          .map(
+            (item) =>
+              String(
+                item || ""
+              ).trim()
+          )
+          .filter(Boolean);
+
+      patch.gallery =
+        gallery;
+
+      patch.photos =
+        gallery;
+
+      patch.images =
+        gallery;
+    }
+
+    if (
+      !Object.keys(patch).length
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "BUSINESS_CARD_PATCH_EMPTY",
+      });
+    }
+
+    patch.updated_at =
+      new Date().toISOString();
+
+    const {
+      data: updated,
+      error: updateError,
+    } = await supabase
+      .from("stations")
+      .update(
+        patch
+      )
+      .eq(
+        "id",
+        businessId
+      )
+      .eq(
+        "owner_id",
+        userId
+      )
+      .select("*")
+      .single();
+
+    if (updateError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][CARD_UPDATE_ERROR]",
+        {
+          userId,
+          businessId,
+          code:
+            updateError.code ||
+            null,
+          message:
+            updateError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CARD_UPDATE_FAILED",
+      });
+    }
+
+    return res.json({
+      ok: true,
+
+      business: {
+        id:
+          updated.id,
+
+        name:
+          updated.name ||
+          "",
+
+        legalName:
+          updated.legal_name ||
+          "",
+
+        phone:
+          updated.phone ||
+          "",
+
+        email:
+          updated.email ||
+          "",
+
+        city:
+          updated.city ||
+          "",
+
+        address:
+          updated.address ||
+          "",
+
+        addressFull:
+          updated.address_full ||
+          updated.address ||
+          "",
+
+        latitude:
+          updated.latitude == null
+            ? null
+            : Number(
+                updated.latitude
+              ),
+
+        longitude:
+          updated.longitude == null
+            ? null
+            : Number(
+                updated.longitude
+              ),
+
+        timezone:
+          updated.timezone ||
+          "",
+
+        workHours:
+          updated.work_hours ||
+          "",
+
+        workSchedule:
+          Array.isArray(
+            updated.work_schedule
+          )
+            ? updated.work_schedule
+            : [],
+
+        works24x7:
+          updated.works_24_7 === true,
+
+        description:
+          updated.description ||
+          "",
+
+        priceVisible:
+          updated.price_visible === true,
+
+        onlineBookingEnabled:
+          updated.online_booking_enabled === true,
+
+        experienceYears:
+          Number(
+            updated.experience_years ||
+            0
+          ),
+
+        warrantyDays:
+          Number(
+            updated.warranty_days ||
+            0
+          ),
+
+        photo:
+          updated.photo_url ||
+          updated.photo ||
+          updated.image ||
+          "",
+
+        gallery:
+          Array.isArray(
+            updated.gallery
+          )
+            ? updated.gallery
+            : [],
+
+        siteUrl:
+          updated.site_url ||
+          "",
+
+        vkUrl:
+          updated.vk_url ||
+          "",
+
+        maxUrl:
+          updated.max_url ||
+          "",
+
+        isActive:
+          updated.is_active === true,
+
+        status:
+          updated.status ||
+          "",
+
+        updatedAt:
+          updated.updated_at ||
+          null,
+      },
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][CARD_UPDATE_FATAL]",
+      {
+        userId,
+        businessId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_CARD_UPDATE_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/business/reviews", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
