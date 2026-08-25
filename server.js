@@ -27,6 +27,13 @@ const adsCreativeUpload = multer({
   },
 });
 
+const businessCardPhotoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 8 * 1024 * 1024,
+  },
+});
+
 const vehicleCheckCache = new Map();
 const geocodeCache = new Map();
 
@@ -1918,6 +1925,226 @@ app.get("/api/business/card", async (req, res) => {
     });
   }
 });
+
+
+app.post(
+  "/api/business/card/:businessId/photo",
+  businessCardPhotoUpload.single("image"),
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const userId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    const businessId =
+      String(
+        req.params?.businessId || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!businessId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "BUSINESS_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      /*
+       * Никогда не доверяем businessId,
+       * полученному из браузера.
+       */
+      const {
+        data: station,
+        error: stationError,
+      } = await supabase
+        .from("stations")
+        .select("id,owner_id")
+        .eq("id", businessId)
+        .eq("owner_id", userId)
+        .maybeSingle();
+
+      if (stationError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][PHOTO_OWNER_ERROR]",
+          stationError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CARD_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCESS_REQUIRED",
+        });
+      }
+
+      const file = req.file;
+
+      if (!file?.buffer?.length) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_PHOTO_REQUIRED",
+        });
+      }
+
+      const mimeType =
+        String(
+          file.mimetype || ""
+        ).toLowerCase();
+
+      const extensionByMime = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+      };
+
+      const extension =
+        extensionByMime[mimeType];
+
+      if (!extension) {
+        return res.status(415).json({
+          ok: false,
+          error:
+            "BUSINESS_PHOTO_TYPE_UNSUPPORTED",
+        });
+      }
+
+      const bucket =
+        "business-photos";
+
+      const storagePath =
+        `${userId}/main_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 10)}.${extension}`;
+
+      const {
+        error: uploadError,
+      } = await supabase.storage
+        .from(bucket)
+        .upload(
+          storagePath,
+          file.buffer,
+          {
+            contentType: mimeType,
+            upsert: false,
+          }
+        );
+
+      if (uploadError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][PHOTO_UPLOAD_ERROR]",
+          uploadError
+        );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "BUSINESS_PHOTO_UPLOAD_FAILED",
+        });
+      }
+
+      const {
+        data: publicData,
+      } = supabase.storage
+        .from(bucket)
+        .getPublicUrl(storagePath);
+
+      const photoUrl =
+        String(
+          publicData?.publicUrl || ""
+        ).trim();
+
+      if (!photoUrl) {
+        return res.status(502).json({
+          ok: false,
+          error:
+            "BUSINESS_PHOTO_URL_FAILED",
+        });
+      }
+
+      /*
+       * Сразу делаем новое изображение
+       * основной фотографией станции.
+       */
+      const {
+        error: updateError,
+      } = await supabase
+        .from("stations")
+        .update({
+          photo_url: photoUrl,
+        })
+        .eq("id", businessId)
+        .eq("owner_id", userId);
+
+      if (updateError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][PHOTO_CARD_UPDATE_ERROR]",
+          updateError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_PHOTO_CARD_UPDATE_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        businessId,
+        photoUrl,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][PHOTO_FATAL]",
+        {
+          userId,
+          businessId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_PHOTO_UPLOAD_FAILED",
+      });
+    }
+  }
+);
 
 
 app.patch("/api/business/card/:businessId", async (req, res) => {
