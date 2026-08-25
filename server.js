@@ -3496,6 +3496,607 @@ app.patch("/api/business/reviews/read", async (req, res) => {
 });
 
 
+
+app.get("/api/business/notifications", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * Browser does not decide which business
+     * notifications it is allowed to see.
+     * Resolve stations from authenticated owner.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,name,legal_name"
+      )
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][NOTIFICATIONS_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code ||
+            null,
+          message:
+            stationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    const stationIds =
+      ownedStations
+        .map(
+          (station) =>
+            String(
+              station?.id || ""
+            ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    /*
+     * Reviews have their own section and badge.
+     * Do not duplicate business_new_review here.
+     */
+    const {
+      data: rows,
+      error: notificationsError,
+    } = await supabase
+      .from("notifications")
+      .select(
+        [
+          "id",
+          "recipient_role",
+          "recipient_id",
+          "title",
+          "body",
+          "type",
+          "related_type",
+          "related_id",
+          "is_read",
+          "created_at",
+        ].join(",")
+      )
+      .eq(
+        "recipient_role",
+        "business"
+      )
+      .neq(
+        "type",
+        "business_new_review"
+      )
+      .in(
+        "recipient_id",
+        stationIds
+      )
+      .order(
+        "created_at",
+        {
+          ascending: false,
+        }
+      )
+      .limit(200);
+
+    if (notificationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][NOTIFICATIONS_LOAD_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            notificationsError.code ||
+            null,
+          message:
+            notificationsError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_NOTIFICATIONS_LOAD_FAILED",
+      });
+    }
+
+    const stationMap =
+      new Map(
+        ownedStations.map(
+          (station) => [
+            String(
+              station.id
+            ),
+            station,
+          ]
+        )
+      );
+
+    const notifications =
+      (
+        Array.isArray(rows)
+          ? rows
+          : []
+      ).map((row) => {
+        const recipientId =
+          String(
+            row?.recipient_id || ""
+          ).trim();
+
+        const station =
+          stationMap.get(
+            recipientId
+          ) || null;
+
+        return {
+          id:
+            row.id,
+
+          businessId:
+            recipientId,
+
+          businessName:
+            station?.name ||
+            station?.legal_name ||
+            "Бизнес AUTODEAR",
+
+          title:
+            String(
+              row?.title ||
+              "Уведомление"
+            ),
+
+          body:
+            String(
+              row?.body || ""
+            ),
+
+          type:
+            row?.type ||
+            "system",
+
+          relatedType:
+            row?.related_type ||
+            null,
+
+          relatedId:
+            row?.related_id ||
+            null,
+
+          isRead:
+            row?.is_read === true,
+
+          createdAt:
+            row?.created_at ||
+            null,
+        };
+      });
+
+    const unread =
+      notifications.filter(
+        (item) =>
+          item.isRead !== true
+      ).length;
+
+    return res.json({
+      ok: true,
+
+      summary: {
+        total:
+          notifications.length,
+
+        unread,
+      },
+
+      notifications,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][NOTIFICATIONS_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_NOTIFICATIONS_LOAD_FAILED",
+    });
+  }
+});
+
+
+app.patch(
+  "/api/business/notifications/:id/read",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const userId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    const notificationId =
+      String(
+        req.params?.id || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!notificationId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "NOTIFICATION_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      const {
+        data: stations,
+        error: stationsError,
+      } = await supabase
+        .from("stations")
+        .select("id")
+        .eq(
+          "owner_id",
+          userId
+        );
+
+      if (stationsError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LOOKUP_FAILED",
+        });
+      }
+
+      const stationIds =
+        (
+          Array.isArray(stations)
+            ? stations
+            : []
+        )
+          .map(
+            (station) =>
+              String(
+                station?.id || ""
+              ).trim()
+          )
+          .filter(Boolean);
+
+      if (!stationIds.length) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCESS_REQUIRED",
+        });
+      }
+
+      /*
+       * Update succeeds only if notification
+       * belongs to one of this owner's stations.
+       */
+      const {
+        data: updatedRows,
+        error: updateError,
+      } = await supabase
+        .from("notifications")
+        .update({
+          is_read: true,
+        })
+        .eq(
+          "id",
+          notificationId
+        )
+        .eq(
+          "recipient_role",
+          "business"
+        )
+        .neq(
+          "type",
+          "business_new_review"
+        )
+        .in(
+          "recipient_id",
+          stationIds
+        )
+        .select("id");
+
+      if (updateError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][NOTIFICATION_READ_ERROR]",
+          {
+            userId,
+            notificationId,
+            code:
+              updateError.code ||
+              null,
+            message:
+              updateError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_NOTIFICATION_READ_FAILED",
+        });
+      }
+
+      if (
+        !Array.isArray(
+          updatedRows
+        ) ||
+        !updatedRows.length
+      ) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_NOTIFICATION_NOT_FOUND",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        notificationId,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][NOTIFICATION_READ_FATAL]",
+        {
+          userId,
+          notificationId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_NOTIFICATION_READ_FAILED",
+      });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/business/notifications/read-all",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const userId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      const {
+        data: stations,
+        error: stationsError,
+      } = await supabase
+        .from("stations")
+        .select("id")
+        .eq(
+          "owner_id",
+          userId
+        );
+
+      if (stationsError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LOOKUP_FAILED",
+        });
+      }
+
+      const stationIds =
+        (
+          Array.isArray(stations)
+            ? stations
+            : []
+        )
+          .map(
+            (station) =>
+              String(
+                station?.id || ""
+              ).trim()
+          )
+          .filter(Boolean);
+
+      if (!stationIds.length) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCESS_REQUIRED",
+        });
+      }
+
+      const {
+        data: updatedRows,
+        error: updateError,
+      } = await supabase
+        .from("notifications")
+        .update({
+          is_read: true,
+        })
+        .eq(
+          "recipient_role",
+          "business"
+        )
+        .eq(
+          "is_read",
+          false
+        )
+        .neq(
+          "type",
+          "business_new_review"
+        )
+        .in(
+          "recipient_id",
+          stationIds
+        )
+        .select("id");
+
+      if (updateError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][NOTIFICATIONS_READ_ALL_ERROR]",
+          {
+            userId,
+            stationIds,
+            code:
+              updateError.code ||
+              null,
+            message:
+              updateError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_NOTIFICATIONS_READ_ALL_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        markedRead:
+          Array.isArray(
+            updatedRows
+          )
+            ? updatedRows.length
+            : 0,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][NOTIFICATIONS_READ_ALL_FATAL]",
+        {
+          userId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_NOTIFICATIONS_READ_ALL_FAILED",
+      });
+    }
+  }
+);
+
+
 app.get("/api/business/signals", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
