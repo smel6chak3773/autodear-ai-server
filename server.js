@@ -6486,8 +6486,20 @@ app.get("/api/business/requests", async (req, res) => {
               request.customer_name ||
               "Клиент AUTODEAR",
 
+            customerPhone:
+              request.customer_phone ||
+              "",
+
             car:
               request.car ||
+              "",
+
+            carYear:
+              request.car_year ||
+              "",
+
+            plate:
+              request.plate ||
               "",
 
             vin:
@@ -6496,6 +6508,14 @@ app.get("/api/business/requests", async (req, res) => {
 
             service:
               request.service ||
+              "",
+
+            serviceCategory:
+              request.service_category ||
+              "",
+
+            serviceReason:
+              request.service_reason ||
               "",
 
             date:
@@ -6562,6 +6582,193 @@ app.get("/api/business/requests", async (req, res) => {
  * booking. Repeated confirmation reuses the
  * existing booking instead of creating a duplicate.
  */
+
+/*
+ * WEB BUSINESS — CANCEL INCOMING REQUEST
+ *
+ * Входящая заявка ещё не является business_booking.
+ * Поэтому отменяем её непосредственно в
+ * business_requests.
+ *
+ * В модели мобильного приложения отмена бизнесом
+ * соответствует status = "rejected".
+ */
+app.patch("/api/business/requests/:id/cancel", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const userId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  const requestId =
+    String(
+      req.params?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!requestId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "REQUEST_ID_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("id")
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const stationIds =
+      (
+        Array.isArray(stations)
+          ? stations
+          : []
+      )
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const {
+      data: request,
+      error: requestError,
+    } = await supabase
+      .from("business_requests")
+      .select(
+        "id,business_id,status"
+      )
+      .eq(
+        "id",
+        requestId
+      )
+      .in(
+        "business_id",
+        stationIds
+      )
+      .maybeSingle();
+
+    if (requestError) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "REQUEST_LOOKUP_FAILED",
+      });
+    }
+
+    if (!request) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "REQUEST_NOT_FOUND",
+      });
+    }
+
+    if (
+      request.status !== "new" &&
+      request.status !== "rescheduled"
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "REQUEST_STATUS_INVALID",
+      });
+    }
+
+    const {
+      data: updatedRequest,
+      error: updateError,
+    } = await supabase
+      .from("business_requests")
+      .update({
+        status: "rejected",
+        updated_at:
+          new Date().toISOString(),
+      })
+      .eq(
+        "id",
+        requestId
+      )
+      .in(
+        "business_id",
+        stationIds
+      )
+      .select("*")
+      .single();
+
+    if (
+      updateError ||
+      !updatedRequest
+    ) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "REQUEST_CANCEL_FAILED",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      request: updatedRequest,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REQUEST_CANCEL]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "REQUEST_CANCEL_FAILED",
+    });
+  }
+});
+
+
 app.patch("/api/business/requests/:id/confirm", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
