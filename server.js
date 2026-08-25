@@ -4097,6 +4097,873 @@ app.patch(
 );
 
 
+
+app.get("/api/business/chats", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const userId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * SECURITY:
+     * A business sees only chats where
+     * business_owner_id is the authenticated user.
+     */
+    const {
+      data: rows,
+      error,
+    } = await supabase
+      .from("chats")
+      .select("*")
+      .eq(
+        "business_owner_id",
+        userId
+      )
+      .order(
+        "updated_at",
+        {
+          ascending: false,
+        }
+      )
+      .limit(200);
+
+    if (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][CHATS_LOAD_ERROR]",
+        {
+          userId,
+          code:
+            error.code || null,
+          message:
+            error.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CHATS_LOAD_FAILED",
+      });
+    }
+
+    const chats =
+      (
+        Array.isArray(rows)
+          ? rows
+          : []
+      ).map((row) => ({
+        id:
+          row.id,
+
+        chatType:
+          row.chat_type ||
+          "service",
+
+        stationId:
+          row.station_id ||
+          null,
+
+        businessOwnerId:
+          row.business_owner_id ||
+          null,
+
+        userId:
+          row.user_id ||
+          null,
+
+        buyerId:
+          row.buyer_id ||
+          null,
+
+        sellerId:
+          row.seller_id ||
+          null,
+
+        userName:
+          row.user_name ||
+          "Клиент AUTODEAR",
+
+        userPhone:
+          row.user_phone ||
+          null,
+
+        userAvatarUrl:
+          row.user_avatar_url ||
+          null,
+
+        businessPhoto:
+          row.business_photo ||
+          null,
+
+        businessAvatarUrl:
+          row.business_avatar_url ||
+          null,
+
+        sellerAvatarUrl:
+          row.seller_avatar_url ||
+          null,
+
+        sellerName:
+          row.seller_name ||
+          null,
+
+        listingId:
+          row.listing_id ||
+          null,
+
+        listingTitle:
+          row.listing_title ||
+          null,
+
+        listingPrice:
+          row.listing_price ||
+          null,
+
+        lastMessage:
+          row.last_message ||
+          "",
+
+        unread:
+          Number(
+            row.business_unread ||
+            0
+          ),
+
+        updatedAt:
+          row.updated_at ||
+          null,
+
+        archivedBy:
+          Array.isArray(
+            row.archived_by
+          )
+            ? row.archived_by
+            : [],
+      }));
+
+    return res.json({
+      ok: true,
+      chats,
+      count:
+        chats.length,
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][CHATS_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_CHATS_LOAD_FAILED",
+    });
+  }
+});
+
+
+app.get(
+  "/api/business/chats/:chatId/messages",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    const chatId =
+      String(
+        req.params?.chatId || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!chatId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "CHAT_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      const {
+        data: chat,
+        error: chatError,
+      } = await supabase
+        .from("chats")
+        .select("*")
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (chatError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_LOOKUP_FAILED",
+        });
+      }
+
+      if (!chat) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_NOT_FOUND",
+        });
+      }
+
+      const {
+        data: rows,
+        error: messagesError,
+      } = await supabase
+        .from("chat_messages")
+        .select("*")
+        .eq(
+          "chat_id",
+          chatId
+        )
+        .order(
+          "created_at",
+          {
+            ascending: true,
+          }
+        )
+        .limit(1000);
+
+      if (messagesError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][MESSAGES_LOAD_ERROR]",
+          {
+            userId,
+            chatId,
+            code:
+              messagesError.code ||
+              null,
+            message:
+              messagesError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_MESSAGES_LOAD_FAILED",
+        });
+      }
+
+      const messages =
+        (
+          Array.isArray(rows)
+            ? rows
+            : []
+        )
+          .filter((row) => {
+            if (
+              row?.deleted_for_everyone ===
+              true
+            ) {
+              return false;
+            }
+
+            const hiddenFor =
+              Array.isArray(
+                row?.hidden_for
+              )
+                ? row.hidden_for.map(
+                    String
+                  )
+                : [];
+
+            return !hiddenFor.includes(
+              userId
+            );
+          })
+          .map((row) => ({
+            id:
+              row.id,
+
+            chatId:
+              row.chat_id,
+
+            senderId:
+              row.sender_id,
+
+            senderRole:
+              row.sender_role ||
+              null,
+
+            text:
+              row.text ||
+              "",
+
+            attachments:
+              Array.isArray(
+                row.attachments
+              )
+                ? row.attachments
+                : [],
+
+            status:
+              row.status ||
+              "sent",
+
+            deliveredAt:
+              row.delivered_at ||
+              null,
+
+            readAt:
+              row.read_at ||
+              null,
+
+            createdAt:
+              row.created_at ||
+              null,
+          }));
+
+      return res.json({
+        ok: true,
+
+        chat: {
+          id:
+            chat.id,
+
+          userId:
+            chat.user_id ||
+            null,
+
+          userName:
+            chat.user_name ||
+            "Клиент AUTODEAR",
+
+          userPhone:
+            chat.user_phone ||
+            null,
+
+          userAvatarUrl:
+            chat.user_avatar_url ||
+            null,
+
+          listingTitle:
+            chat.listing_title ||
+            null,
+
+          chatType:
+            chat.chat_type ||
+            "service",
+        },
+
+        messages,
+        count:
+          messages.length,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][MESSAGES_FATAL]",
+        {
+          userId,
+          chatId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_MESSAGES_LOAD_FAILED",
+      });
+    }
+  }
+);
+
+
+app.post(
+  "/api/business/chats/:chatId/messages",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    const chatId =
+      String(
+        req.params?.chatId || ""
+      ).trim();
+
+    const text =
+      String(
+        req.body?.text || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!chatId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "CHAT_ID_REQUIRED",
+      });
+    }
+
+    if (!text) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "MESSAGE_TEXT_REQUIRED",
+      });
+    }
+
+    if (text.length > 10000) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "MESSAGE_TEXT_TOO_LONG",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      const {
+        data: chat,
+        error: chatError,
+      } = await supabase
+        .from("chats")
+        .select("*")
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (chatError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_LOOKUP_FAILED",
+        });
+      }
+
+      if (!chat) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_NOT_FOUND",
+        });
+      }
+
+      const now =
+        new Date().toISOString();
+
+      const messageId =
+        `web_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 10)}`;
+
+      const {
+        data: message,
+        error: insertError,
+      } = await supabase
+        .from("chat_messages")
+        .insert({
+          id:
+            messageId,
+
+          chat_id:
+            chatId,
+
+          sender_id:
+            userId,
+
+          sender_role:
+            "business",
+
+          text,
+
+          attachments:
+            [],
+
+          status:
+            "sent",
+
+          created_at:
+            now,
+        })
+        .select("*")
+        .single();
+
+      if (insertError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][MESSAGE_SEND_ERROR]",
+          {
+            userId,
+            chatId,
+            code:
+              insertError.code ||
+              null,
+            message:
+              insertError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_MESSAGE_SEND_FAILED",
+        });
+      }
+
+      const {
+        error: chatUpdateError,
+      } = await supabase
+        .from("chats")
+        .update({
+          last_message:
+            text,
+
+          updated_at:
+            now,
+
+          user_unread:
+            1,
+
+          business_unread:
+            0,
+
+          unread:
+            1,
+        })
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        );
+
+      if (chatUpdateError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][MESSAGE_CHAT_UPDATE_ERROR]",
+          {
+            userId,
+            chatId,
+            code:
+              chatUpdateError.code ||
+              null,
+            message:
+              chatUpdateError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_MESSAGE_CHAT_UPDATE_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        message: {
+          id:
+            message.id,
+
+          chatId:
+            message.chat_id,
+
+          senderId:
+            message.sender_id,
+
+          senderRole:
+            message.sender_role,
+
+          text:
+            message.text,
+
+          attachments:
+            Array.isArray(
+              message.attachments
+            )
+              ? message.attachments
+              : [],
+
+          status:
+            message.status ||
+            "sent",
+
+          createdAt:
+            message.created_at ||
+            now,
+        },
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][MESSAGE_SEND_FATAL]",
+        {
+          userId,
+          chatId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_MESSAGE_SEND_FAILED",
+      });
+    }
+  }
+);
+
+
+app.post(
+  "/api/business/chats/:chatId/read",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    const chatId =
+      String(
+        req.params?.chatId || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!chatId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "CHAT_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      const {
+        data: chat,
+        error: chatError,
+      } = await supabase
+        .from("chats")
+        .select(
+          "id,business_owner_id"
+        )
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (chatError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_LOOKUP_FAILED",
+        });
+      }
+
+      if (!chat) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_NOT_FOUND",
+        });
+      }
+
+      const now =
+        new Date().toISOString();
+
+      const {
+        error: messagesError,
+      } = await supabase
+        .from("chat_messages")
+        .update({
+          status:
+            "read",
+
+          delivered_at:
+            now,
+
+          read_at:
+            now,
+        })
+        .eq(
+          "chat_id",
+          chatId
+        )
+        .neq(
+          "sender_id",
+          userId
+        );
+
+      if (messagesError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][MESSAGE_READ_ERROR]",
+          messagesError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_MESSAGES_READ_FAILED",
+        });
+      }
+
+      const {
+        error: chatUpdateError,
+      } = await supabase
+        .from("chats")
+        .update({
+          business_unread:
+            0,
+        })
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        );
+
+      if (chatUpdateError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_READ_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        chatId,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][CHAT_READ_FATAL]",
+        {
+          userId,
+          chatId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CHAT_READ_FAILED",
+      });
+    }
+  }
+);
+
+
 app.get("/api/business/signals", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
