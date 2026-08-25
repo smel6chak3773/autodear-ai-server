@@ -4250,6 +4250,16 @@ app.get("/api/business/chats", async (req, res) => {
             0
           ),
 
+        userTyping:
+          Boolean(
+            row.user_typing
+          ),
+
+        businessTyping:
+          Boolean(
+            row.business_typing
+          ),
+
         updatedAt:
           row.updated_at ||
           null,
