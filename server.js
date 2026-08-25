@@ -5575,6 +5575,732 @@ app.get("/api/business/signals", async (req, res) => {
 });
 
 
+
+/*
+ * AUTODEAR WEB BUSINESS REVENUE
+ *
+ * Источник истины:
+ * public.business_revenue_entries
+ *
+ * Безопасность:
+ * браузер не выбирает произвольный business_id.
+ * Сначала определяем станции текущего пользователя.
+ */
+
+app.get("/api/business/revenue", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const userId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,name,legal_name"
+      )
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVENUE_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code || null,
+          message:
+            stationsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    if (!ownedStations.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const stationIds =
+      ownedStations
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    const {
+      data: entries,
+      error: entriesError,
+    } = await supabase
+      .from("business_revenue_entries")
+      .select("*")
+      .in(
+        "business_id",
+        stationIds
+      )
+      .order(
+        "earned_at",
+        {
+          ascending: false,
+        }
+      )
+      .limit(1000);
+
+    if (entriesError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVENUE_LOAD_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            entriesError.code || null,
+          message:
+            entriesError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REVENUE_LOAD_FAILED",
+      });
+    }
+
+    const rows =
+      Array.isArray(entries)
+        ? entries
+        : [];
+
+    const now =
+      new Date();
+
+    const localDateKey =
+      (value) => {
+        const d =
+          new Date(value);
+
+        if (
+          Number.isNaN(
+            d.getTime()
+          )
+        ) {
+          return "";
+        }
+
+        const year =
+          d.getUTCFullYear();
+
+        const month =
+          String(
+            d.getUTCMonth() + 1
+          ).padStart(2, "0");
+
+        const day =
+          String(
+            d.getUTCDate()
+          ).padStart(2, "0");
+
+        return `${year}-${month}-${day}`;
+      };
+
+    const todayKey =
+      localDateKey(now);
+
+    const monthKey =
+      todayKey.slice(0, 7);
+
+    let totalKopecks = 0;
+    let todayKopecks = 0;
+    let monthKopecks = 0;
+    let autodearKopecks = 0;
+    let manualKopecks = 0;
+
+    for (const row of rows) {
+      const amount =
+        Number(
+          row?.amount_kopecks ||
+          0
+        );
+
+      totalKopecks += amount;
+
+      const earnedKey =
+        localDateKey(
+          row?.earned_at
+        );
+
+      if (
+        earnedKey ===
+        todayKey
+      ) {
+        todayKopecks +=
+          amount;
+      }
+
+      if (
+        earnedKey.startsWith(
+          monthKey
+        )
+      ) {
+        monthKopecks +=
+          amount;
+      }
+
+      if (
+        row?.source ===
+        "autodear"
+      ) {
+        autodearKopecks +=
+          amount;
+      } else {
+        manualKopecks +=
+          amount;
+      }
+    }
+
+    return res.json({
+      ok: true,
+
+      businesses:
+        ownedStations.map(
+          (station) => ({
+            id:
+              station.id,
+
+            name:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+          })
+        ),
+
+      summary: {
+        totalKopecks,
+        todayKopecks,
+        monthKopecks,
+        autodearKopecks,
+        manualKopecks,
+        operations:
+          rows.length,
+      },
+
+      entries:
+        rows.map(
+          (row) => ({
+            id:
+              row.id,
+
+            businessId:
+              row.business_id,
+
+            bookingId:
+              row.booking_id ||
+              null,
+
+            source:
+              row.source ||
+              "manual",
+
+            customerId:
+              row.customer_id ||
+              null,
+
+            customerName:
+              row.customer_name ||
+              "Клиент",
+
+            service:
+              row.service ||
+              "",
+
+            car:
+              row.car ||
+              "",
+
+            amountKopecks:
+              Number(
+                row.amount_kopecks ||
+                0
+              ),
+
+            earnedAt:
+              row.earned_at ||
+              null,
+
+            note:
+              row.note ||
+              "",
+
+            createdAt:
+              row.created_at ||
+              null,
+
+            updatedAt:
+              row.updated_at ||
+              null,
+          })
+        ),
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REVENUE_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_REVENUE_FAILED",
+    });
+  }
+});
+
+
+app.post("/api/business/revenue", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const userId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  const bookingId =
+    String(
+      req.body?.bookingId || ""
+    ).trim();
+
+  const requestedBusinessId =
+    String(
+      req.body?.businessId || ""
+    ).trim();
+
+  const amountKopecks =
+    Number(
+      req.body?.amountKopecks
+    );
+
+  const manualSource =
+    String(
+      req.body?.source ||
+      "manual"
+    )
+      .trim()
+      .toLowerCase();
+
+  const customerName =
+    String(
+      req.body?.customerName ||
+      ""
+    ).trim();
+
+  const service =
+    String(
+      req.body?.service ||
+      ""
+    ).trim();
+
+  const car =
+    String(
+      req.body?.car ||
+      ""
+    ).trim();
+
+  const note =
+    String(
+      req.body?.note ||
+      ""
+    ).trim();
+
+  if (
+    !Number.isInteger(
+      amountKopecks
+    ) ||
+    amountKopecks <= 0
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "REVENUE_AMOUNT_INVALID",
+    });
+  }
+
+  try {
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("id")
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const stationIds =
+      (
+        Array.isArray(stations)
+          ? stations
+          : []
+      )
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    let businessId = "";
+    let source = "manual";
+    let customerId = null;
+    let finalCustomerName =
+      customerName;
+    let finalService =
+      service;
+    let finalCar =
+      car;
+
+    if (bookingId) {
+      const {
+        data: booking,
+        error: bookingError,
+      } = await supabase
+        .from("business_bookings")
+        .select("*")
+        .eq(
+          "id",
+          bookingId
+        )
+        .in(
+          "business_id",
+          stationIds
+        )
+        .maybeSingle();
+
+      if (bookingError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BOOKING_LOOKUP_FAILED",
+        });
+      }
+
+      if (!booking) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BOOKING_NOT_FOUND",
+        });
+      }
+
+      if (
+        booking.status !==
+        "completed"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BOOKING_NOT_COMPLETED",
+        });
+      }
+
+      businessId =
+        String(
+          booking.business_id
+        );
+
+      source =
+        booking.source ===
+        "autodear"
+          ? "autodear"
+          : "manual";
+
+      customerId =
+        booking.customer_id ||
+        null;
+
+      finalCustomerName =
+        booking.customer_name ||
+        customerName ||
+        "";
+
+      finalService =
+        booking.service ||
+        service ||
+        "";
+
+      finalCar =
+        booking.car ||
+        car ||
+        "";
+
+    } else {
+      if (
+        !stationIds.includes(
+          requestedBusinessId
+        )
+      ) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCESS_REQUIRED",
+        });
+      }
+
+      if (
+        manualSource !==
+        "manual"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "REVENUE_SOURCE_INVALID",
+        });
+      }
+
+      businessId =
+        requestedBusinessId;
+
+      source =
+        "manual";
+    }
+
+    const now =
+      new Date().toISOString();
+
+    const entryId =
+      `revenue_${crypto.randomUUID()}`;
+
+    const {
+      data: inserted,
+      error: insertError,
+    } = await supabase
+      .from("business_revenue_entries")
+      .insert({
+        id:
+          entryId,
+
+        business_id:
+          businessId,
+
+        booking_id:
+          bookingId ||
+          null,
+
+        source,
+
+        customer_id:
+          customerId,
+
+        customer_name:
+          finalCustomerName,
+
+        service:
+          finalService,
+
+        car:
+          finalCar,
+
+        amount_kopecks:
+          amountKopecks,
+
+        earned_at:
+          now,
+
+        note,
+
+        created_by:
+          userId,
+
+        created_at:
+          now,
+
+        updated_at:
+          now,
+      })
+      .select("*")
+      .single();
+
+    if (insertError) {
+      const duplicate =
+        insertError.code ===
+        "23505";
+
+      if (duplicate) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "REVENUE_ALREADY_RECORDED",
+        });
+      }
+
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REVENUE_CREATE_ERROR]",
+        {
+          userId,
+          bookingId:
+            bookingId ||
+            null,
+          code:
+            insertError.code ||
+            null,
+          message:
+            insertError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REVENUE_CREATE_FAILED",
+      });
+    }
+
+    return res.status(201).json({
+      ok: true,
+
+      entry: {
+        id:
+          inserted.id,
+
+        businessId:
+          inserted.business_id,
+
+        bookingId:
+          inserted.booking_id ||
+          null,
+
+        source:
+          inserted.source,
+
+        customerName:
+          inserted.customer_name ||
+          "",
+
+        service:
+          inserted.service ||
+          "",
+
+        car:
+          inserted.car ||
+          "",
+
+        amountKopecks:
+          Number(
+            inserted.amount_kopecks ||
+            0
+          ),
+
+        earnedAt:
+          inserted.earned_at ||
+          null,
+
+        note:
+          inserted.note ||
+          "",
+      },
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REVENUE_CREATE_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_REVENUE_CREATE_FAILED",
+    });
+  }
+});
+
+
 app.get("/api/business/bookings", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
