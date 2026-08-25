@@ -4260,6 +4260,24 @@ app.get("/api/business/chats", async (req, res) => {
             row.business_typing
           ),
 
+        userLastSeen:
+          row.user_last_seen ||
+          null,
+
+        businessLastSeen:
+          row.business_last_seen ||
+          null,
+
+        userInChat:
+          Boolean(
+            row.user_in_chat
+          ),
+
+        businessInChat:
+          Boolean(
+            row.business_in_chat
+          ),
+
         updatedAt:
           row.updated_at ||
           null,
@@ -4297,6 +4315,206 @@ app.get("/api/business/chats", async (req, res) => {
     });
   }
 });
+
+
+/*
+ * Web business chat presence.
+ *
+ * The browser uses the same `chats` presence fields
+ * as the mobile application:
+ *
+ * business_typing
+ * business_last_seen
+ * business_in_chat
+ */
+app.patch(
+  "/api/business/chats/:chatId/presence",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    const chatId =
+      String(
+        req.params?.chatId || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!chatId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "CHAT_ID_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    try {
+      const {
+        data: chat,
+        error: chatError,
+      } = await supabase
+        .from("chats")
+        .select(
+          "id,business_owner_id"
+        )
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (chatError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][PRESENCE_LOOKUP_ERROR]",
+          {
+            userId,
+            chatId,
+            code:
+              chatError.code || null,
+            message:
+              chatError.message || null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_LOOKUP_FAILED",
+        });
+      }
+
+      if (!chat) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_NOT_FOUND",
+        });
+      }
+
+      const patch = {
+        business_last_seen:
+          new Date().toISOString(),
+      };
+
+      if (
+        typeof req.body?.typing ===
+        "boolean"
+      ) {
+        patch.business_typing =
+          req.body.typing;
+      }
+
+      if (
+        typeof req.body?.inChat ===
+        "boolean"
+      ) {
+        patch.business_in_chat =
+          req.body.inChat;
+      }
+
+      const {
+        data: updated,
+        error: updateError,
+      } = await supabase
+        .from("chats")
+        .update(patch)
+        .eq(
+          "id",
+          chatId
+        )
+        .eq(
+          "business_owner_id",
+          userId
+        )
+        .select(
+          "id,business_typing,business_last_seen,business_in_chat"
+        )
+        .maybeSingle();
+
+      if (updateError) {
+        console.error(
+          "[AUTODEAR][WEB_BUSINESS][PRESENCE_UPDATE_ERROR]",
+          {
+            userId,
+            chatId,
+            code:
+              updateError.code || null,
+            message:
+              updateError.message || null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CHAT_PRESENCE_UPDATE_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        presence: {
+          businessTyping:
+            Boolean(
+              updated?.business_typing
+            ),
+
+          businessLastSeen:
+            updated?.business_last_seen ||
+            null,
+
+          businessInChat:
+            Boolean(
+              updated?.business_in_chat
+            ),
+        },
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][PRESENCE_FATAL]",
+        {
+          userId,
+          chatId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CHAT_PRESENCE_FAILED",
+      });
+    }
+  }
+);
 
 
 app.get(
