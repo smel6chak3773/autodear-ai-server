@@ -5286,13 +5286,21 @@ app.get("/api/business/signals", async (req, res) => {
         .filter(Boolean);
 
     /*
-     * New bookings:
-     * only bookings belonging to one of
-     * the authenticated owner's stations.
+     * New client requests:
+     *
+     * A new AUTODEAR request lives in
+     * business_requests until the business
+     * confirms it.
+     *
+     * Only after confirmation does the mobile
+     * bridge create business_bookings.
+     *
+     * Therefore the "Записи" badge must count
+     * NEW requests, not calendar bookings.
      */
     const bookingsPromise =
       supabase
-        .from("business_bookings")
+        .from("business_requests")
         .select(
           "id",
           {
@@ -6296,6 +6304,830 @@ app.post("/api/business/revenue", async (req, res) => {
       ok: false,
       error:
         "BUSINESS_REVENUE_CREATE_FAILED",
+    });
+  }
+});
+
+
+/*
+ * WEB BUSINESS — CLIENT REQUESTS
+ *
+ * Returns AUTODEAR client requests belonging only
+ * to stations owned by the authenticated user.
+ *
+ * SECURITY:
+ * The browser does not supply business_id.
+ * Station ids are resolved from auth user -> stations.
+ */
+app.get("/api/business/requests", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,owner_id,name,legal_name"
+      )
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REQUESTS_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code || null,
+          message:
+            stationsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const ownedStations =
+      Array.isArray(stations)
+        ? stations
+        : [];
+
+    if (!ownedStations.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    const stationIds =
+      ownedStations
+        .map(
+          (station) =>
+            String(
+              station?.id || ""
+            ).trim()
+        )
+        .filter(Boolean);
+
+    const {
+      data: requests,
+      error: requestsError,
+    } = await supabase
+      .from("business_requests")
+      .select("*")
+      .in(
+        "business_id",
+        stationIds
+      )
+      .order(
+        "created_at",
+        {
+          ascending: false,
+        }
+      );
+
+    if (requestsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REQUESTS_ERROR]",
+        {
+          userId,
+          stationIds,
+          code:
+            requestsError.code || null,
+          message:
+            requestsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REQUESTS_LOAD_FAILED",
+      });
+    }
+
+    const rows =
+      Array.isArray(requests)
+        ? requests
+        : [];
+
+    return res.json({
+      ok: true,
+
+      businesses:
+        ownedStations.map(
+          (station) => ({
+            id:
+              station.id,
+            name:
+              station.name ||
+              station.legal_name ||
+              "Бизнес AUTODEAR",
+          })
+        ),
+
+      requests:
+        rows.map(
+          (request) => ({
+            id:
+              request.id,
+
+            businessId:
+              request.business_id,
+
+            stationId:
+              request.station_id ||
+              request.business_id,
+
+            businessName:
+              request.business_name ||
+              "",
+
+            customerId:
+              request.customer_id ||
+              "",
+
+            customerName:
+              request.customer_name ||
+              "Клиент AUTODEAR",
+
+            car:
+              request.car ||
+              "",
+
+            vin:
+              request.vin ||
+              "",
+
+            service:
+              request.service ||
+              "",
+
+            date:
+              request.date ||
+              "",
+
+            time:
+              request.time ||
+              "",
+
+            comment:
+              request.comment ||
+              "",
+
+            status:
+              request.status ||
+              "new",
+
+            createdAt:
+              request.created_at ||
+              null,
+          })
+        ),
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REQUESTS_FATAL]",
+      {
+        userId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_REQUESTS_LOAD_FAILED",
+    });
+  }
+});
+
+
+
+/*
+ * WEB BUSINESS — CONFIRM CLIENT REQUEST
+ * 20260825
+ *
+ * business_requests:
+ *   new -> confirmed
+ *
+ * Confirmation also creates exactly one
+ * business_bookings row for the request.
+ *
+ * SECURITY:
+ * - browser never chooses business_id;
+ * - authenticated user must own the station;
+ * - request must belong to that station.
+ *
+ * IDEMPOTENCY:
+ * request_id links the request to its calendar
+ * booking. Repeated confirmation reuses the
+ * existing booking instead of creating a duplicate.
+ */
+app.patch("/api/business/requests/:id/confirm", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const userId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  const requestId =
+    String(
+      req.params?.id || ""
+    ).trim();
+
+  if (!userId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!requestId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "REQUEST_ID_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * Resolve stations from authenticated owner.
+     */
+    const {
+      data: stations,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select("id")
+      .eq(
+        "owner_id",
+        userId
+      );
+
+    if (stationsError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_STATIONS_ERROR]",
+        {
+          userId,
+          code:
+            stationsError.code || null,
+          message:
+            stationsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_LOOKUP_FAILED",
+      });
+    }
+
+    const stationIds =
+      (
+        Array.isArray(stations)
+          ? stations
+          : []
+      )
+        .map((station) =>
+          String(
+            station?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    if (!stationIds.length) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    /*
+     * The request itself determines the station.
+     */
+    const {
+      data: request,
+      error: requestError,
+    } = await supabase
+      .from("business_requests")
+      .select("*")
+      .eq(
+        "id",
+        requestId
+      )
+      .in(
+        "business_id",
+        stationIds
+      )
+      .maybeSingle();
+
+    if (requestError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_LOOKUP_ERROR]",
+        {
+          userId,
+          requestId,
+          code:
+            requestError.code || null,
+          message:
+            requestError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REQUEST_LOOKUP_FAILED",
+      });
+    }
+
+    if (!request) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BUSINESS_REQUEST_NOT_FOUND",
+      });
+    }
+
+    const businessId =
+      String(
+        request.station_id ||
+        request.business_id ||
+        ""
+      ).trim();
+
+    if (
+      !businessId ||
+      !stationIds.includes(
+        businessId
+      )
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCESS_REQUIRED",
+      });
+    }
+
+    /*
+     * First check whether this request already has
+     * a calendar booking.
+     */
+    const {
+      data: existingBooking,
+      error: existingBookingError,
+    } = await supabase
+      .from("business_bookings")
+      .select("*")
+      .eq(
+        "request_id",
+        requestId
+      )
+      .in(
+        "business_id",
+        stationIds
+      )
+      .maybeSingle();
+
+    if (existingBookingError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_BOOKING_LOOKUP_ERROR]",
+        {
+          userId,
+          requestId,
+          code:
+            existingBookingError.code ||
+            null,
+          message:
+            existingBookingError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BOOKING_LOOKUP_FAILED",
+      });
+    }
+
+    let booking =
+      existingBooking || null;
+
+    /*
+     * Create calendar booking only once.
+     */
+    if (!booking) {
+      const now =
+        new Date().toISOString();
+
+      const bookingId =
+        `booking_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 10)}`;
+
+      const bookingDate =
+        String(
+          request.date || ""
+        )
+          .trim()
+          .slice(0, 10);
+
+      const startTime =
+        String(
+          request.time || ""
+        )
+          .trim()
+          .slice(0, 5);
+
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(
+          bookingDate
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_DATE_INVALID",
+        });
+      }
+
+      if (
+        !/^\d{2}:\d{2}$/.test(
+          startTime
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BOOKING_TIME_INVALID",
+        });
+      }
+
+      const {
+        data: createdBooking,
+        error: createBookingError,
+      } = await supabase
+        .from("business_bookings")
+        .insert({
+          id:
+            bookingId,
+
+          business_id:
+            businessId,
+
+          request_id:
+            requestId,
+
+          customer_id:
+            request.customer_id ||
+            null,
+
+          customer_name:
+            request.customer_name ||
+            "Клиент AUTODEAR",
+
+          customer_phone:
+            "",
+
+          car:
+            request.car ||
+            "",
+
+          plate:
+            "",
+
+          vin:
+            request.vin ||
+            "",
+
+          service:
+            request.service ||
+            "",
+
+          comment:
+            request.comment ||
+            "",
+
+          booking_date:
+            bookingDate,
+
+          start_time:
+            startTime,
+
+          duration_minutes:
+            60,
+
+          post_number:
+            1,
+
+          source:
+            "autodear",
+
+          status:
+            "confirmed",
+
+          customer_confirmation_status:
+            "confirmed",
+
+          customer_confirmed_at:
+            now,
+
+          created_by:
+            request.customer_id ||
+            null,
+
+          updated_at:
+            now,
+        })
+        .select("*")
+        .single();
+
+      if (createBookingError) {
+        const isConflict =
+          createBookingError.code ===
+            "23P01" ||
+          String(
+            createBookingError.message ||
+            ""
+          ).includes(
+            "business_bookings_no_overlap"
+          );
+
+        if (isConflict) {
+          return res.status(409).json({
+            ok: false,
+            error:
+              "BOOKING_CONFLICT",
+          });
+        }
+
+        /*
+         * If request_id is protected by UNIQUE,
+         * another confirmation may have created
+         * the booking between lookup and insert.
+         */
+        if (
+          createBookingError.code ===
+          "23505"
+        ) {
+          const {
+            data: duplicateBooking,
+            error: duplicateLookupError,
+          } = await supabase
+            .from("business_bookings")
+            .select("*")
+            .eq(
+              "request_id",
+              requestId
+            )
+            .in(
+              "business_id",
+              stationIds
+            )
+            .maybeSingle();
+
+          if (
+            !duplicateLookupError &&
+            duplicateBooking
+          ) {
+            booking =
+              duplicateBooking;
+          } else {
+            console.error(
+              "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_DUPLICATE_LOOKUP_ERROR]",
+              {
+                userId,
+                requestId,
+                createCode:
+                  createBookingError.code ||
+                  null,
+                createMessage:
+                  createBookingError.message ||
+                  null,
+              }
+            );
+
+            return res.status(500).json({
+              ok: false,
+              error:
+                "BOOKING_CREATE_FAILED",
+            });
+          }
+        } else {
+          console.error(
+            "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_BOOKING_CREATE_ERROR]",
+            {
+              userId,
+              requestId,
+              businessId,
+              code:
+                createBookingError.code ||
+                null,
+              message:
+                createBookingError.message ||
+                null,
+            }
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              "BOOKING_CREATE_FAILED",
+          });
+        }
+      } else {
+        booking =
+          createdBooking;
+      }
+    }
+
+    /*
+     * Calendar booking exists now.
+     * Only now may the request become confirmed.
+     */
+    const {
+      data: updatedRequest,
+      error: requestUpdateError,
+    } = await supabase
+      .from("business_requests")
+      .update({
+        status:
+          "confirmed",
+        updated_at:
+          new Date().toISOString(),
+      })
+      .eq(
+        "id",
+        requestId
+      )
+      .in(
+        "business_id",
+        stationIds
+      )
+      .select("*")
+      .single();
+
+    if (requestUpdateError) {
+      console.error(
+        "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_UPDATE_ERROR]",
+        {
+          userId,
+          requestId,
+          code:
+            requestUpdateError.code ||
+            null,
+          message:
+            requestUpdateError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_REQUEST_UPDATE_FAILED",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRMED]",
+      {
+        userId,
+        requestId,
+        businessId,
+        bookingId:
+          booking?.id || null,
+      }
+    );
+
+    return res.json({
+      ok: true,
+
+      request: {
+        id:
+          updatedRequest.id,
+        status:
+          updatedRequest.status,
+        businessId:
+          updatedRequest.business_id,
+      },
+
+      booking: {
+        id:
+          booking?.id || null,
+
+        businessId:
+          booking?.business_id ||
+          businessId,
+
+        requestId:
+          booking?.request_id ||
+          requestId,
+
+        customerName:
+          booking?.customer_name ||
+          request.customer_name ||
+          "Клиент AUTODEAR",
+
+        service:
+          booking?.service ||
+          request.service ||
+          "",
+
+        date:
+          booking?.booking_date ||
+          request.date ||
+          "",
+
+        startTime:
+          booking?.start_time ||
+          request.time ||
+          "",
+
+        source:
+          booking?.source ||
+          "autodear",
+
+        status:
+          booking?.status ||
+          "confirmed",
+      },
+    });
+
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WEB_BUSINESS][REQUEST_CONFIRM_FATAL]",
+      {
+        userId,
+        requestId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_REQUEST_CONFIRM_FAILED",
     });
   }
 });
