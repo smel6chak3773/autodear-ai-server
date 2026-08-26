@@ -145,6 +145,202 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "12mb" }));
 
+/*
+ * AUTODEAR Auth registration proxy.
+ *
+ * На реальном iPhone прямой POST к Supabase /auth/v1/signup
+ * может обрываться на транспортном уровне.
+ *
+ * Поэтому мобильное приложение создаёт аккаунт через
+ * api.autodear.ru, а сервер уже выполняет штатный
+ * Supabase Auth signUp.
+ *
+ * ВАЖНО:
+ * здесь используется supabaseAuth (anon key), а не
+ * service-role admin API. Таким образом сохраняются
+ * обычные правила регистрации Supabase.
+ */
+app.post("/api/auth/register", async (req, res) => {
+  const startedAt = Date.now();
+
+  const name =
+    String(req.body?.name || "").trim();
+
+  const email =
+    String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
+
+  const password =
+    String(req.body?.password || "");
+
+  const phone =
+    String(req.body?.phone || "").trim();
+
+  const role =
+    String(req.body?.role || "user").trim();
+
+  console.log(
+    "[AUTODEAR][AUTH_REGISTER][BEGIN]",
+    {
+      email,
+      role,
+      hasName: Boolean(name),
+      hasPhone: Boolean(phone),
+    }
+  );
+
+  if (!supabaseAuth) {
+    return res.status(503).json({
+      ok: false,
+      error: "AUTH_SERVICE_NOT_CONFIGURED",
+      message:
+        "Сервис регистрации временно недоступен.",
+    });
+  }
+
+  if (!email || !password || !name) {
+    return res.status(400).json({
+      ok: false,
+      error: "AUTH_REGISTER_FIELDS_REQUIRED",
+      message:
+        "Заполните имя, email и пароль.",
+    });
+  }
+
+  if (
+    role !== "user" &&
+    role !== "business"
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "AUTH_REGISTER_ROLE_INVALID",
+      message:
+        "Недопустимый тип аккаунта.",
+    });
+  }
+
+  try {
+    const {
+      data,
+      error,
+    } = await supabaseAuth.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          name,
+          phone,
+          role,
+        },
+      },
+    });
+
+    if (error) {
+      console.warn(
+        "[AUTODEAR][AUTH_REGISTER][SUPABASE_ERROR]",
+        {
+          email,
+          status:
+            error.status || null,
+          message:
+            error.message || null,
+          ms:
+            Date.now() - startedAt,
+        }
+      );
+
+      const status =
+        Number(error.status) >= 400 &&
+        Number(error.status) < 500
+          ? Number(error.status)
+          : 400;
+
+      return res.status(status).json({
+        ok: false,
+        error: "AUTH_REGISTER_FAILED",
+        message:
+          error.message ||
+          "Не удалось создать аккаунт.",
+      });
+    }
+
+    const user =
+      data?.user || null;
+
+    const session =
+      data?.session || null;
+
+    if (!user?.id) {
+      console.warn(
+        "[AUTODEAR][AUTH_REGISTER][NO_USER]",
+        {
+          email,
+          ms:
+            Date.now() - startedAt,
+        }
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error: "AUTH_REGISTER_NO_USER",
+        message:
+          "Supabase не вернул созданного пользователя.",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][AUTH_REGISTER][OK]",
+      {
+        email,
+        userId: user.id,
+        hasSession:
+          Boolean(session?.access_token),
+        ms:
+          Date.now() - startedAt,
+      }
+    );
+
+    return res.status(200).json({
+      ok: true,
+      user,
+      session: session
+        ? {
+            access_token:
+              session.access_token,
+            refresh_token:
+              session.refresh_token,
+            expires_in:
+              session.expires_in,
+            expires_at:
+              session.expires_at,
+            token_type:
+              session.token_type,
+          }
+        : null,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][AUTH_REGISTER][EXCEPTION]",
+      {
+        email,
+        message:
+          error?.message ||
+          String(error),
+        ms:
+          Date.now() - startedAt,
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: "AUTH_REGISTER_INTERNAL_ERROR",
+      message:
+        "Не удалось выполнить регистрацию.",
+    });
+  }
+});
+
 async function resolveAuthenticatedUser(req) {
   const authHeader =
     String(
