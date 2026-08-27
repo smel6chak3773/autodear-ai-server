@@ -10377,6 +10377,170 @@ app.get("/api/vehicle-reports/products", async (req, res) => {
   }
 });
 
+/*
+ * Получение сохранённого отчёта проверки автомобиля.
+ *
+ * Отчёт доступен только владельцу:
+ * авторизованный user_id обязан совпадать с
+ * vehicle_check_reports.user_id.
+ */
+app.get("/api/vehicle-reports/:reportId", async (req, res) => {
+  try {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const userId =
+      String(
+        authResult?.user?.id || ""
+      ).trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const reportId =
+      String(
+        req.params?.reportId || ""
+      ).trim();
+
+    if (!reportId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "VEHICLE_REPORT_ID_REQUIRED",
+      });
+    }
+
+    const {
+      data: report,
+      error,
+    } = await supabase
+      .from("vehicle_check_reports")
+      .select("*")
+      .eq("id", reportId)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error(
+        "[AUTODEAR][VEHICLE_REPORT][GET_ERROR]",
+        {
+          userId,
+          reportId,
+          code:
+            error.code || null,
+          message:
+            error.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "VEHICLE_REPORT_GET_ERROR",
+      });
+    }
+
+    if (!report) {
+      /*
+       * Намеренно не различаем:
+       * - отчёта нет;
+       * - отчёт принадлежит другому пользователю.
+       *
+       * Так мы не раскрываем существование
+       * чужих reportId.
+       */
+      return res.status(404).json({
+        ok: false,
+        error:
+          "VEHICLE_REPORT_NOT_FOUND",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][VEHICLE_REPORT][GET_OK]",
+      {
+        userId,
+        reportId,
+        reportType:
+          report.report_type,
+      }
+    );
+
+    return res.json({
+      ok: true,
+
+      reportId:
+        report.id,
+
+      reportType:
+        report.report_type,
+
+      reportVersion:
+        report.report_version,
+
+      vin:
+        report.vin,
+
+      plate:
+        report.plate,
+
+      provider:
+        report.provider,
+
+      status:
+        report.status,
+
+      created_at:
+        report.created_at,
+
+      completed_at:
+        report.completed_at,
+
+      result:
+        report.normalized_json || {},
+
+      raw:
+        report.raw_json || {},
+
+      ai: {
+        riskLevel:
+          report.risk_level || null,
+
+        title:
+          report.risk_title || null,
+
+        summary:
+          report.ai_summary || null,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][VEHICLE_REPORT][GET_UNKNOWN_ERROR]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "VEHICLE_REPORT_GET_UNKNOWN_ERROR",
+    });
+  }
+});
+
 app.get("/download", (req, res) => {
   const googlePlayUrl = String(process.env.AUTODEAR_GOOGLE_PLAY_URL || "").trim();
   const ruStoreUrl = String(process.env.AUTODEAR_RUSTORE_URL || "").trim();
