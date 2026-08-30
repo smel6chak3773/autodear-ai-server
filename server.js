@@ -10804,6 +10804,140 @@ function normalizeGeocodeText(value = "") {
     .slice(0, 300);
 }
 
+app.post("/api/address-suggest", async (req, res) => {
+  try {
+    const apiKey = String(process.env.DADATA_API_KEY || "").trim();
+
+    if (!apiKey) {
+      return res.status(503).json({
+        ok: false,
+        error: "DADATA_API_KEY_NOT_CONFIGURED",
+      });
+    }
+
+    const city = normalizeGeocodeText(req.body?.city);
+    const query = normalizeGeocodeText(req.body?.query);
+    const selected = req.body?.selected === true;
+
+    if (!query) {
+      return res.status(400).json({
+        ok: false,
+        error: "QUERY_REQUIRED",
+      });
+    }
+
+    const payload = {
+      query,
+      count: selected ? 1 : 10,
+      language: "ru",
+    };
+
+    if (!selected && city) {
+      payload.locations = [{ city }];
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    let response;
+
+    try {
+      response = await fetch(
+        "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address",
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            Authorization: `Token ${apiKey}`,
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        }
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      const providerText = await response.text().catch(() => "");
+
+      console.warn("[AUTODEAR][DADATA][HTTP_ERROR]", {
+        status: response.status,
+        body: providerText.slice(0, 300),
+      });
+
+      return res.status(502).json({
+        ok: false,
+        error: `DADATA_PROVIDER_HTTP_${response.status}`,
+      });
+    }
+
+    const data = await response.json();
+    const suggestions = Array.isArray(data?.suggestions)
+      ? data.suggestions
+      : [];
+
+    const items = suggestions.map((item) => {
+      const details = item?.data || {};
+
+      const latitude =
+        details.geo_lat == null ? null : Number(details.geo_lat);
+      const longitude =
+        details.geo_lon == null ? null : Number(details.geo_lon);
+
+      return {
+        value: String(item?.value || ""),
+        unrestrictedValue: String(
+          item?.unrestricted_value || item?.value || ""
+        ),
+        city: String(
+          details.city ||
+            details.settlement ||
+            city ||
+            ""
+        ),
+        street: String(details.street_with_type || ""),
+        house: String(details.house || ""),
+        postalCode: String(details.postal_code || ""),
+        fiasId: String(details.fias_id || ""),
+        fiasLevel:
+          details.fias_level == null
+            ? null
+            : Number(details.fias_level),
+        latitude: Number.isFinite(latitude) ? latitude : null,
+        longitude: Number.isFinite(longitude) ? longitude : null,
+        qcGeo:
+          details.qc_geo == null
+            ? null
+            : Number(details.qc_geo),
+      };
+    });
+
+    return res.json({
+      ok: true,
+      city,
+      query,
+      selected,
+      items,
+    });
+  } catch (error) {
+    const aborted = error?.name === "AbortError";
+
+    console.error("[AUTODEAR][DADATA][ADDRESS_SUGGEST_ERROR]", {
+      message: error?.message || String(error),
+      aborted,
+    });
+
+    return res.status(aborted ? 504 : 500).json({
+      ok: false,
+      error: aborted
+        ? "DADATA_TIMEOUT"
+        : "ADDRESS_SUGGEST_FAILED",
+    });
+  }
+});
+
 app.post("/api/geocode", async (req, res) => {
   try {
     const city = normalizeGeocodeText(req.body?.city);
@@ -17434,6 +17568,1396 @@ app.put(
 );
 
 
+
+/*
+ * AUTODEAR business tomorrow reminder.
+ *
+ * Один вечерний push владельцу станции:
+ * - источник записей: business_bookings;
+ * - неподтверждённые business_requests не входят;
+ * - время отправки: через 1 час после закрытия;
+ * - если сегодня выходной / 24x7 / график неизвестен:
+ *   используем 19:00;
+ * - дата и время считаются в timezone станции;
+ * - если timezone не заполнен, временный fallback:
+ *   Europe/Moscow;
+ * - notifications используется как постоянный журнал,
+ *   чтобы после рестарта сервера не отправить push повторно.
+ */
+
+const AUTODEAR_BUSINESS_REMINDER_TYPE =
+  "business_tomorrow_schedule";
+
+const AUTODEAR_BUSINESS_REMINDER_FALLBACK_TIMEZONE =
+  "Europe/Moscow";
+
+const AUTODEAR_BUSINESS_REMINDER_FALLBACK_MINUTE =
+  19 * 60;
+
+let autodearBusinessReminderSweepRunning =
+  false;
+
+function autodearSafeTimezone(value) {
+  const requested =
+    String(value || "").trim();
+
+  if (!requested) {
+    return AUTODEAR_BUSINESS_REMINDER_FALLBACK_TIMEZONE;
+  }
+
+  try {
+    new Intl.DateTimeFormat(
+      "en-US",
+      {
+        timeZone:
+          requested,
+      }
+    ).format(
+      new Date()
+    );
+
+    return requested;
+  } catch {
+    console.warn(
+      "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][INVALID_TIMEZONE]",
+      {
+        timezone:
+          requested,
+        fallback:
+          AUTODEAR_BUSINESS_REMINDER_FALLBACK_TIMEZONE,
+      }
+    );
+
+    return AUTODEAR_BUSINESS_REMINDER_FALLBACK_TIMEZONE;
+  }
+}
+
+function autodearZonedParts(
+  value,
+  timezone
+) {
+  const date =
+    value instanceof Date
+      ? value
+      : new Date(value);
+
+  const safeTimezone =
+    autodearSafeTimezone(
+      timezone
+    );
+
+  const formatter =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone:
+          safeTimezone,
+        year:
+          "numeric",
+        month:
+          "2-digit",
+        day:
+          "2-digit",
+        hour:
+          "2-digit",
+        minute:
+          "2-digit",
+        hourCycle:
+          "h23",
+      }
+    );
+
+  const parts =
+    Object.fromEntries(
+      formatter
+        .formatToParts(date)
+        .filter(
+          (part) =>
+            part.type !==
+            "literal"
+        )
+        .map(
+          (part) => [
+            part.type,
+            part.value,
+          ]
+        )
+    );
+
+  return {
+    timezone:
+      safeTimezone,
+
+    date:
+      `${parts.year}-${parts.month}-${parts.day}`,
+
+    hour:
+      Number(
+        parts.hour
+      ),
+
+    minute:
+      Number(
+        parts.minute
+      ),
+  };
+}
+
+function autodearAddDaysToDateKey(
+  dateKey,
+  amount
+) {
+  const match =
+    String(
+      dateKey || ""
+    ).match(
+      /^(\d{4})-(\d{2})-(\d{2})$/
+    );
+
+  if (!match) {
+    return "";
+  }
+
+  const value =
+    new Date(
+      Date.UTC(
+        Number(
+          match[1]
+        ),
+        Number(
+          match[2]
+        ) - 1,
+        Number(
+          match[3]
+        )
+      )
+    );
+
+  value.setUTCDate(
+    value.getUTCDate() +
+      Number(
+        amount || 0
+      )
+  );
+
+  const year =
+    value.getUTCFullYear();
+
+  const month =
+    String(
+      value.getUTCMonth() + 1
+    ).padStart(
+      2,
+      "0"
+    );
+
+  const day =
+    String(
+      value.getUTCDate()
+    ).padStart(
+      2,
+      "0"
+    );
+
+  return `${year}-${month}-${day}`;
+}
+
+function autodearWeekdayIdFromDateKey(
+  dateKey
+) {
+  const match =
+    String(
+      dateKey || ""
+    ).match(
+      /^(\d{4})-(\d{2})-(\d{2})$/
+    );
+
+  if (!match) {
+    return "";
+  }
+
+  const value =
+    new Date(
+      Date.UTC(
+        Number(
+          match[1]
+        ),
+        Number(
+          match[2]
+        ) - 1,
+        Number(
+          match[3]
+        ),
+        12
+      )
+    );
+
+  return [
+    "sun",
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri",
+    "sat",
+  ][
+    value.getUTCDay()
+  ];
+}
+
+function autodearParseClockMinutes(
+  value
+) {
+  const match =
+    String(
+      value || ""
+    )
+      .trim()
+      .match(
+        /^(\d{1,2}):(\d{2})/
+      );
+
+  if (!match) {
+    return null;
+  }
+
+  const hour =
+    Number(
+      match[1]
+    );
+
+  const minute =
+    Number(
+      match[2]
+    );
+
+  if (
+    !Number.isInteger(
+      hour
+    ) ||
+    !Number.isInteger(
+      minute
+    ) ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59
+  ) {
+    return null;
+  }
+
+  return (
+    hour * 60 +
+    minute
+  );
+}
+
+function autodearBusinessReminderMinute(
+  station,
+  todayKey
+) {
+  if (
+    station?.works_24_7 ===
+    true
+  ) {
+    return AUTODEAR_BUSINESS_REMINDER_FALLBACK_MINUTE;
+  }
+
+  const schedule =
+    Array.isArray(
+      station?.work_schedule
+    )
+      ? station.work_schedule
+      : [];
+
+  const weekdayId =
+    autodearWeekdayIdFromDateKey(
+      todayKey
+    );
+
+  const todaySchedule =
+    schedule.find(
+      (item) =>
+        String(
+          item?.id || ""
+        )
+          .trim()
+          .toLowerCase() ===
+        weekdayId
+    );
+
+  if (
+    !todaySchedule ||
+    todaySchedule.enabled ===
+      false
+  ) {
+    return AUTODEAR_BUSINESS_REMINDER_FALLBACK_MINUTE;
+  }
+
+  const closeMinutes =
+    autodearParseClockMinutes(
+      todaySchedule.close
+    );
+
+  if (
+    closeMinutes ==
+    null
+  ) {
+    return AUTODEAR_BUSINESS_REMINDER_FALLBACK_MINUTE;
+  }
+
+  const reminderMinutes =
+    closeMinutes + 60;
+
+  if (
+    reminderMinutes >=
+    24 * 60
+  ) {
+    return 23 * 60 + 59;
+  }
+
+  return reminderMinutes;
+}
+
+function autodearBookingTime(value) {
+  const raw =
+    String(
+      value || ""
+    ).trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  const match =
+    raw.match(
+      /(\d{1,2}):(\d{2})/
+    );
+
+  if (!match) {
+    return raw;
+  }
+
+  return `${String(
+    match[1]
+  ).padStart(
+    2,
+    "0"
+  )}:${match[2]}`;
+}
+
+async function sendAutodearExpoPush({
+  tokens,
+  title,
+  body,
+  data,
+}) {
+  const cleanTokens =
+    Array.from(
+      new Set(
+        (
+          Array.isArray(
+            tokens
+          )
+            ? tokens
+            : []
+        )
+          .map(
+            (item) =>
+              String(
+                item || ""
+              ).trim()
+          )
+          .filter(
+            Boolean
+          )
+      )
+    );
+
+  if (
+    !cleanTokens.length
+  ) {
+    return {
+      ok:
+        true,
+      sent:
+        0,
+      reason:
+        "NO_PUSH_TOKENS",
+    };
+  }
+
+  const messages =
+    cleanTokens.map(
+      (to) => ({
+        to,
+        sound:
+          "default",
+        title,
+        body,
+        data:
+          data || {},
+      })
+    );
+
+  const response =
+    await fetch(
+      "https://exp.host/--/api/v2/push/send",
+      {
+        method:
+          "POST",
+
+        headers: {
+          Accept:
+            "application/json",
+
+          "Content-Type":
+            "application/json",
+        },
+
+        body:
+          JSON.stringify(
+            messages
+          ),
+      }
+    );
+
+  const responseText =
+    await response.text();
+
+  if (
+    !response.ok
+  ) {
+    throw new Error(
+      `EXPO_PUSH_FAILED_${response.status}: ${responseText}`
+    );
+  }
+
+  let payload =
+    null;
+
+  try {
+    payload =
+      JSON.parse(
+        responseText
+      );
+  } catch {
+    payload = {
+      raw:
+        responseText,
+    };
+  }
+
+  return {
+    ok:
+      true,
+    sent:
+      cleanTokens.length,
+    payload,
+  };
+}
+
+async function buildBusinessTomorrowReminder(
+  stationId
+) {
+  if (!supabase) {
+    throw new Error(
+      "SUPABASE_NOT_CONFIGURED"
+    );
+  }
+
+  const targetStationId =
+    String(
+      stationId || ""
+    ).trim();
+
+  if (!targetStationId) {
+    throw new Error(
+      "STATION_ID_REQUIRED"
+    );
+  }
+
+  const {
+    data:
+      station,
+    error:
+      stationError,
+  } =
+    await supabase
+      .from(
+        "stations"
+      )
+      .select(
+        [
+          "id",
+          "owner_id",
+          "name",
+          "legal_name",
+          "timezone",
+          "work_schedule",
+          "works_24_7",
+        ].join(",")
+      )
+      .eq(
+        "id",
+        targetStationId
+      )
+      .maybeSingle();
+
+  if (
+    stationError
+  ) {
+    throw stationError;
+  }
+
+  if (!station) {
+    throw new Error(
+      "STATION_NOT_FOUND"
+    );
+  }
+
+  const timezone =
+    autodearSafeTimezone(
+      station.timezone
+    );
+
+  const localNow =
+    autodearZonedParts(
+      new Date(),
+      timezone
+    );
+
+  const tomorrow =
+    autodearAddDaysToDateKey(
+      localNow.date,
+      1
+    );
+
+  const {
+    data:
+      bookingRows,
+    error:
+      bookingsError,
+  } =
+    await supabase
+      .from(
+        "business_bookings"
+      )
+      .select("*")
+      .eq(
+        "business_id",
+        targetStationId
+      )
+      .eq(
+        "booking_date",
+        tomorrow
+      );
+
+  if (
+    bookingsError
+  ) {
+    throw bookingsError;
+  }
+
+  const bookings =
+    (
+      Array.isArray(
+        bookingRows
+      )
+        ? bookingRows
+        : []
+    )
+      .filter(
+        (item) => {
+          const status =
+            String(
+              item?.status ||
+                ""
+            )
+              .trim()
+              .toLowerCase();
+
+          return (
+            status !==
+              "cancelled" &&
+            status !==
+              "rejected"
+          );
+        }
+      )
+      .sort(
+        (a, b) =>
+          autodearBookingTime(
+            a?.start_time
+          ).localeCompare(
+            autodearBookingTime(
+              b?.start_time
+            )
+          )
+      );
+
+  const baseResult = {
+    ok:
+      true,
+
+    stationId:
+      targetStationId,
+
+    ownerId:
+      String(
+        station.owner_id ||
+          ""
+      ).trim(),
+
+    stationName:
+      station.name ||
+      station.legal_name ||
+      "Бизнес AUTODEAR",
+
+    timezone,
+
+    localDate:
+      localNow.date,
+
+    localTime:
+      `${String(
+        localNow.hour
+      ).padStart(
+        2,
+        "0"
+      )}:${String(
+        localNow.minute
+      ).padStart(
+        2,
+        "0"
+      )}`,
+
+    workSchedule:
+      station.work_schedule ||
+      null,
+
+    works24x7:
+      station.works_24_7 ===
+      true,
+
+    tomorrow,
+  };
+
+  if (
+    !bookings.length
+  ) {
+    return {
+      ...baseResult,
+
+      hasBookings:
+        false,
+
+      count:
+        0,
+
+      bookings:
+        [],
+    };
+  }
+
+  const first =
+    bookings[0];
+
+  const firstTime =
+    autodearBookingTime(
+      first?.start_time
+    );
+
+  const customerName =
+    String(
+      first?.customer_name ||
+        ""
+    ).trim();
+
+  const car =
+    String(
+      first?.car || ""
+    ).trim();
+
+  const service =
+    String(
+      first?.service || ""
+    ).trim();
+
+  let title =
+    "";
+
+  let body =
+    "";
+
+  const sourceLabel =
+    String(
+      first?.source || ""
+    )
+      .trim()
+      .toLowerCase() ===
+    "manual"
+      ? "своя запись"
+      : "запись клиента";
+
+  if (
+    bookings.length ===
+    1
+  ) {
+    const personAndCar =
+      [
+        customerName,
+        car,
+      ]
+        .filter(
+          Boolean
+        )
+        .join(
+          ", "
+        );
+
+    title =
+      firstTime
+        ? `Завтра в ${firstTime}${
+            personAndCar
+              ? ` — ${personAndCar}`
+              : ""
+          }`
+        : `Завтра запись${
+            personAndCar
+              ? ` — ${personAndCar}`
+              : ""
+          }`;
+
+    const details =
+      [
+        service,
+        sourceLabel,
+      ].filter(
+        Boolean
+      );
+
+    body =
+      details.length
+        ? details.join(
+            " · "
+          )
+        : "Откройте расписание, чтобы посмотреть детали.";
+  } else {
+    const count =
+      bookings.length;
+
+    const mod10 =
+      count % 10;
+
+    const mod100 =
+      count % 100;
+
+    const bookingWord =
+      mod10 === 1 &&
+      mod100 !== 11
+        ? "запись"
+        : mod10 >= 2 &&
+          mod10 <= 4 &&
+          !(
+            mod100 >= 12 &&
+            mod100 <= 14
+          )
+        ? "записи"
+        : "записей";
+
+    title =
+      `Завтра ${count} ${bookingWord}`;
+
+    const personAndCar =
+      [
+        customerName,
+        car,
+      ]
+        .filter(
+          Boolean
+        )
+        .join(
+          ", "
+        );
+
+    body =
+      firstTime
+        ? `Первая в ${firstTime}${
+            personAndCar
+              ? ` — ${personAndCar}`
+              : ""
+          }`
+        : `Первая запись${
+            personAndCar
+              ? ` — ${personAndCar}`
+              : ""
+          }`;
+  }
+
+  return {
+    ...baseResult,
+
+    hasBookings:
+      true,
+
+    count:
+      bookings.length,
+
+    title,
+    body,
+
+    firstBookingId:
+      first?.id ||
+      null,
+
+    bookings,
+  };
+}
+
+async function autodearBusinessReminderAlreadySent({
+  stationId,
+  timezone,
+  localDate,
+}) {
+  const {
+    data:
+      rows,
+    error,
+  } =
+    await supabase
+      .from(
+        "notifications"
+      )
+      .select(
+        "id,created_at"
+      )
+      .eq(
+        "recipient_role",
+        "business"
+      )
+      .eq(
+        "recipient_id",
+        stationId
+      )
+      .eq(
+        "type",
+        AUTODEAR_BUSINESS_REMINDER_TYPE
+      )
+      .order(
+        "created_at",
+        {
+          ascending:
+            false,
+        }
+      )
+      .limit(
+        10
+      );
+
+  if (error) {
+    throw error;
+  }
+
+  return (
+    Array.isArray(
+      rows
+    )
+      ? rows
+      : []
+  ).some(
+    (row) => {
+      if (
+        !row?.created_at
+      ) {
+        return false;
+      }
+
+      return (
+        autodearZonedParts(
+          row.created_at,
+          timezone
+        ).date ===
+        localDate
+      );
+    }
+  );
+}
+
+async function autodearProcessBusinessTomorrowReminder(
+  stationId
+) {
+  const reminder =
+    await buildBusinessTomorrowReminder(
+      stationId
+    );
+
+  if (
+    !reminder.hasBookings
+  ) {
+    return {
+      ok:
+        true,
+      skipped:
+        true,
+      reason:
+        "NO_TOMORROW_BOOKINGS",
+      stationId:
+        reminder.stationId,
+    };
+  }
+
+  if (
+    !reminder.ownerId
+  ) {
+    return {
+      ok:
+        true,
+      skipped:
+        true,
+      reason:
+        "NO_OWNER",
+      stationId:
+        reminder.stationId,
+    };
+  }
+
+  const now =
+    autodearZonedParts(
+      new Date(),
+      reminder.timezone
+    );
+
+  const currentMinute =
+    now.hour * 60 +
+    now.minute;
+
+  const {
+    data:
+      stationRow,
+    error:
+      stationError,
+  } =
+    await supabase
+      .from(
+        "stations"
+      )
+      .select(
+        "id,work_schedule,works_24_7"
+      )
+      .eq(
+        "id",
+        reminder.stationId
+      )
+      .maybeSingle();
+
+  if (
+    stationError
+  ) {
+    throw stationError;
+  }
+
+  const dueMinute =
+    autodearBusinessReminderMinute(
+      stationRow || {},
+      now.date
+    );
+
+  if (
+    currentMinute <
+    dueMinute
+  ) {
+    return {
+      ok:
+        true,
+      skipped:
+        true,
+      reason:
+        "NOT_DUE_YET",
+      stationId:
+        reminder.stationId,
+      localTime:
+        reminder.localTime,
+      dueMinute,
+    };
+  }
+
+  const alreadySent =
+    await autodearBusinessReminderAlreadySent({
+      stationId:
+        reminder.stationId,
+
+      timezone:
+        reminder.timezone,
+
+      localDate:
+        now.date,
+    });
+
+  if (
+    alreadySent
+  ) {
+    return {
+      ok:
+        true,
+      skipped:
+        true,
+      reason:
+        "ALREADY_SENT",
+      stationId:
+        reminder.stationId,
+    };
+  }
+
+  const {
+    data:
+      tokenRows,
+    error:
+      tokensError,
+  } =
+    await supabase
+      .from(
+        "device_push_tokens"
+      )
+      .select(
+        "expo_push_token"
+      )
+      .eq(
+        "user_id",
+        reminder.ownerId
+      )
+      .eq(
+        "is_active",
+        true
+      );
+
+  if (
+    tokensError
+  ) {
+    throw tokensError;
+  }
+
+  const tokens =
+    (
+      Array.isArray(
+        tokenRows
+      )
+        ? tokenRows
+        : []
+    )
+      .map(
+        (row) =>
+          String(
+            row?.expo_push_token ||
+              ""
+          ).trim()
+      )
+      .filter(
+        Boolean
+      );
+
+  const pushResult =
+    await sendAutodearExpoPush({
+      tokens,
+
+      title:
+        reminder.title,
+
+      body:
+        reminder.body,
+
+      data: {
+        type:
+          AUTODEAR_BUSINESS_REMINDER_TYPE,
+
+        stationId:
+          reminder.stationId,
+
+        businessId:
+          reminder.stationId,
+
+        date:
+          reminder.tomorrow,
+
+        bookingId:
+          reminder.firstBookingId ||
+          null,
+      },
+    });
+
+  if (
+    !pushResult.sent
+  ) {
+    console.log(
+      "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][NO_PUSH_TOKENS]",
+      {
+        stationId:
+          reminder.stationId,
+
+        ownerId:
+          reminder.ownerId,
+      }
+    );
+
+    return {
+      ok:
+        true,
+
+      skipped:
+        true,
+
+      reason:
+        "NO_PUSH_TOKENS",
+
+      stationId:
+        reminder.stationId,
+    };
+  }
+
+  const {
+    error:
+      notificationError,
+  } =
+    await supabase
+      .from(
+        "notifications"
+      )
+      .insert({
+        recipient_role:
+          "business",
+
+        recipient_id:
+          reminder.stationId,
+
+        title:
+          reminder.title,
+
+        body:
+          reminder.body,
+
+        type:
+          AUTODEAR_BUSINESS_REMINDER_TYPE,
+
+        is_read:
+          false,
+
+        created_at:
+          new Date().toISOString(),
+      });
+
+  if (
+    notificationError
+  ) {
+    throw notificationError;
+  }
+
+  console.log(
+    "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][SENT]",
+    {
+      stationId:
+        reminder.stationId,
+
+      ownerId:
+        reminder.ownerId,
+
+      timezone:
+        reminder.timezone,
+
+      localDate:
+        now.date,
+
+      tomorrow:
+        reminder.tomorrow,
+
+      count:
+        reminder.count,
+
+      pushSent:
+        pushResult.sent,
+    }
+  );
+
+  return {
+    ok:
+      true,
+
+    sent:
+      true,
+
+    stationId:
+      reminder.stationId,
+
+    push:
+      pushResult,
+  };
+}
+
+async function runAutodearBusinessTomorrowReminderSweep() {
+  if (
+    autodearBusinessReminderSweepRunning ||
+    !supabase
+  ) {
+    return;
+  }
+
+  autodearBusinessReminderSweepRunning =
+    true;
+
+  try {
+    const {
+      data:
+        stations,
+      error:
+        stationsError,
+    } =
+      await supabase
+        .from(
+          "stations"
+        )
+        .select(
+          "id"
+        );
+
+    if (
+      stationsError
+    ) {
+      throw stationsError;
+    }
+
+    for (
+      const station of
+      Array.isArray(
+        stations
+      )
+        ? stations
+        : []
+    ) {
+      const stationId =
+        String(
+          station?.id || ""
+        ).trim();
+
+      if (
+        !stationId
+      ) {
+        continue;
+      }
+
+      try {
+        await autodearProcessBusinessTomorrowReminder(
+          stationId
+        );
+      } catch (error) {
+        console.error(
+          "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][STATION_ERROR]",
+          {
+            stationId,
+            message:
+              error?.message ||
+              String(
+                error
+              ),
+          }
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][SWEEP_ERROR]",
+      error
+    );
+  } finally {
+    autodearBusinessReminderSweepRunning =
+      false;
+  }
+}
+
+function startBusinessTomorrowReminderScheduler() {
+  const run =
+    () => {
+      runAutodearBusinessTomorrowReminderSweep()
+        .catch(
+          (error) => {
+            console.error(
+              "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][UNHANDLED]",
+              error
+            );
+          }
+        );
+    };
+
+  setTimeout(
+    run,
+    5000
+  );
+
+  const timer =
+    setInterval(
+      run,
+      60 * 1000
+    );
+
+  if (
+    typeof timer.unref ===
+    "function"
+  ) {
+    timer.unref();
+  }
+
+  console.log(
+    "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][SCHEDULER_STARTED]"
+  );
+}
+
+/*
+ * Диагностический endpoint.
+ * Ничего не отправляет.
+ */
+app.get(
+  "/api/developer/business-tomorrow-reminder-preview",
+  async (req, res) => {
+    try {
+      const stationId =
+        String(
+          req.query?.stationId ||
+            ""
+        ).trim();
+
+      const result =
+        await buildBusinessTomorrowReminder(
+          stationId
+        );
+
+      return res.json({
+        ok:
+          true,
+
+        reminder:
+          result,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_TOMORROW_REMINDER][PREVIEW_ERROR]",
+        error
+      );
+
+      return res
+        .status(
+          500
+        )
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "BUSINESS_TOMORROW_REMINDER_PREVIEW_FAILED",
+        });
+    }
+  }
+);
+
+
 app.post("/api/push/register-token", async (req, res) => {
   try {
     if (!supabase) {
@@ -17560,4 +19084,6 @@ app.post("/api/assistant/message", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`AUTODEAR AI Server started on port ${PORT}`);
+
+  startBusinessTomorrowReminderScheduler();
 });
