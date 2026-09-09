@@ -301,24 +301,19 @@ app.post("/api/auth/register", async (req, res) => {
       }
     );
 
-    return res.status(200).json({
-      ok: true,
-      user,
-      session: session
-        ? {
-            access_token:
-              session.access_token,
-            refresh_token:
-              session.refresh_token,
-            expires_in:
-              session.expires_in,
-            expires_at:
-              session.expires_at,
-            token_type:
-              session.token_type,
-          }
-        : null,
-    });
+    /*
+     * Регистрационный endpoint подтверждает только
+     * успешное создание аккаунта.
+     *
+     * Не отправляем обратно через Cloudflare/React Native
+     * большой Supabase user + session payload:
+     * на реальном iPhone тело успешного HTTP 200 иногда
+     * обрывалось после получения заголовков.
+     *
+     * После 204 мобильное приложение выполняет обычный
+     * signInWithPassword напрямую через Supabase.
+     */
+    return res.status(204).end();
   } catch (error) {
     console.error(
       "[AUTODEAR][AUTH_REGISTER][EXCEPTION]",
@@ -10788,6 +10783,330 @@ function cleanJsonText(value = "") {
     .replace(/\s*```$/i, "")
     .trim();
 }
+
+
+function normalizeListingModerationDecision(value = "") {
+  const decision = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (
+    decision === "approved_auto" ||
+    decision === "action_required" ||
+    decision === "manual_review" ||
+    decision === "blocked_auto"
+  ) {
+    return decision;
+  }
+
+  return "manual_review";
+}
+
+function normalizeListingModerationRiskScore(value) {
+  const score = Number(value);
+
+  if (!Number.isFinite(score)) {
+    return 50;
+  }
+
+  return Math.max(
+    0,
+    Math.min(100, Math.round(score))
+  );
+}
+
+function normalizeListingModerationReasons(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) =>
+      String(item || "")
+        .replace(/\s+/g, " ")
+        .trim()
+    )
+    .filter(Boolean)
+    .slice(0, 10);
+}
+
+/*
+ * Серверная AI-модерация объявлений AUTODEAR.
+ *
+ * На первом этапе endpoint только анализирует объявление и
+ * возвращает решение. Запись результата в Supabase подключим
+ * после проверки реального ответа модели.
+ */
+app.post(
+  "/api/listings/:listingId/moderate",
+  async (req, res) => {
+    const startedAt = Date.now();
+
+    const listingId = String(
+      req.params?.listingId || ""
+    ).trim();
+
+    const log = (stage, extra = {}) => {
+      console.log(
+        `[AUTODEAR][LISTING_MODERATION][${stage}]`,
+        {
+          listingId,
+          ms: Date.now() - startedAt,
+          ...extra,
+        }
+      );
+    };
+
+    try {
+      if (!listingId) {
+        return res.status(400).json({
+          ok: false,
+          error: "LISTING_ID_REQUIRED",
+        });
+      }
+
+      if (!supabase) {
+        return res.status(503).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      if (!openai) {
+        return res.status(503).json({
+          ok: false,
+          error: "OPENAI_API_KEY_NOT_CONFIGURED",
+        });
+      }
+
+      log("START");
+
+      const {
+        data: listing,
+        error: listingError,
+      } = await supabase
+        .from("listings")
+        .select("*")
+        .eq("id", listingId)
+        .maybeSingle();
+
+      if (listingError) {
+        console.error(
+          "[AUTODEAR][LISTING_MODERATION][LOAD_ERROR]",
+          listingError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error: "LISTING_LOAD_FAILED",
+        });
+      }
+
+      if (!listing) {
+        return res.status(404).json({
+          ok: false,
+          error: "LISTING_NOT_FOUND",
+        });
+      }
+
+      const payload =
+        listing.payload &&
+        typeof listing.payload === "object"
+          ? listing.payload
+          : {};
+
+      const moderationInput = {
+        id: listing.id,
+        title:
+          listing.title ||
+          payload.title ||
+          "",
+        description:
+          listing.description ||
+          payload.description ||
+          "",
+        price:
+          listing.price ??
+          payload.price ??
+          "",
+        categoryId:
+          listing.category_id ||
+          payload.categoryId ||
+          "",
+        categoryTitle:
+          listing.category_title ||
+          payload.categoryTitle ||
+          "",
+        type:
+          listing.type ||
+          payload.type ||
+          "",
+        condition:
+          listing.condition ||
+          payload.condition ||
+          "",
+        brand:
+          listing.brand ||
+          payload.brand ||
+          "",
+        model:
+          listing.model ||
+          payload.model ||
+          "",
+        year:
+          listing.year ||
+          payload.year ||
+          "",
+        city:
+          listing.city ||
+          payload.city ||
+          "",
+        extraFields:
+          payload.extraFields &&
+          typeof payload.extraFields === "object"
+            ? payload.extraFields
+            : {},
+        photos: Array.isArray(
+          listing.photos
+        )
+          ? listing.photos
+          : Array.isArray(payload.photos)
+          ? payload.photos
+          : [],
+      };
+
+      log("LISTING_LOADED", {
+        categoryId:
+          moderationInput.categoryId,
+        photos:
+          moderationInput.photos.length,
+      });
+
+      const response =
+        await openai.chat.completions.create({
+          model:
+            process.env
+              .OPENAI_LISTING_MODERATION_MODEL ||
+            "gpt-4.1-mini",
+          temperature: 0,
+          response_format: {
+            type: "json_object",
+          },
+          messages: [
+            {
+              role: "system",
+              content: [
+                "Ты серверный модератор автомобильной площадки AUTODEAR.",
+                "Проверь объявление на безопасность, мошенничество, запрещённый или явно неподходящий контент, контакты и ссылки в описании, попытки увести пользователя на сторонние площадки, подозрительные условия оплаты, несоответствие категории и очевидно недостоверные данные.",
+                "Не отклоняй нормальное автомобильное объявление только из-за обычных автомобильных терминов.",
+                "Не придумывай отсутствующие нарушения.",
+                "",
+                "Верни только JSON:",
+                '{',
+                '  "decision": "approved_auto | action_required | manual_review | blocked_auto",',
+                '  "riskScore": 0,',
+                '  "reasons": ["краткая причина на русском"]',
+                '}',
+                "",
+                "approved_auto — явных нарушений нет.",
+                "action_required — пользователь может исправить объявление.",
+                "manual_review — есть существенная неоднозначность, требующая человека.",
+                "blocked_auto — явное серьёзное нарушение, опасный или запрещённый контент.",
+              ].join("\n"),
+            },
+            {
+              role: "user",
+              content:
+                JSON.stringify(
+                  moderationInput,
+                  null,
+                  2
+                ),
+            },
+          ],
+        });
+
+      const rawText =
+        response.choices?.[0]?.message
+          ?.content || "";
+
+      let parsed;
+
+      try {
+        parsed = JSON.parse(
+          cleanJsonText(rawText)
+        );
+      } catch (parseError) {
+        console.error(
+          "[AUTODEAR][LISTING_MODERATION][JSON_ERROR]",
+          {
+            listingId,
+            rawText: String(rawText).slice(
+              0,
+              1000
+            ),
+            error:
+              parseError instanceof Error
+                ? parseError.message
+                : String(parseError),
+          }
+        );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "MODERATION_RESPONSE_INVALID",
+        });
+      }
+
+      const decision =
+        normalizeListingModerationDecision(
+          parsed?.decision
+        );
+
+      const riskScore =
+        normalizeListingModerationRiskScore(
+          parsed?.riskScore
+        );
+
+      const reasons =
+        normalizeListingModerationReasons(
+          parsed?.reasons
+        );
+
+      log("DONE", {
+        decision,
+        riskScore,
+        reasonsCount: reasons.length,
+      });
+
+      return res.json({
+        ok: true,
+        listingId,
+        decision,
+        riskScore,
+        reasons,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][LISTING_MODERATION][ERROR]",
+        {
+          listingId,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "LISTING_MODERATION_FAILED",
+      });
+    }
+  }
+);
 
 function normalizeVehiclePlate(value = "") {
   return String(value || "")
