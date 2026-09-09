@@ -180,6 +180,9 @@ app.post("/api/auth/register", async (req, res) => {
   const role =
     String(req.body?.role || "user").trim();
 
+  const city =
+    String(req.body?.city || "").trim();
+
   console.log(
     "[AUTODEAR][AUTH_REGISTER][BEGIN]",
     {
@@ -289,6 +292,74 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
+    /*
+     * Профиль создаём на backend после успешного
+     * Supabase Auth signUp.
+     *
+     * Это важно для мобильных клиентов:
+     * успешная регистрация больше не зависит от
+     * отдельного клиентского profiles.upsert.
+     */
+    if (!supabase) {
+      console.error(
+        "[AUTODEAR][AUTH_REGISTER][PROFILE_CLIENT_MISSING]",
+        {
+          email,
+          userId: user.id,
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error: "AUTH_PROFILE_SERVICE_NOT_CONFIGURED",
+        message:
+          "Аккаунт создан, но не удалось создать профиль.",
+      });
+    }
+
+    const {
+      error: profileError,
+    } = await supabase
+      .from("profiles")
+      .upsert(
+        {
+          id: user.id,
+          auth_user_id: user.id,
+          name,
+          email,
+          phone,
+          role,
+          city,
+          updated_at: new Date().toISOString(),
+        },
+        {
+          onConflict: "id",
+        }
+      );
+
+    if (profileError) {
+      console.error(
+        "[AUTODEAR][AUTH_REGISTER][PROFILE_ERROR]",
+        {
+          email,
+          userId: user.id,
+          code:
+            profileError.code || null,
+          message:
+            profileError.message || null,
+          ms:
+            Date.now() - startedAt,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "AUTH_REGISTER_PROFILE_FAILED",
+        message:
+          "Аккаунт создан, но не удалось создать профиль.",
+      });
+    }
+
     console.log(
       "[AUTODEAR][AUTH_REGISTER][OK]",
       {
@@ -296,6 +367,7 @@ app.post("/api/auth/register", async (req, res) => {
         userId: user.id,
         hasSession:
           Boolean(session?.access_token),
+        profileCreated: true,
         ms:
           Date.now() - startedAt,
       }
