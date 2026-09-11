@@ -9349,7 +9349,7 @@ app.get("/api/account/workspaces", async (req, res) => {
       if (error) {
         console.error(
           "[AUTODEAR][ACCOUNT_WORKSPACES][GROUP_LINKS_ERROR]",
-          {
+          JSON.stringify({
             authUserId,
             code:
               error.code ||
@@ -9357,7 +9357,13 @@ app.get("/api/account/workspaces", async (req, res) => {
             message:
               error.message ||
               null,
-          }
+            details:
+              error.details ||
+              null,
+            hint:
+              error.hint ||
+              null,
+          })
         );
 
         return res.status(500).json({
@@ -15528,7 +15534,18 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
       });
     }
 
+    const staffRole =
+      getAdsStaffRole(user);
+
+    const advertiserActivated =
+      Boolean(staffRole) ||
+      await getAdsAdvertiserActivation(
+        ownerId
+      );
+
     const result = {
+      advertiserActivated,
+
       wallet: {
         ownerId,
 
@@ -15726,6 +15743,111 @@ function getAdsStaffRole(user) {
     : "";
 }
 
+
+async function getAdsAdvertiserActivation(
+  ownerId
+) {
+  const normalizedOwnerId =
+    String(ownerId || "").trim();
+
+  if (!normalizedOwnerId) {
+    return false;
+  }
+
+  if (!supabase) {
+    throw new Error(
+      "SUPABASE_NOT_CONFIGURED"
+    );
+  }
+
+  const {
+    data,
+    error,
+  } = await supabase
+    .from("ads_wallet_transactions")
+    .select("id")
+    .eq(
+      "owner_id",
+      normalizedOwnerId
+    )
+    .eq(
+      "type",
+      "payment"
+    )
+    .eq(
+      "status",
+      "confirmed"
+    )
+    .gte(
+      "amount_kopecks",
+      50000
+    )
+    .limit(1);
+
+  if (error) {
+    console.error(
+      "[AUTODEAR][ADS][ACTIVATION_CHECK_ERROR]",
+      {
+        ownerId:
+          normalizedOwnerId,
+        code:
+          error.code,
+        message:
+          error.message,
+      }
+    );
+
+    throw new Error(
+      "ADS_ACTIVATION_CHECK_ERROR"
+    );
+  }
+
+  return (
+    Array.isArray(data) &&
+    data.length > 0
+  );
+}
+
+
+async function requireAdsActivatedUser(
+  req
+) {
+  const user =
+    await requireAdsAuthUser(req);
+
+  const staffRole =
+    getAdsStaffRole(user);
+
+  if (staffRole) {
+    return {
+      user,
+      activated: true,
+      staffRole,
+    };
+  }
+
+  const activated =
+    await getAdsAdvertiserActivation(
+      user.id
+    );
+
+  if (!activated) {
+    const error =
+      new Error(
+        "ADS_ADVERTISER_NOT_ACTIVATED"
+      );
+
+    error.statusCode = 403;
+
+    throw error;
+  }
+
+  return {
+    user,
+    activated: true,
+    staffRole: "",
+  };
+}
 
 async function requireAdsStaffUser(req) {
   const user =
@@ -16921,8 +17043,12 @@ app.post(
         });
       }
 
-      const user =
-        await requireAdsAuthUser(req);
+        const {
+          user,
+        } =
+          await requireAdsActivatedUser(
+            req
+          );
 
       const ownerId =
         String(user.id);
