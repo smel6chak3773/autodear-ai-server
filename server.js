@@ -56,6 +56,76 @@ const supabase = supabaseUrl && supabaseKey
   ? createClient(supabaseUrl, supabaseKey)
   : null;
 
+
+function isTransientSupabaseReadError(error) {
+  const message =
+    String(
+      error?.message ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    message.includes(
+      "gateway timeout"
+    ) ||
+    message.includes(
+      "bad gateway"
+    ) ||
+    message.includes(
+      "service unavailable"
+    ) ||
+    message.includes(
+      "fetch failed"
+    ) ||
+    message.includes(
+      "econnreset"
+    ) ||
+    message.includes(
+      "etimedout"
+    )
+  );
+}
+
+async function supabaseReadWithRetry(
+  operation,
+  context = "unknown"
+) {
+  const firstResult =
+    await operation();
+
+  if (
+    !firstResult?.error ||
+    !isTransientSupabaseReadError(
+      firstResult.error
+    )
+  ) {
+    return firstResult;
+  }
+
+  console.warn(
+    "[AUTODEAR][SUPABASE_READ_RETRY]",
+    {
+      context,
+      attempt: 2,
+      message:
+        firstResult.error?.message ||
+        null,
+    }
+  );
+
+  await new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        350
+      )
+  );
+
+  return operation();
+}
+
 const supabaseAnonKey =
   process.env.SUPABASE_ANON_KEY ||
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ||
@@ -9213,25 +9283,29 @@ app.get("/api/account/workspaces", async (req, res) => {
     const {
       data: currentProfile,
       error: currentProfileError,
-    } = await supabase
-      .from("profiles")
-      .select(
-        [
-          "id",
-          "auth_user_id",
-          "name",
-          "email",
-          "phone",
-          "role",
-          "city",
-          "avatar_url",
-        ].join(",")
-      )
-      .or(
-        `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
-      )
-      .limit(1)
-      .maybeSingle();
+    } = await supabaseReadWithRetry(
+      () =>
+        supabase
+          .from("profiles")
+          .select(
+            [
+              "id",
+              "auth_user_id",
+              "name",
+              "email",
+              "phone",
+              "role",
+              "city",
+              "avatar_url",
+            ].join(",")
+          )
+          .or(
+            `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+          )
+          .limit(1)
+          .maybeSingle(),
+      "account_workspaces_current_profile"
+    );
 
     if (currentProfileError) {
       console.error(
