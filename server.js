@@ -36,6 +36,7 @@ const businessCardPhotoUpload = multer({
 
 const vehicleCheckCache = new Map();
 const geocodeCache = new Map();
+const routeDistanceCache = new Map();
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({
@@ -11517,6 +11518,189 @@ app.post("/api/geocode", async (req, res) => {
         ? "GEOCODE_TIMEOUT"
         : "GEOCODE_FAILED",
     });
+  }
+});
+
+app.post("/api/route-distance", async (req, res) => {
+  try {
+    const fromLat = Number(req.body?.fromLat);
+    const fromLng = Number(req.body?.fromLng);
+    const toLat = Number(req.body?.toLat);
+    const toLng = Number(req.body?.toLng);
+
+    const coordinatesValid =
+      Number.isFinite(fromLat) &&
+      Number.isFinite(fromLng) &&
+      Number.isFinite(toLat) &&
+      Number.isFinite(toLng) &&
+      fromLat >= -90 &&
+      fromLat <= 90 &&
+      toLat >= -90 &&
+      toLat <= 90 &&
+      fromLng >= -180 &&
+      fromLng <= 180 &&
+      toLng >= -180 &&
+      toLng <= 180;
+
+    if (!coordinatesValid) {
+      return res.status(400).json({
+        ok: false,
+        error: "ROUTE_COORDINATES_INVALID",
+      });
+    }
+
+    /*
+     * Округляем только ключ кэша.
+     * В сам routing provider передаём исходные координаты.
+     */
+    const cacheKey = [
+      fromLat.toFixed(5),
+      fromLng.toFixed(5),
+      toLat.toFixed(5),
+      toLng.toFixed(5),
+    ].join(":");
+
+    if (routeDistanceCache.has(cacheKey)) {
+      return res.json({
+        ...routeDistanceCache.get(cacheKey),
+        cached: true,
+      });
+    }
+
+    const controller = new AbortController();
+
+    const timeout = setTimeout(
+      () => controller.abort(),
+      8000
+    );
+
+    let response;
+
+    try {
+      /*
+       * OSRM принимает координаты в порядке:
+       * longitude,latitude
+       */
+      const coordinates =
+        `${fromLng},${fromLat};${toLng},${toLat}`;
+
+      const url =
+        "https://router.project-osrm.org/route/v1/driving/" +
+        coordinates +
+        "?overview=false&alternatives=false&steps=false";
+
+      response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "AUTODEAR/1.0",
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      console.warn(
+        "[AUTODEAR][ROUTE_DISTANCE][PROVIDER_HTTP_ERROR]",
+        {
+          status: response.status,
+        }
+      );
+
+      return res.status(502).json({
+        ok: false,
+        error:
+          `ROUTE_PROVIDER_HTTP_${response.status}`,
+      });
+    }
+
+    const data =
+      await response.json().catch(() => null);
+
+    const route =
+      Array.isArray(data?.routes)
+        ? data.routes[0] || null
+        : null;
+
+    const distanceMeters =
+      Number(route?.distance);
+
+    const durationSeconds =
+      Number(route?.duration);
+
+    if (
+      !route ||
+      !Number.isFinite(distanceMeters) ||
+      distanceMeters < 0 ||
+      !Number.isFinite(durationSeconds) ||
+      durationSeconds < 0
+    ) {
+      return res.status(502).json({
+        ok: false,
+        error: "ROUTE_PROVIDER_RESULT_INVALID",
+      });
+    }
+
+    const result = {
+      ok: true,
+      distanceKm:
+        Math.round((distanceMeters / 1000) * 10) /
+        10,
+      durationMinutes:
+        Math.max(
+          1,
+          Math.round(durationSeconds / 60)
+        ),
+      provider: "osrm",
+      cached: false,
+    };
+
+    /*
+     * Ограничиваем RAM cache, чтобы процесс Render
+     * не накапливал ключи бесконечно.
+     */
+    if (routeDistanceCache.size >= 2000) {
+      routeDistanceCache.clear();
+    }
+
+    routeDistanceCache.set(
+      cacheKey,
+      result
+    );
+
+    return res.json(result);
+  } catch (error) {
+    const message =
+      String(
+        error?.message ||
+        error ||
+        ""
+      );
+
+    const aborted =
+      error?.name === "AbortError" ||
+      message
+        .toLowerCase()
+        .includes("abort");
+
+    console.warn(
+      "[AUTODEAR][ROUTE_DISTANCE][ERROR]",
+      {
+        aborted,
+        message,
+      }
+    );
+
+    return res
+      .status(aborted ? 504 : 502)
+      .json({
+        ok: false,
+        error: aborted
+          ? "ROUTE_PROVIDER_TIMEOUT"
+          : "ROUTE_PROVIDER_FAILED",
+      });
   }
 });
 
