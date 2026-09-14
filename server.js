@@ -15616,6 +15616,354 @@ app.get("/api/bonuses/me", async (req, res) => {
       });
     }
 
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          "BONUS_SERVICE_NOT_CONFIGURED",
+      });
+    }
+
+    const bonusRows =
+      Array.isArray(data)
+        ? data
+        : [];
+
+    const incomeIds =
+      bonusRows
+        .filter(
+          (row) =>
+            String(
+              row?.type || ""
+            ) === "income"
+        )
+        .map((row) =>
+          String(
+            row?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    const expenseIds =
+      bonusRows
+        .filter(
+          (row) =>
+            String(
+              row?.type || ""
+            ) === "expense"
+        )
+        .map((row) =>
+          String(
+            row?.id || ""
+          ).trim()
+        )
+        .filter(Boolean);
+
+    let allocationRows = [];
+
+    if (
+      incomeIds.length > 0 ||
+      expenseIds.length > 0
+    ) {
+      const {
+        data: allocations,
+        error: allocationsError,
+      } =
+        await supabaseReadWithRetry(
+          () =>
+            supabaseServiceRole
+              .from(
+                "bonus_spend_allocations"
+              )
+              .select(
+                "income_bonus_id,expense_bonus_id,amount"
+              )
+              .eq(
+                "user_id",
+                profileId
+              ),
+          "bonus-ledger-allocations"
+        );
+
+      if (allocationsError) {
+        console.error(
+          "[AUTODEAR][BONUS_LEDGER][ALLOCATIONS_ERROR]",
+          {
+            authUserId,
+            profileId,
+            code:
+              allocationsError.code ||
+              null,
+            message:
+              allocationsError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BONUS_ALLOCATIONS_READ_FAILED",
+        });
+      }
+
+      allocationRows =
+        Array.isArray(allocations)
+          ? allocations
+          : [];
+    }
+
+    const allocatedByIncome =
+      new Map();
+
+    const allocatedExpenseIds =
+      new Set();
+
+    const allocatedByExpense =
+      new Map();
+
+    for (
+      const allocation of
+      allocationRows
+    ) {
+      const incomeBonusId =
+        String(
+          allocation?.income_bonus_id ||
+          ""
+        ).trim();
+
+      const expenseBonusId =
+        String(
+          allocation?.expense_bonus_id ||
+          ""
+        ).trim();
+
+      const amount =
+        Math.max(
+          0,
+          Number(
+            allocation?.amount || 0
+          )
+        );
+
+      if (
+        incomeBonusId &&
+        Number.isFinite(amount)
+      ) {
+        allocatedByIncome.set(
+          incomeBonusId,
+          Number(
+            allocatedByIncome.get(
+              incomeBonusId
+            ) || 0
+          ) + amount
+        );
+      }
+
+      if (expenseBonusId) {
+        allocatedExpenseIds.add(
+          expenseBonusId
+        );
+
+        allocatedByExpense.set(
+          expenseBonusId,
+          Number(
+            allocatedByExpense.get(
+              expenseBonusId
+            ) || 0
+          ) + amount
+        );
+      }
+    }
+
+    const unallocatedExpenseIds =
+      expenseIds.filter(
+        (expenseId) =>
+          !allocatedExpenseIds.has(
+            expenseId
+          )
+      );
+
+    if (
+      unallocatedExpenseIds.length > 0
+    ) {
+      console.error(
+        "[AUTODEAR][BONUS_LEDGER][UNALLOCATED_EXPENSE]",
+        {
+          authUserId,
+          profileId,
+          count:
+            unallocatedExpenseIds.length,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_LEDGER_REQUIRES_RECONCILIATION",
+      });
+    }
+
+    const expenseAllocationMismatches =
+      bonusRows
+        .filter(
+          (row) =>
+            String(
+              row?.type || ""
+            ) === "expense"
+        )
+        .map((row) => {
+          const expenseId =
+            String(
+              row?.id || ""
+            ).trim();
+
+          const expenseAmount =
+            Math.max(
+              0,
+              Number(
+                row?.amount || 0
+              )
+            );
+
+          const allocatedAmount =
+            Math.max(
+              0,
+              Number(
+                allocatedByExpense.get(
+                  expenseId
+                ) || 0
+              )
+            );
+
+          return {
+            expenseId,
+            expenseAmount,
+            allocatedAmount,
+          };
+        })
+        .filter(
+          (item) =>
+            !item.expenseId ||
+            !Number.isFinite(
+              item.expenseAmount
+            ) ||
+            item.expenseAmount <= 0 ||
+            !Number.isFinite(
+              item.allocatedAmount
+            ) ||
+            item.allocatedAmount !==
+              item.expenseAmount
+        );
+
+    if (
+      expenseAllocationMismatches.length >
+      0
+    ) {
+      console.error(
+        "[AUTODEAR][BONUS_LEDGER][EXPENSE_ALLOCATION_MISMATCH]",
+        {
+          authUserId,
+          profileId,
+          count:
+            expenseAllocationMismatches.length,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_LEDGER_REQUIRES_RECONCILIATION",
+      });
+    }
+
+    const now = Date.now();
+
+    const balance =
+      bonusRows.reduce(
+        (sum, row) => {
+          if (
+            String(
+              row?.type || ""
+            ) !== "income"
+          ) {
+            return sum;
+          }
+
+          const amount =
+            Math.max(
+              0,
+              Number(
+                row?.amount || 0
+              )
+            );
+
+          if (
+            !Number.isFinite(amount) ||
+            amount <= 0
+          ) {
+            return sum;
+          }
+
+          const createdAtMs =
+            new Date(
+              row?.created_at || ""
+            ).getTime();
+
+          const explicitExpiresAtMs =
+            new Date(
+              row?.expires_at || ""
+            ).getTime();
+
+          const expiresAtMs =
+            Number.isFinite(
+              explicitExpiresAtMs
+            )
+              ? explicitExpiresAtMs
+              : Number.isFinite(
+                  createdAtMs
+                )
+              ? createdAtMs +
+                365 *
+                  24 *
+                  60 *
+                  60 *
+                  1000
+              : 0;
+
+          if (
+            !expiresAtMs ||
+            expiresAtMs <= now
+          ) {
+            return sum;
+          }
+
+          const bonusId =
+            String(
+              row?.id || ""
+            ).trim();
+
+          const allocated =
+            Math.max(
+              0,
+              Number(
+                allocatedByIncome.get(
+                  bonusId
+                ) || 0
+              )
+            );
+
+          return (
+            sum +
+            Math.max(
+              0,
+              amount - allocated
+            )
+          );
+        },
+        0
+      );
+
     const transactions =
       (
         Array.isArray(data)
@@ -15647,6 +15995,7 @@ app.get("/api/bonuses/me", async (req, res) => {
       ok: true,
       userId: authUserId,
       profileId,
+      balance,
       transactions,
     });
   } catch (error) {
