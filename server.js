@@ -5,6 +5,7 @@ const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
 const multer = require("multer");
+const crypto = require("crypto");
 
 const { processMessage } = require("./assistant/brain");
 const memoryStore = require("./assistant/memoryStore");
@@ -56,6 +57,33 @@ const supabaseKey =
 const supabase = supabaseUrl && supabaseKey
   ? createClient(supabaseUrl, supabaseKey)
   : null;
+
+/*
+ * Financial / privileged Supabase client.
+ *
+ * IMPORTANT:
+ * Never fall back to anon here.
+ * Bonus spending RPC is executable only by service_role.
+ */
+const supabaseServiceRoleKey =
+  String(
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    ""
+  ).trim();
+
+const supabaseServiceRole =
+  supabaseUrl && supabaseServiceRoleKey
+    ? createClient(
+        supabaseUrl,
+        supabaseServiceRoleKey,
+        {
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+          },
+        }
+      )
+    : null;
 
 
 function isTransientSupabaseReadError(error) {
@@ -15457,6 +15485,580 @@ app.post("/api/payments/ckassa/sync-new", async (req, res) => {
 
 
 // ============================================================
+// AUTODEAR BONUS LEDGER — READ ONLY FOR CLIENT
+//
+// Bonus points are NOT money and are intentionally separated
+// from personal/business wallets.
+//
+// The authenticated client may read only its own ledger.
+// Bonus creation/spending will be performed only by trusted
+// AUTODEAR server flows.
+// ============================================================
+
+app.get("/api/bonuses/me", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const authUserId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    const {
+      data: profile,
+      error: profileError,
+    } = await supabaseReadWithRetry(
+      () =>
+        supabase
+          .from("profiles")
+          .select("id,auth_user_id")
+          .or(
+            `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+          )
+          .limit(1)
+          .maybeSingle(),
+      "bonus-ledger-profile"
+    );
+
+    if (profileError) {
+      console.error(
+        "[AUTODEAR][BONUS_LEDGER][PROFILE_ERROR]",
+        {
+          authUserId,
+          code:
+            profileError.code || null,
+          message:
+            profileError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_PROFILE_LOOKUP_FAILED",
+      });
+    }
+
+    const profileId =
+      String(
+        profile?.id || ""
+      ).trim();
+
+    if (!profileId) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BONUS_PROFILE_NOT_FOUND",
+      });
+    }
+
+    const {
+      data,
+      error,
+    } = await supabaseReadWithRetry(
+      () =>
+        supabase
+          .from("bonuses")
+          .select(
+            "id,user_id,title,amount,type,expires_at,source_type,source_id,created_at"
+          )
+          .eq(
+            "user_id",
+            profileId
+          )
+          .order(
+            "created_at",
+            {
+              ascending: false,
+            }
+          ),
+      "bonus-ledger-me"
+    );
+
+    if (error) {
+      console.error(
+        "[AUTODEAR][BONUS_LEDGER][READ_ERROR]",
+        {
+          authUserId,
+          profileId,
+          code:
+            error.code || null,
+          message:
+            error.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_LEDGER_READ_FAILED",
+      });
+    }
+
+    const transactions =
+      (
+        Array.isArray(data)
+          ? data
+          : []
+      ).map((row) => ({
+        id: row.id,
+        userId: row.user_id,
+        title:
+          String(
+            row.title || ""
+          ),
+        amount:
+          Number(
+            row.amount || 0
+          ),
+        type: row.type,
+        expiresAt:
+          row.expires_at || null,
+        sourceType:
+          row.source_type || null,
+        sourceId:
+          row.source_id || null,
+        createdAt:
+          row.created_at,
+      }));
+
+    return res.json({
+      ok: true,
+      userId: authUserId,
+      profileId,
+      transactions,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][BONUS_LEDGER][READ_FATAL]",
+      {
+        authUserId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BONUS_LEDGER_READ_FAILED",
+    });
+  }
+});
+
+// ============================================================
+// AUTODEAR BONUS REDEMPTION — TRUSTED SERVER FLOW
+//
+// Client sends only:
+//   requestId
+//   requestedBonus
+//
+// Financial context is NEVER trusted from the client.
+// Customer, station, completion status and repair amount are
+// loaded from business_requests by the server.
+//
+// The actual ledger expense is created only by the
+// service-role-only PostgreSQL RPC.
+// ============================================================
+
+app.post("/api/bonuses/redeem", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const authUserId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  const requestId =
+    String(
+      req.body?.requestId || ""
+    ).trim();
+
+  const requestedBonus =
+    Number(
+      req.body?.requestedBonus
+    );
+
+  if (!requestId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "BONUS_REQUEST_ID_REQUIRED",
+    });
+  }
+
+  if (
+    !Number.isInteger(requestedBonus) ||
+    requestedBonus <= 0
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "BONUS_AMOUNT_INVALID",
+    });
+  }
+
+  /*
+   * Fail closed.
+   *
+   * The ordinary `supabase` client may intentionally support
+   * an anon fallback elsewhere in the server. Financial bonus
+   * spending must NEVER use that fallback.
+   */
+  if (!supabaseServiceRole) {
+    console.error(
+      "[AUTODEAR][BONUS_REDEEM][SERVICE_ROLE_MISSING]"
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error:
+        "BONUS_SERVICE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+    /*
+     * Resolve auth UUID -> canonical AUTODEAR profile UUID.
+     * Legacy profiles are supported by checking both columns.
+     */
+    const {
+      data: profile,
+      error: profileError,
+    } = await supabaseServiceRole
+      .from("profiles")
+      .select("id,auth_user_id")
+      .or(
+        `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+      )
+      .limit(1)
+      .maybeSingle();
+
+    if (profileError) {
+      console.error(
+        "[AUTODEAR][BONUS_REDEEM][PROFILE_ERROR]",
+        {
+          authUserId,
+          code:
+            profileError.code || null,
+          message:
+            profileError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_PROFILE_LOOKUP_FAILED",
+      });
+    }
+
+    const profileId =
+      String(
+        profile?.id || ""
+      ).trim();
+
+    if (!profileId) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BONUS_PROFILE_NOT_FOUND",
+      });
+    }
+
+    /*
+     * SECURITY:
+     * Request ID comes from the client, but all financial
+     * properties are loaded from the database.
+     */
+    const {
+      data: businessRequest,
+      error: requestError,
+    } = await supabaseServiceRole
+      .from("business_requests")
+      .select(
+        "id,customer_id,business_id,station_id,status,repair_amount"
+      )
+      .eq(
+        "id",
+        requestId
+      )
+      .maybeSingle();
+
+    if (requestError) {
+      console.error(
+        "[AUTODEAR][BONUS_REDEEM][REQUEST_ERROR]",
+        {
+          authUserId,
+          profileId,
+          requestId,
+          code:
+            requestError.code || null,
+          message:
+            requestError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_LOOKUP_FAILED",
+      });
+    }
+
+    if (!businessRequest) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_NOT_FOUND",
+      });
+    }
+
+    const requestCustomerId =
+      String(
+        businessRequest.customer_id ||
+        ""
+      ).trim();
+
+    /*
+     * New AUTODEAR accounts normally have profile.id equal to
+     * auth user UUID. Keep authUserId compatibility for legacy
+     * request rows while canonical profileId remains the ledger
+     * identity passed to PostgreSQL.
+     */
+    if (
+      !requestCustomerId ||
+      (
+        requestCustomerId !== profileId &&
+        requestCustomerId !== authUserId
+      )
+    ) {
+      console.warn(
+        "[AUTODEAR][BONUS_REDEEM][CUSTOMER_MISMATCH]",
+        {
+          authUserId,
+          profileId,
+          requestId,
+        }
+      );
+
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_ACCESS_DENIED",
+      });
+    }
+
+    if (
+      String(
+        businessRequest.status ||
+        ""
+      ).trim() !== "completed"
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_NOT_COMPLETED",
+      });
+    }
+
+    const stationId =
+      String(
+        businessRequest.station_id ||
+        businessRequest.business_id ||
+        ""
+      ).trim();
+
+    if (!stationId) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_STATION_NOT_FOUND",
+      });
+    }
+
+    const serviceAmount =
+      Number(
+        businessRequest.repair_amount
+      );
+
+    if (
+      !Number.isFinite(serviceAmount) ||
+      serviceAmount <= 0
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_SERVICE_AMOUNT_NOT_AVAILABLE",
+      });
+    }
+
+    /*
+     * The RPC performs:
+     * - active partner validation
+     * - payment percentage limit
+     * - current non-expired balance calculation
+     * - idempotency
+     * - customer-level concurrency lock
+     * - immutable expense creation
+     * - FEFO/FIFO allocation
+     */
+    const {
+      data: redeemResult,
+      error: redeemError,
+    } = await supabaseServiceRole.rpc(
+      "autodear_redeem_partner_bonus",
+      {
+        p_customer_id:
+          profileId,
+
+        p_station_id:
+          stationId,
+
+        p_source_type:
+          "business_request",
+
+        p_source_id:
+          requestId,
+
+        p_service_amount:
+          serviceAmount,
+
+        p_requested_bonus:
+          requestedBonus,
+      }
+    );
+
+    if (redeemError) {
+      console.error(
+        "[AUTODEAR][BONUS_REDEEM][RPC_ERROR]",
+        {
+          authUserId,
+          profileId,
+          requestId,
+          stationId,
+          code:
+            redeemError.code || null,
+          message:
+            redeemError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_REDEEM_FAILED",
+      });
+    }
+
+    if (
+      !redeemResult ||
+      redeemResult.ok !== true
+    ) {
+      const rpcError =
+        String(
+          redeemResult?.error ||
+          "BONUS_REDEEM_REJECTED"
+        );
+
+      const status =
+        rpcError ===
+          "BONUS_PARTNER_NOT_ACTIVE"
+          ? 409
+          : rpcError ===
+              "BONUS_AMOUNT_EXCEEDS_LIMIT"
+            ? 409
+            : rpcError ===
+                "BONUS_NOT_AVAILABLE"
+              ? 409
+              : 400;
+
+      return res.status(status).json({
+        ...(redeemResult || {}),
+        ok: false,
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][BONUS_REDEEM][OK]",
+      {
+        authUserId,
+        profileId,
+        requestId,
+        stationId,
+        approvedBonus:
+          redeemResult.approvedBonus ||
+          0,
+        duplicate:
+          redeemResult.duplicate ===
+          true,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      stationId,
+      result:
+        redeemResult,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][BONUS_REDEEM][FATAL]",
+      {
+        authUserId,
+        requestId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BONUS_REDEEM_FAILED",
+    });
+  }
+});
+
+
+// ============================================================
 // AUTODEAR ADS — REAL SERVER WALLET
 // Supabase is the source of truth.
 // Client can read the wallet through AUTODEAR API,
@@ -15921,6 +16523,1831 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
 // Browser and mobile app use the same authenticated owner.
 // AsyncStorage may remain only as a mobile cache.
 // ============================================================
+
+
+/*
+ * ============================================================
+ * AUTODEAR — BUSINESS LISTING CLAIM FOUNDATION
+ * ============================================================
+ *
+ * Business account and business listing are separate concepts.
+ *
+ * A staff-created listing:
+ *   owner_id = NULL
+ *   created_source = autodear_staff
+ *   ownership_status = unclaimed
+ *
+ * created_by_user_id records the operator only.
+ * It never grants business ownership.
+ */
+
+const BUSINESS_LISTING_CLAIM_ALPHABET =
+  "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+
+function normalizeBusinessListingClaimCode(
+  value
+) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+
+function createBusinessListingClaimCode() {
+  const randomPart = (length) => {
+    let result = "";
+
+    for (let index = 0; index < length; index += 1) {
+      const position =
+        crypto.randomInt(
+          0,
+          BUSINESS_LISTING_CLAIM_ALPHABET.length
+        );
+
+      result +=
+        BUSINESS_LISTING_CLAIM_ALPHABET[
+          position
+        ];
+    }
+
+    return result;
+  };
+
+  return `AD-${randomPart(4)}-${randomPart(4)}`;
+}
+
+
+function digestBusinessListingClaimCode(
+  value
+) {
+  const normalized =
+    normalizeBusinessListingClaimCode(
+      value
+    );
+
+  if (!normalized) {
+    return "";
+  }
+
+  /*
+   * The claim code has limited entropy, therefore a keyed
+   * digest is preferable to a plain SHA-256 hash.
+   *
+   * Render must provide BUSINESS_LISTING_CLAIM_SECRET.
+   */
+  const secret =
+    String(
+      process.env
+        .BUSINESS_LISTING_CLAIM_SECRET ||
+        ""
+    ).trim();
+
+  if (!secret) {
+    const error =
+      new Error(
+        "BUSINESS_LISTING_CLAIM_SECRET_NOT_CONFIGURED"
+      );
+
+    error.statusCode = 500;
+    throw error;
+  }
+
+  return crypto
+    .createHmac(
+      "sha256",
+      secret
+    )
+    .update(normalized)
+    .digest("hex");
+}
+
+
+function getBusinessListingClaimCodeHint(
+  value
+) {
+  const normalized =
+    normalizeBusinessListingClaimCode(
+      value
+    );
+
+  const suffix =
+    normalized.slice(-4);
+
+  return suffix
+    ? `****-${suffix}`
+    : null;
+}
+
+
+async function requireBusinessDirectoryStaffUser(
+  req
+) {
+  /*
+   * Business Directory staff access reuses the existing,
+   * server-authoritative AUTODEAR staff authentication.
+   *
+   * Do not create a second role lookup here and never trust
+   * a role supplied by the app/browser.
+   */
+  const staff =
+    await requireAdsStaffUser(req);
+
+  return {
+    user:
+      staff.user,
+
+    role:
+      staff.role,
+  };
+}
+
+function normalizeBusinessListingPhone(
+  value
+) {
+  const digits =
+    String(value || "")
+      .replace(/\D/g, "");
+
+  if (!digits) {
+    return "";
+  }
+
+  if (
+    digits.length === 11 &&
+    digits.startsWith("8")
+  ) {
+    return `7${digits.slice(1)}`;
+  }
+
+  return digits;
+}
+
+
+/*
+ * Staff creates an ownerless business listing and receives
+ * a one-time paper confirmation code.
+ */
+app.post(
+  "/api/business-directory/staff/listings",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const body =
+        req.body &&
+        typeof req.body === "object" &&
+        !Array.isArray(req.body)
+          ? req.body
+          : {};
+
+      const name =
+        String(
+          body.name || ""
+        ).trim();
+
+      const address =
+        String(
+          body.address || ""
+        ).trim();
+
+      const city =
+        String(
+          body.city || ""
+        ).trim();
+
+      const phone =
+        String(
+          body.phone || ""
+        ).trim();
+
+      if (!name) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_NAME_REQUIRED",
+        });
+      }
+
+      if (!address) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_ADDRESS_REQUIRED",
+        });
+      }
+
+      /*
+       * IMPORTANT:
+       * Do not pass arbitrary client fields into stations.
+       * Keep the staff creation surface intentionally small.
+       */
+      const stationPayload = {
+        owner_id: null,
+        name,
+        address,
+        city: city || null,
+        phone: phone || null,
+
+        created_source:
+          "autodear_staff",
+
+        created_by_user_id:
+          user.id,
+
+        ownership_status:
+          "unclaimed",
+
+        claimed_by_user_id:
+          null,
+
+        claimed_at:
+          null,
+
+        is_verified:
+          false,
+      };
+
+      const {
+        data: station,
+        error: stationError,
+      } = await supabase
+        .from("stations")
+        .insert(
+          stationPayload
+        )
+        .select(
+          [
+            "id",
+            "owner_id",
+            "name",
+            "address",
+            "city",
+            "phone",
+            "created_source",
+            "created_by_user_id",
+            "ownership_status",
+            "created_at",
+          ].join(",")
+        )
+        .single();
+
+      if (stationError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_STATION_ERROR]",
+          {
+            code:
+              stationError.code ||
+              null,
+            message:
+              stationError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CREATE_FAILED",
+        });
+      }
+
+      const claimCode =
+        createBusinessListingClaimCode();
+
+      const codeDigest =
+        digestBusinessListingClaimCode(
+          claimCode
+        );
+
+      const codeHint =
+        getBusinessListingClaimCodeHint(
+          claimCode
+        );
+
+      /*
+       * Revoke any unexpected active code before inserting
+       * the current one. Normally a brand-new station has none.
+       */
+      await supabase
+        .from(
+          "business_listing_claim_codes"
+        )
+        .update({
+          status: "revoked",
+          revoked_at:
+            new Date().toISOString(),
+          updated_at:
+            new Date().toISOString(),
+        })
+        .eq(
+          "station_id",
+          station.id
+        )
+        .eq(
+          "status",
+          "active"
+        );
+
+      const {
+        error: codeError,
+      } = await supabase
+        .from(
+          "business_listing_claim_codes"
+        )
+        .insert({
+          station_id:
+            station.id,
+
+          code_digest:
+            codeDigest,
+
+          code_hint:
+            codeHint,
+
+          status:
+            "active",
+
+          issued_by_user_id:
+            user.id,
+        });
+
+      if (codeError) {
+        /*
+         * Do not leave a public claimable listing without
+         * its confirmation credential.
+         */
+        const {
+          error: cleanupError,
+        } = await supabase
+          .from("stations")
+          .delete()
+          .eq(
+            "id",
+            station.id
+          )
+          .is(
+            "owner_id",
+            null
+          )
+          .eq(
+            "created_source",
+            "autodear_staff"
+          )
+          .eq(
+            "ownership_status",
+            "unclaimed"
+          );
+
+        if (cleanupError) {
+          console.error(
+            "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_CLEANUP_ERROR]",
+            cleanupError
+          );
+        }
+
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_CODE_ERROR]",
+          {
+            code:
+              codeError.code ||
+              null,
+            message:
+              codeError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CODE_CREATE_FAILED",
+        });
+      }
+
+      return res.status(201).json({
+        ok: true,
+
+        listing: {
+          id:
+            station.id,
+
+          name:
+            station.name,
+
+          address:
+            station.address,
+
+          city:
+            station.city,
+
+          phone:
+            station.phone,
+
+          ownershipStatus:
+            station.ownership_status,
+
+          createdAt:
+            station.created_at,
+        },
+
+        /*
+         * Plaintext is returned exactly at issuance time.
+         * It is never persisted in the database.
+         */
+        confirmationCode:
+          claimCode,
+
+        codeHint,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "BUSINESS_LISTING_CREATE_FATAL",
+      });
+    }
+  }
+);
+
+
+/*
+ * Candidate discovery for a logged-in business account.
+ *
+ * Only explicitly staff-created, still-unclaimed listings
+ * participate in ownership discovery.
+ */
+app.get(
+  "/api/business-directory/claim/candidates",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const user =
+        authResult?.user || null;
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const {
+        data: profile,
+        error: profileError,
+      } = await supabase
+        .from("profiles")
+        .select(
+          "id,auth_user_id,name,email,phone,city,role"
+        )
+        .or(
+          `auth_user_id.eq.${userId},id.eq.${userId}`
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (profileError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_PROFILE_LOOKUP_FAILED",
+        });
+      }
+
+      const profilePhone =
+        normalizeBusinessListingPhone(
+          profile?.phone
+        );
+
+      const requestedPhone =
+        normalizeBusinessListingPhone(
+          req.query?.phone
+        );
+
+      const phone =
+        profilePhone ||
+        requestedPhone;
+
+      const city =
+        String(
+          req.query?.city ||
+          profile?.city ||
+          ""
+        ).trim();
+
+      /*
+       * We deliberately do not discover by address alone.
+       * Several independent businesses may share one address.
+       */
+      if (!phone) {
+        return res.json({
+          ok: true,
+          candidates: [],
+          count: 0,
+          match:
+            "none",
+        });
+      }
+
+      const {
+        data: rows,
+        error: rowsError,
+      } = await supabase
+        .from("stations")
+        .select(
+          [
+            "id",
+            "name",
+            "address",
+            "city",
+            "phone",
+            "photo_url",
+            "image_url",
+            "business_type",
+            "ownership_status",
+            "created_source",
+          ].join(",")
+        )
+        .is(
+          "owner_id",
+          null
+        )
+        .eq(
+          "created_source",
+          "autodear_staff"
+        )
+        .eq(
+          "ownership_status",
+          "unclaimed"
+        )
+        .limit(100);
+
+      if (rowsError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][CANDIDATES_ERROR]",
+          rowsError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_CANDIDATES_FAILED",
+        });
+      }
+
+      const candidates =
+        (Array.isArray(rows)
+          ? rows
+          : [])
+          .filter(
+            (row) =>
+              normalizeBusinessListingPhone(
+                row?.phone
+              ) === phone
+          )
+          .map((row) => ({
+            id:
+              row.id,
+
+            name:
+              row.name ||
+              "Бизнес AUTODEAR",
+
+            address:
+              row.address ||
+              null,
+
+            city:
+              row.city ||
+              null,
+
+            phone:
+              row.phone ||
+              null,
+
+            photoUrl:
+              row.photo_url ||
+              row.image_url ||
+              null,
+
+            businessType:
+              row.business_type ||
+              null,
+
+            ownershipStatus:
+              row.ownership_status,
+
+            cityMatch:
+              Boolean(
+                city &&
+                row.city &&
+                String(row.city)
+                  .trim()
+                  .toLowerCase() ===
+                  city.toLowerCase()
+              ),
+          }));
+
+      return res.json({
+        ok: true,
+
+        candidates,
+
+        count:
+          candidates.length,
+
+        match:
+          candidates.length === 1
+            ? "single"
+            : candidates.length > 1
+              ? "multiple"
+              : "none",
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][CANDIDATES_FATAL]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CLAIM_CANDIDATES_FATAL",
+      });
+    }
+  }
+);
+
+
+/*
+ * Create a manual ownership-confirmation request.
+ *
+ * IMPORTANT:
+ * This endpoint never changes stations.owner_id.
+ */
+app.post(
+  "/api/business-directory/claim/requests",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const user =
+        authResult?.user || null;
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const stationId =
+        String(
+          req.body?.stationId ||
+          ""
+        ).trim();
+
+      if (!stationId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: station,
+        error: stationError,
+      } = await supabase
+        .from("stations")
+        .select(
+          "id,owner_id,ownership_status,created_source,name"
+        )
+        .eq(
+          "id",
+          stationId
+        )
+        .is(
+          "owner_id",
+          null
+        )
+        .eq(
+          "created_source",
+          "autodear_staff"
+        )
+        .eq(
+          "ownership_status",
+          "unclaimed"
+        )
+        .maybeSingle();
+
+      if (stationError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_NOT_CLAIMABLE",
+        });
+      }
+
+      const {
+        data: profile,
+        error: profileError,
+      } = await supabase
+        .from("profiles")
+        .select(
+          "id,email,phone"
+        )
+        .or(
+          `auth_user_id.eq.${userId},id.eq.${userId}`
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (profileError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_PROFILE_LOOKUP_FAILED",
+        });
+      }
+
+      const payload = {
+        station_id:
+          stationId,
+
+        requesting_auth_user_id:
+          userId,
+
+        requesting_profile_id:
+          profile?.id ||
+          null,
+
+        method:
+          "manual",
+
+        status:
+          "requested",
+
+        applicant_phone:
+          profile?.phone ||
+          null,
+
+        applicant_email:
+          profile?.email ||
+          user?.email ||
+          null,
+
+        applicant_note:
+          String(
+            req.body?.note ||
+            ""
+          )
+            .trim()
+            .slice(
+              0,
+              2000
+            ) ||
+          null,
+      };
+
+      const {
+        data: claim,
+        error: claimError,
+      } = await supabase
+        .from(
+          "business_listing_claims"
+        )
+        .insert(payload)
+        .select(
+          "id,station_id,status,method,created_at"
+        )
+        .single();
+
+      if (claimError) {
+        /*
+         * Partial unique index protects against duplicate
+         * simultaneously-open requests.
+         */
+        if (
+          String(
+            claimError.code ||
+            ""
+          ) === "23505"
+        ) {
+          const {
+            data: existing,
+          } = await supabase
+            .from(
+              "business_listing_claims"
+            )
+            .select(
+              "id,station_id,status,method,created_at"
+            )
+            .eq(
+              "station_id",
+              stationId
+            )
+            .eq(
+              "requesting_auth_user_id",
+              userId
+            )
+            .in(
+              "status",
+              [
+                "requested",
+                "under_review",
+                "approved",
+              ]
+            )
+            .order(
+              "created_at",
+              {
+                ascending:
+                  false,
+              }
+            )
+            .limit(1)
+            .maybeSingle();
+
+          return res.json({
+            ok: true,
+            duplicate: true,
+            claim:
+              existing ||
+              null,
+          });
+        }
+
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][CLAIM_REQUEST_ERROR]",
+          claimError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_REQUEST_FAILED",
+        });
+      }
+
+      return res.status(201).json({
+        ok: true,
+        claim,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][CLAIM_REQUEST_FATAL]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CLAIM_REQUEST_FATAL",
+      });
+    }
+  }
+);
+
+
+
+/*
+ * BUSINESS LISTING CLAIM — STAFF REVIEW
+ */
+
+app.get(
+  "/api/business-directory/staff/claim-requests",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      await requireBusinessDirectoryStaffUser(req);
+
+      const requestedStatus =
+        String(req.query?.status || "").trim();
+
+      const allowedStatuses =
+        new Set([
+          "requested",
+          "under_review",
+          "approved",
+          "rejected",
+          "claimed",
+          "cancelled",
+        ]);
+
+      let query =
+        supabase
+          .from("business_listing_claims")
+          .select(
+            [
+              "id",
+              "station_id",
+              "requesting_auth_user_id",
+              "requesting_profile_id",
+              "method",
+              "status",
+              "applicant_phone",
+              "applicant_email",
+              "staff_note",
+              "applicant_note",
+              "decided_by_user_id",
+              "decided_at",
+              "claimed_at",
+              "created_at",
+              "updated_at",
+            ].join(",")
+          )
+          .order(
+            "created_at",
+            { ascending: false }
+          )
+          .limit(200);
+
+      if (
+        requestedStatus &&
+        allowedStatuses.has(requestedStatus)
+      ) {
+        query =
+          query.eq(
+            "status",
+            requestedStatus
+          );
+      }
+
+      const {
+        data: claims,
+        error: claimsError,
+      } = await query;
+
+      if (claimsError) {
+        throw claimsError;
+      }
+
+      const claimRows =
+        Array.isArray(claims)
+          ? claims
+          : [];
+
+      const stationIds =
+        [
+          ...new Set(
+            claimRows
+              .map((item) =>
+                String(
+                  item?.station_id || ""
+                ).trim()
+              )
+              .filter(Boolean)
+          ),
+        ];
+
+      let stationRows = [];
+
+      if (stationIds.length) {
+        const {
+          data,
+          error,
+        } =
+          await supabase
+            .from("stations")
+            .select(
+              [
+                "id",
+                "name",
+                "address",
+                "city",
+                "phone",
+                "owner_id",
+                "ownership_status",
+                "created_source",
+              ].join(",")
+            )
+            .in(
+              "id",
+              stationIds
+            );
+
+        if (error) {
+          throw error;
+        }
+
+        stationRows =
+          Array.isArray(data)
+            ? data
+            : [];
+      }
+
+      const stationById =
+        new Map(
+          stationRows.map(
+            (station) => [
+              String(station.id),
+              station,
+            ]
+          )
+        );
+
+      return res.json({
+        ok: true,
+        claims:
+          claimRows.map(
+            (claim) => ({
+              ...claim,
+              station:
+                stationById.get(
+                  String(
+                    claim.station_id
+                  )
+                ) || null,
+            })
+          ),
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][STAFF_LIST_FATAL]",
+        error
+      );
+
+      return res
+        .status(status)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_CLAIM_STAFF_LIST_FATAL",
+        });
+    }
+  }
+);
+
+
+app.post(
+  "/api/business-directory/staff/claim-requests/:claimId/approve",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const staff =
+        await requireBusinessDirectoryStaffUser(req);
+
+      const claimId =
+        String(
+          req.params?.claimId || ""
+        ).trim();
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error: "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } =
+        await supabase
+          .from("business_listing_claims")
+          .select(
+            "id,station_id,requesting_auth_user_id,status"
+          )
+          .eq("id", claimId)
+          .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error: "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      const {
+        data: result,
+        error: rpcError,
+      } =
+        await supabase.rpc(
+          "approve_business_listing_claim",
+          {
+            p_claim_id: claimId,
+            p_staff_user_id:
+              staff.user.id,
+          }
+        );
+
+      if (rpcError) {
+        throw rpcError;
+      }
+
+      if (!result?.ok) {
+        return res.status(409).json(
+          result || {
+            ok: false,
+            error:
+              "BUSINESS_CLAIM_APPROVE_FAILED",
+          }
+        );
+      }
+
+      return res.json({
+        ok: true,
+        result,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][STAFF_APPROVE_FATAL]",
+        error
+      );
+
+      return res
+        .status(status)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_CLAIM_STAFF_APPROVE_FATAL",
+        });
+    }
+  }
+);
+
+
+app.post(
+  "/api/business-directory/staff/claim-requests/:claimId/reject",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const staff =
+        await requireBusinessDirectoryStaffUser(req);
+
+      const claimId =
+        String(
+          req.params?.claimId || ""
+        ).trim();
+
+      const staffNote =
+        String(
+          req.body?.note || ""
+        )
+          .trim()
+          .slice(0, 2000) ||
+        null;
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error: "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } =
+        await supabase
+          .from("business_listing_claims")
+          .select(
+            "id,status"
+          )
+          .eq("id", claimId)
+          .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error: "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      if (
+        ![
+          "requested",
+          "under_review",
+          "approved",
+        ].includes(
+          String(claim.status || "")
+        )
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_NOT_REJECTABLE",
+        });
+      }
+
+      const nowIso =
+        new Date().toISOString();
+
+      const {
+        error: updateError,
+      } =
+        await supabase
+          .from("business_listing_claims")
+          .update({
+            status: "rejected",
+            staff_note: staffNote,
+            decided_by_user_id:
+              staff.user.id,
+            decided_at: nowIso,
+            updated_at: nowIso,
+          })
+          .eq("id", claimId);
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      return res.json({
+        ok: true,
+        claimId,
+        status: "rejected",
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode || 500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][STAFF_REJECT_FATAL]",
+        error
+      );
+
+      return res
+        .status(status)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_CLAIM_STAFF_REJECT_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Validate a paper confirmation code.
+ *
+ * This stage intentionally DOES NOT assign owner_id yet.
+ * The final transfer will be performed by one atomic
+ * PostgreSQL RPC in the next foundation stage.
+ */
+app.post(
+  "/api/business-directory/claim/validate-code",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const user =
+        authResult?.user || null;
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const stationId =
+        String(
+          req.body?.stationId ||
+          ""
+        ).trim();
+
+      const code =
+        String(
+          req.body?.code ||
+          ""
+        ).trim();
+
+      if (
+        !stationId ||
+        !code
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CODE_REQUIRED",
+        });
+      }
+
+      const codeDigest =
+        digestBusinessListingClaimCode(
+          code
+        );
+
+      const {
+        data: station,
+        error: stationError,
+      } = await supabase
+        .from("stations")
+        .select(
+          "id,owner_id,ownership_status,created_source"
+        )
+        .eq(
+          "id",
+          stationId
+        )
+        .is(
+          "owner_id",
+          null
+        )
+        .eq(
+          "created_source",
+          "autodear_staff"
+        )
+        .eq(
+          "ownership_status",
+          "unclaimed"
+        )
+        .maybeSingle();
+
+      if (stationError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_NOT_CLAIMABLE",
+        });
+      }
+
+      const {
+        data: claimCode,
+        error: codeError,
+      } = await supabase
+        .from(
+          "business_listing_claim_codes"
+        )
+        .select(
+          "id,station_id,status,expires_at"
+        )
+        .eq(
+          "station_id",
+          stationId
+        )
+        .eq(
+          "code_digest",
+          codeDigest
+        )
+        .eq(
+          "status",
+          "active"
+        )
+        .maybeSingle();
+
+      if (codeError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CODE_LOOKUP_FAILED",
+        });
+      }
+
+      if (!claimCode) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CODE_INVALID",
+        });
+      }
+
+      if (
+        claimCode.expires_at &&
+        Date.parse(
+          claimCode.expires_at
+        ) <= Date.now()
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CODE_EXPIRED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        valid: true,
+        stationId,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][CODE_VALIDATE_FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "BUSINESS_LISTING_CODE_VALIDATE_FATAL",
+      });
+    }
+  }
+);
+
+
+
+/*
+ * ============================================================
+ * BUSINESS LISTING ATOMIC CODE CLAIM
+ * ============================================================
+ *
+ * Backend authenticates the user and calculates HMAC.
+ * PostgreSQL performs the ownership transfer atomically.
+ */
+app.post(
+  "/api/business-directory/claim/by-code",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const user =
+        authResult?.user || null;
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const {
+        data: profile,
+        error: profileError,
+      } = await supabase
+        .from("profiles")
+        .select(
+          "id,auth_user_id,role"
+        )
+        .or(
+          `auth_user_id.eq.${userId},id.eq.${userId}`
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (profileError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][ATOMIC_CLAIM_PROFILE_ERROR]",
+          {
+            code:
+              profileError.code ||
+              null,
+            message:
+              profileError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_PROFILE_LOOKUP_FAILED",
+        });
+      }
+
+      const role =
+        String(
+          profile?.role || ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (role !== "business") {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_PROFILE_REQUIRED",
+        });
+      }
+
+      const stationId =
+        String(
+          req.body?.stationId ||
+          ""
+        ).trim();
+
+      const code =
+        String(
+          req.body?.code ||
+          ""
+        ).trim();
+
+      if (!stationId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_ID_REQUIRED",
+        });
+      }
+
+      if (!code) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CODE_REQUIRED",
+        });
+      }
+
+      const codeDigest =
+        digestBusinessListingClaimCode(
+          code
+        );
+
+      const {
+        data: result,
+        error: rpcError,
+      } = await supabase.rpc(
+        "claim_business_listing_by_code",
+        {
+          p_station_id:
+            stationId,
+
+          p_owner_id:
+            userId,
+
+          p_claimed_by_user_id:
+            userId,
+
+          p_code_digest:
+            codeDigest,
+        }
+      );
+
+      if (rpcError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][ATOMIC_CLAIM_RPC_ERROR]",
+          {
+            code:
+              rpcError.code ||
+              null,
+            message:
+              rpcError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CLAIM_FAILED",
+        });
+      }
+
+      if (
+        !result ||
+        result.ok !== true
+      ) {
+        const errorCode =
+          String(
+            result?.error ||
+            "BUSINESS_LISTING_CLAIM_FAILED"
+          );
+
+        const conflictErrors =
+          new Set([
+            "BUSINESS_LISTING_NOT_CLAIMABLE",
+            "BUSINESS_LISTING_ALREADY_CLAIMED",
+          ]);
+
+        const codeErrors =
+          new Set([
+            "BUSINESS_LISTING_CODE_INVALID",
+            "BUSINESS_LISTING_CODE_EXPIRED",
+          ]);
+
+        const status =
+          conflictErrors.has(
+            errorCode
+          )
+            ? 409
+            : codeErrors.has(
+                errorCode
+              )
+              ? 400
+              : 400;
+
+        return res
+          .status(status)
+          .json({
+            ok: false,
+            error:
+              errorCode,
+          });
+      }
+
+      return res.json({
+        ok: true,
+
+        listing: {
+          id:
+            result.stationId ||
+            stationId,
+
+          ownerId:
+            result.ownerId ||
+            userId,
+
+          ownershipStatus:
+            result.ownershipStatus ||
+            "claimed",
+
+          claimedAt:
+            result.claimedAt ||
+            null,
+        },
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][ATOMIC_CLAIM_FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "BUSINESS_LISTING_CLAIM_FATAL",
+      });
+    }
+  }
+);
+
 
 async function requireAdsAuthUser(req) {
   if (!supabaseAuth) {
@@ -19647,6 +22074,678 @@ async function runAutodearBusinessTomorrowReminderSweep() {
   }
 }
 
+
+/*
+ * AUTODEAR customer booking reminders.
+ *
+ * Источник истины:
+ * business_bookings со status=confirmed.
+ *
+ * Напоминания:
+ * - за 24 часа;
+ * - за 1 час;
+ * - за 15 минут.
+ *
+ * Дедупликация постоянная через notifications:
+ * один booking + один eventType отправляются только один раз.
+ */
+const CUSTOMER_BOOKING_REMINDER_INTERVAL_MS =
+  60 * 1000;
+
+const CUSTOMER_BOOKING_REMINDER_WINDOWS = [
+  {
+    eventType: "booking_reminder_24h",
+    minutesBefore: 24 * 60,
+    toleranceMinutes: 2,
+  },
+  {
+    eventType: "booking_reminder_1h",
+    minutesBefore: 60,
+    toleranceMinutes: 2,
+  },
+  {
+    eventType: "booking_reminder_15m",
+    minutesBefore: 15,
+    toleranceMinutes: 2,
+  },
+];
+
+let customerBookingReminderRunning = false;
+
+function autodearBookingDateTimeUtc(
+  dateKey,
+  timeValue,
+  timezone
+) {
+  const date = String(dateKey || "").trim();
+
+  const time = autodearBookingTime(
+    timeValue
+  );
+
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+    !/^\d{2}:\d{2}$/.test(time)
+  ) {
+    return null;
+  }
+
+  const [year, month, day] =
+    date.split("-").map(Number);
+
+  const [hour, minute] =
+    time.split(":").map(Number);
+
+  /*
+   * Находим UTC instant, который соответствует
+   * локальным дате/времени станции.
+   *
+   * Используем уже существующий
+   * autodearZonedParts(), поэтому не вводим
+   * стороннюю timezone-библиотеку.
+   */
+  let guess = new Date(
+    Date.UTC(
+      year,
+      month - 1,
+      day,
+      hour,
+      minute,
+      0,
+      0
+    )
+  );
+
+  for (let index = 0; index < 3; index += 1) {
+    const parts =
+      autodearZonedParts(
+        guess,
+        timezone
+      );
+
+    const currentAsUtc =
+      Date.UTC(
+        Number(parts.year),
+        Number(parts.month) - 1,
+        Number(parts.day),
+        Number(parts.hour),
+        Number(parts.minute),
+        0,
+        0
+      );
+
+    const desiredAsUtc =
+      Date.UTC(
+        year,
+        month - 1,
+        day,
+        hour,
+        minute,
+        0,
+        0
+      );
+
+    const delta =
+      desiredAsUtc - currentAsUtc;
+
+    if (Math.abs(delta) < 1000) {
+      break;
+    }
+
+    guess =
+      new Date(
+        guess.getTime() + delta
+      );
+  }
+
+  return guess;
+}
+
+function buildCustomerBookingReminderCopy(
+  booking,
+  station,
+  eventType
+) {
+  const stationName =
+    String(
+      station?.name ||
+        station?.legal_name ||
+        "СТО AUTODEAR"
+    ).trim();
+
+  const stationAddress =
+    String(
+      station?.address_full ||
+        station?.address ||
+        ""
+    ).trim();
+
+  const service =
+    String(
+      booking?.service || ""
+    ).trim();
+
+  const time =
+    autodearBookingTime(
+      booking?.start_time
+    );
+
+  if (
+    eventType ===
+    "booking_reminder_15m"
+  ) {
+    const details = [
+      stationName,
+      stationAddress,
+    ].filter(Boolean);
+
+    return {
+      title:
+        "Запись через 15 минут",
+      body:
+        details.length
+          ? `В ${time} — ${details.join(
+              " · "
+            )}`
+          : `В ${time} у вас запись на СТО.`,
+    };
+  }
+
+  if (
+    eventType ===
+    "booking_reminder_1h"
+  ) {
+    const details = [
+      stationName,
+      stationAddress,
+    ].filter(Boolean);
+
+    return {
+      title:
+        "Скоро запись на сервис",
+      body:
+        details.length
+          ? `Через час, в ${time} — ${details.join(
+              " · "
+            )}`
+          : `Через час, в ${time} у вас запись на СТО.`,
+    };
+  }
+
+  const details = [
+    service,
+    stationName,
+  ].filter(Boolean);
+
+  return {
+    title:
+      "Напоминание о записи",
+    body:
+      details.length
+        ? `Завтра в ${time} — ${details.join(
+            " · "
+          )}`
+        : `Завтра в ${time} у вас запись на сервис.`,
+  };
+}
+
+async function customerBookingReminderAlreadySent(
+  bookingId,
+  eventType
+) {
+  const {
+    data,
+    error,
+  } = await supabase
+    .from("notifications")
+    .select("id")
+    .eq(
+      "related_type",
+      eventType
+    )
+    .eq(
+      "related_id",
+      String(bookingId)
+    )
+    .limit(1);
+
+  if (error) {
+    throw error;
+  }
+
+  return (
+    Array.isArray(data) &&
+    data.length > 0
+  );
+}
+
+async function runCustomerBookingReminders() {
+  if (
+    customerBookingReminderRunning ||
+    !supabase
+  ) {
+    return;
+  }
+
+  customerBookingReminderRunning = true;
+
+  try {
+    const now = new Date();
+
+    /*
+     * Достаточно ближайших ~24 часов.
+     * Берём сегодня/завтра/послезавтра по UTC,
+     * затем точное окно рассчитываем уже
+     * в timezone станции.
+     */
+    const dateKeys = [];
+
+    for (
+      let offset = 0;
+      offset <= 2;
+      offset += 1
+    ) {
+      const date =
+        new Date(
+          now.getTime() +
+            offset *
+              24 *
+              60 *
+              60 *
+              1000
+        );
+
+      dateKeys.push(
+        date
+          .toISOString()
+          .slice(0, 10)
+      );
+    }
+
+    const {
+      data: bookingRows,
+      error: bookingsError,
+    } = await supabase
+      .from("business_bookings")
+      .select("*")
+      .in(
+        "booking_date",
+        dateKeys
+      )
+      .eq(
+        "status",
+        "confirmed"
+      );
+
+    if (bookingsError) {
+      throw bookingsError;
+    }
+
+    const bookings =
+      Array.isArray(bookingRows)
+        ? bookingRows
+        : [];
+
+    if (!bookings.length) {
+      return;
+    }
+
+    const stationIds = [
+      ...new Set(
+        bookings
+          .map(
+            (booking) =>
+              String(
+                booking?.business_id ||
+                  ""
+              ).trim()
+          )
+          .filter(Boolean)
+      ),
+    ];
+
+    if (!stationIds.length) {
+      return;
+    }
+
+    const {
+      data: stationRows,
+      error: stationsError,
+    } = await supabase
+      .from("stations")
+      .select(
+        "id,name,legal_name,address,address_full,timezone"
+      )
+      .in(
+        "id",
+        stationIds
+      );
+
+    if (stationsError) {
+      throw stationsError;
+    }
+
+    const stationsById =
+      new Map(
+        (
+          Array.isArray(stationRows)
+            ? stationRows
+            : []
+        ).map(
+          (station) => [
+            String(station.id),
+            station,
+          ]
+        )
+      );
+
+    for (const booking of bookings) {
+      const bookingId =
+        String(
+          booking?.id || ""
+        ).trim();
+
+      const customerId =
+        String(
+          booking?.customer_id ||
+            ""
+        ).trim();
+
+      const stationId =
+        String(
+          booking?.business_id ||
+            ""
+        ).trim();
+
+      if (
+        !bookingId ||
+        !customerId ||
+        !stationId
+      ) {
+        continue;
+      }
+
+      const station =
+        stationsById.get(
+          stationId
+        );
+
+      if (!station) {
+        continue;
+      }
+
+      const timezone =
+        autodearSafeTimezone(
+          station.timezone
+        );
+
+      const bookingAt =
+        autodearBookingDateTimeUtc(
+          booking.booking_date,
+          booking.start_time,
+          timezone
+        );
+
+      if (!bookingAt) {
+        continue;
+      }
+
+      const minutesUntil =
+        (
+          bookingAt.getTime() -
+          now.getTime()
+        ) /
+        60000;
+
+      for (
+        const rule of
+        CUSTOMER_BOOKING_REMINDER_WINDOWS
+      ) {
+        const distance =
+          Math.abs(
+            minutesUntil -
+              rule.minutesBefore
+          );
+
+        if (
+          distance >
+          rule.toleranceMinutes
+        ) {
+          continue;
+        }
+
+        const alreadySent =
+          await customerBookingReminderAlreadySent(
+            bookingId,
+            rule.eventType
+          );
+
+        if (alreadySent) {
+          continue;
+        }
+
+        const {
+          data: tokenRows,
+          error: tokensError,
+        } = await supabase
+          .from(
+            "device_push_tokens"
+          )
+          .select(
+            "expo_push_token"
+          )
+          .eq(
+            "user_id",
+            customerId
+          )
+          .eq(
+            "is_active",
+            true
+          );
+
+        if (tokensError) {
+          throw tokensError;
+        }
+
+        const tokens =
+          (
+            Array.isArray(tokenRows)
+              ? tokenRows
+              : []
+          )
+            .map(
+              (row) =>
+                String(
+                  row?.expo_push_token ||
+                    ""
+                ).trim()
+            )
+            .filter(Boolean);
+
+        if (!tokens.length) {
+          continue;
+        }
+
+        const copy =
+          buildCustomerBookingReminderCopy(
+            booking,
+            station,
+            rule.eventType
+          );
+
+        const requestId =
+          String(
+            booking?.request_id ||
+              ""
+          ).trim();
+
+        /*
+         * Клиент уже умеет открыть явный route.
+         * Передаём также все ID, чтобы позже
+         * маршрут можно было уточнять без
+         * изменения scheduler.
+         */
+        const pushData = {
+          type:
+            rule.eventType,
+          eventType:
+            rule.eventType,
+          category:
+            "booking",
+          bookingId,
+          requestId:
+            requestId || null,
+          stationId,
+          route:
+            requestId
+              ? `/profile/bookings?requestId=${encodeURIComponent(
+                  requestId
+                )}`
+              : "/profile/bookings",
+        };
+
+        /*
+         * Сначала резервируем notification как
+         * постоянный ключ дедупликации.
+         *
+         * Если push не отправился — удаляем резерв,
+         * чтобы следующий sweep мог повторить попытку.
+         */
+        const {
+          data:
+            reservedNotification,
+          error:
+            notificationError,
+        } = await supabase
+          .from("notifications")
+          .insert({
+            recipient_role:
+              "user",
+            recipient_id:
+              customerId,
+            title:
+              copy.title,
+            body:
+              copy.body,
+            type:
+              "booking",
+            related_type:
+              rule.eventType,
+            related_id:
+              bookingId,
+            is_read:
+              false,
+          })
+          .select("id")
+          .single();
+
+        if (notificationError) {
+          throw notificationError;
+        }
+
+        try {
+          const pushResult =
+            await sendAutodearExpoPush({
+              tokens,
+              title:
+                copy.title,
+              body:
+                copy.body,
+              data:
+                pushData,
+            });
+
+          if (
+            !pushResult ||
+            !pushResult.sent
+          ) {
+            throw new Error(
+              "CUSTOMER_BOOKING_REMINDER_PUSH_NOT_SENT"
+            );
+          }
+        } catch (pushError) {
+          const reservedId =
+            String(
+              reservedNotification?.id ||
+                ""
+            ).trim();
+
+          if (reservedId) {
+            const {
+              error:
+                rollbackError,
+            } = await supabase
+              .from("notifications")
+              .delete()
+              .eq(
+                "id",
+                reservedId
+              );
+
+            if (rollbackError) {
+              console.error(
+                "[AUTODEAR][CUSTOMER_BOOKING_REMINDER][ROLLBACK_ERROR]",
+                {
+                  bookingId,
+                  eventType:
+                    rule.eventType,
+                  notificationId:
+                    reservedId,
+                  message:
+                    rollbackError.message ||
+                    String(
+                      rollbackError
+                    ),
+                }
+              );
+            }
+          }
+
+          throw pushError;
+        }
+
+        console.log(
+          "[AUTODEAR][CUSTOMER_BOOKING_REMINDER][SENT]",
+          {
+            eventType:
+              rule.eventType,
+            bookingId,
+            customerId,
+            stationId,
+          }
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][CUSTOMER_BOOKING_REMINDER][ERROR]",
+      {
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+  } finally {
+    customerBookingReminderRunning = false;
+  }
+}
+
+function startCustomerBookingReminderScheduler() {
+  setTimeout(
+    () => {
+      runCustomerBookingReminders();
+    },
+    5000
+  );
+
+  setInterval(
+    () => {
+      runCustomerBookingReminders();
+    },
+    CUSTOMER_BOOKING_REMINDER_INTERVAL_MS
+  );
+}
+
 function startBusinessTomorrowReminderScheduler() {
   const run =
     () => {
@@ -19860,5 +22959,6 @@ app.post("/api/assistant/message", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`AUTODEAR AI Server started on port ${PORT}`);
 
-  startBusinessTomorrowReminderScheduler();
+  startCustomerBookingReminderScheduler();
+startBusinessTomorrowReminderScheduler();
 });
