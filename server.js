@@ -16709,6 +16709,120 @@ app.post("/api/bonuses/award-completed-deal", async (req, res) => {
       }
     );
 
+    /*
+     * Бонус к этому моменту уже записан.
+     * Уведомление и push — вторичные каналы доставки:
+     * их ошибка не должна отменять начисление.
+     */
+    try {
+      const bonusTitle = "Бонусы начислены";
+      const bonusBody =
+        `Вам начислено ${bonusAmount} бонусов AUTODEAR.`;
+
+      const bonusRelatedId =
+        String(
+          insertedBonus?.id || ""
+        ).trim();
+
+      const bonusPushData = {
+        type: "bonus_earned",
+        eventType: "bonus_earned",
+        category: "bonus",
+        bonusId:
+          bonusRelatedId || null,
+        requestId,
+        amount: bonusAmount,
+        route: "/profile/bonuses",
+      };
+
+      const {
+        error: bonusNotificationError,
+      } = await supabaseServiceRole
+        .from("notifications")
+        .insert({
+          recipient_role: "user",
+          recipient_id: customerId,
+          title: bonusTitle,
+          body: bonusBody,
+          type: "bonus",
+          related_type: "bonus_earned",
+          related_id:
+            bonusRelatedId || requestId,
+          is_read: false,
+        });
+
+      if (bonusNotificationError) {
+        console.warn(
+          "[AUTODEAR][BONUS_AWARD][NOTIFICATION_ERROR]",
+          {
+            requestId,
+            customerId,
+            code:
+              bonusNotificationError.code || null,
+            message:
+              bonusNotificationError.message || null,
+          }
+        );
+      }
+
+      try {
+        const {
+          data: bonusTokenRows,
+          error: bonusTokensError,
+        } = await supabaseServiceRole
+          .from("device_push_tokens")
+          .select("expo_push_token")
+          .eq("user_id", customerId)
+          .eq("is_active", true);
+
+        if (bonusTokensError) {
+          throw bonusTokensError;
+        }
+
+        const bonusTokens =
+          (Array.isArray(bonusTokenRows)
+            ? bonusTokenRows
+            : [])
+            .map((row) =>
+              String(
+                row?.expo_push_token || ""
+              ).trim()
+            )
+            .filter(Boolean);
+
+        if (bonusTokens.length) {
+          await sendAutodearExpoPush({
+            tokens: bonusTokens,
+            title: bonusTitle,
+            body: bonusBody,
+            data: bonusPushData,
+          });
+        }
+      } catch (pushError) {
+        console.warn(
+          "[AUTODEAR][BONUS_AWARD][PUSH_ERROR]",
+          {
+            requestId,
+            customerId,
+            message:
+              pushError?.message ||
+              String(pushError),
+          }
+        );
+      }
+    } catch (notificationError) {
+      console.warn(
+        "[AUTODEAR][BONUS_AWARD][NOTIFICATION_ERROR]",
+        {
+          requestId,
+          customerId,
+          message:
+            notificationError?.message ||
+            String(notificationError),
+        }
+      );
+    }
+
     return res.json({
       ok: true,
       duplicate: false,
