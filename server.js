@@ -86,6 +86,71 @@ const supabaseServiceRole =
     : null;
 
 
+/*
+ * AUTODEAR bonus economics.
+ *
+ * Deal rewards are calculated only from revenue actually earned
+ * by AUTODEAR, never from the customer's gross service bill.
+ *
+ * These are server-side safety limits. The client must never be
+ * trusted to provide or override them.
+ */
+const AUTODEAR_BONUS_ECONOMICS = Object.freeze({
+  customerCashbackPercent: 10,
+  maxDealBonusRevenuePercent: 25,
+  maxDealBonus: 250,
+  lifetimeDays: 365,
+});
+
+function calculateAutodearDealBonus(platformRevenue) {
+  const revenue =
+    Number(platformRevenue);
+
+  if (
+    !Number.isFinite(revenue) ||
+    revenue <= 0
+  ) {
+    return 0;
+  }
+
+  const requested =
+    Math.max(
+      0,
+      Math.round(
+        revenue *
+          AUTODEAR_BONUS_ECONOMICS
+            .customerCashbackPercent /
+          100
+      )
+    );
+
+  const revenueSafetyCap =
+    Math.max(
+      0,
+      Math.floor(
+        revenue *
+          AUTODEAR_BONUS_ECONOMICS
+            .maxDealBonusRevenuePercent /
+          100
+      )
+    );
+
+  const absoluteCap =
+    Math.max(
+      0,
+      Math.floor(
+        AUTODEAR_BONUS_ECONOMICS
+          .maxDealBonus
+      )
+    );
+
+  return Math.min(
+    requested,
+    revenueSafetyCap,
+    absoluteCap
+  );
+}
+
 function isTransientSupabaseReadError(error) {
   const message =
     String(
@@ -16016,6 +16081,663 @@ app.get("/api/bonuses/me", async (req, res) => {
     });
   }
 });
+
+// ============================================================
+// AUTODEAR COMPLETED DEAL BONUS — TRUSTED SERVER FLOW
+//
+// Client sends only requestId.
+// Deal state, customer, station and repair amount are loaded from business_requests.
+// Bonus amount is calculated only on the AUTODEAR server.
+// ============================================================
+
+app.post("/api/bonuses/award-completed-deal", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const authUserId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  const requestId =
+    String(
+      req.body?.requestId || ""
+    ).trim();
+
+  if (!requestId) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "BONUS_REQUEST_ID_REQUIRED",
+    });
+  }
+
+  if (!supabaseServiceRole) {
+    console.error(
+      "[AUTODEAR][BONUS_AWARD][SERVICE_ROLE_MISSING]"
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error:
+        "BONUS_SERVICE_NOT_CONFIGURED",
+    });
+  }
+
+  try {
+
+    /*
+     * business_requests is the canonical source for this award.
+     *
+     * business_id = owner/business account
+     * station_id  = concrete published station card
+     *
+     */
+    const {
+      data: businessRequest,
+      error: requestError,
+    } = await supabaseServiceRole
+      .from("business_requests")
+      .select(
+        "id,business_id,station_id,customer_id,status,repair_amount"
+      )
+      .eq(
+        "id",
+        requestId
+      )
+      .maybeSingle();
+
+    if (requestError) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][REQUEST_ERROR]",
+        {
+          authUserId,
+          requestId,
+          code:
+            requestError.code || null,
+          message:
+            requestError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_LOOKUP_FAILED",
+      });
+    }
+
+    if (!businessRequest) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_NOT_FOUND",
+      });
+    }
+
+    if (
+      String(
+        businessRequest.status || ""
+      ).trim() !== "completed"
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_REQUEST_NOT_COMPLETED",
+      });
+    }
+
+    const stationId =
+      String(
+        businessRequest.station_id || ""
+      ).trim();
+
+    if (!stationId) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_STATION_ID_REQUIRED",
+      });
+    }
+
+    const {
+      data: station,
+      error: stationError,
+    } = await supabaseServiceRole
+      .from("stations")
+      .select("id,owner_id")
+      .eq(
+        "id",
+        stationId
+      )
+      .maybeSingle();
+
+    if (stationError) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][STATION_ERROR]",
+        {
+          authUserId,
+          requestId,
+          stationId,
+          code:
+            stationError.code || null,
+          message:
+            stationError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_STATION_LOOKUP_FAILED",
+      });
+    }
+
+    if (!station) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BONUS_STATION_NOT_FOUND",
+      });
+    }
+
+    const stationOwnerId =
+      String(
+        station.owner_id || ""
+      ).trim();
+
+    if (stationOwnerId !== authUserId) {
+      console.warn(
+        "[AUTODEAR][BONUS_AWARD][BUSINESS_MISMATCH]",
+        {
+          authUserId,
+          requestId,
+          stationId,
+          stationOwnerId,
+        }
+      );
+
+      return res.status(403).json({
+        ok: false,
+        error:
+          "BONUS_DEAL_ACCESS_DENIED",
+      });
+    }
+
+    const customerId =
+      String(
+        businessRequest.customer_id || ""
+      ).trim();
+
+    if (!customerId) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_CUSTOMER_NOT_FOUND",
+      });
+    }
+
+    const {
+      data: customerProfile,
+      error: customerProfileError,
+    } = await supabaseServiceRole
+      .from("profiles")
+      .select("id,auth_user_id")
+      .or(
+        `auth_user_id.eq.${customerId},id.eq.${customerId}`
+      )
+      .limit(1)
+      .maybeSingle();
+
+    if (customerProfileError) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][CUSTOMER_PROFILE_ERROR]",
+        {
+          requestId,
+          customerId,
+          code:
+            customerProfileError.code ||
+            null,
+          message:
+            customerProfileError.message ||
+            null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_CUSTOMER_LOOKUP_FAILED",
+      });
+    }
+
+    const profileId =
+      String(
+        customerProfile?.id || ""
+      ).trim();
+
+    if (!profileId) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          "BONUS_CUSTOMER_PROFILE_NOT_FOUND",
+      });
+    }
+
+    const repairAmount =
+      Number(
+        businessRequest.repair_amount
+      );
+
+    if (
+      !Number.isFinite(repairAmount) ||
+      repairAmount <= 0
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_REPAIR_AMOUNT_NOT_AVAILABLE",
+      });
+    }
+
+    const {
+      data: subscription,
+      error: subscriptionError,
+    } = await supabaseServiceRole
+      .from("business_subscriptions")
+      .select(
+        "business_id,plan,active,expires_at"
+      )
+      .eq(
+        "business_id",
+        stationOwnerId
+      )
+      .maybeSingle();
+
+    if (subscriptionError) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][SUBSCRIPTION_ERROR]",
+        {
+          requestId,
+          stationId,
+          stationOwnerId,
+          code:
+            subscriptionError.code || null,
+          message:
+            subscriptionError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_SUBSCRIPTION_LOOKUP_FAILED",
+      });
+    }
+
+    const nowMs = Date.now();
+    const expiresAtMs =
+      subscription?.expires_at
+        ? Date.parse(subscription.expires_at)
+        : NaN;
+
+    const subscriptionActive =
+      subscription?.active === true &&
+      Number.isFinite(expiresAtMs) &&
+      expiresAtMs > nowMs;
+
+    const rawPlan =
+      subscriptionActive
+        ? String(
+            subscription?.plan || ""
+          ).trim()
+        : "";
+
+    const commissionPlan =
+      rawPlan === "max"
+        ? "max"
+        : rawPlan === "pro"
+          ? "pro"
+          : "partner";
+
+    const {
+      data: financeSettings,
+      error: financeSettingsError,
+    } = await supabaseServiceRole
+      .from("business_finance_settings")
+      .select("*")
+      .eq("id", "global")
+      .maybeSingle();
+
+    if (financeSettingsError) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][FINANCE_SETTINGS_ERROR]",
+        {
+          requestId,
+          code:
+            financeSettingsError.code || null,
+          message:
+            financeSettingsError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_FINANCE_SETTINGS_LOOKUP_FAILED",
+      });
+    }
+
+    if (!financeSettings) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          "BONUS_FINANCE_SETTINGS_NOT_CONFIGURED",
+      });
+    }
+
+    const commissionRange =
+      repairAmount <= 20000
+        ? "up_to_20000"
+        : repairAmount <= 50000
+          ? "up_to_50000"
+          : "above_50000";
+
+    const commissionColumn =
+      `commission_${commissionRange}_${commissionPlan}`;
+
+    const commissionPercent =
+      Number(
+        financeSettings[
+          commissionColumn
+        ]
+      );
+
+    if (
+      !Number.isFinite(commissionPercent) ||
+      commissionPercent < 0 ||
+      commissionPercent > 100
+    ) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][INVALID_COMMISSION]",
+        {
+          requestId,
+          commissionColumn,
+          commissionPercent,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_COMMISSION_INVALID",
+      });
+    }
+
+    const platformRevenue =
+      Math.round(
+        repairAmount *
+          commissionPercent /
+          100
+      );
+
+    if (platformRevenue <= 0) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_PLATFORM_REVENUE_NOT_AVAILABLE",
+      });
+    }
+
+    const bonusAmount =
+      calculateAutodearDealBonus(
+        platformRevenue
+      );
+
+    if (
+      !Number.isInteger(bonusAmount) ||
+      bonusAmount <= 0
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "BONUS_AWARD_NOT_AVAILABLE",
+      });
+    }
+
+    const sourceType =
+      "business_request";
+
+    /*
+     * Idempotency is enforced by the bonus ledger unique source
+     * index. First return an existing award when this request was
+     * already processed.
+     */
+    const {
+      data: existingBonus,
+      error: existingError,
+    } = await supabaseServiceRole
+      .from("bonuses")
+      .select(
+        "id,user_id,title,amount,type,expires_at,source_type,source_id,created_at"
+      )
+      .eq(
+        "user_id",
+        profileId
+      )
+      .eq(
+        "source_type",
+        sourceType
+      )
+      .eq(
+        "source_id",
+        requestId
+      )
+      .eq(
+        "type",
+        "income"
+      )
+      .maybeSingle();
+
+    if (existingError) {
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][EXISTING_ERROR]",
+        {
+          requestId,
+          profileId,
+          code:
+            existingError.code || null,
+          message:
+            existingError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_AWARD_LOOKUP_FAILED",
+      });
+    }
+
+    if (existingBonus) {
+      return res.json({
+        ok: true,
+        duplicate: true,
+        requestId,
+        bonus:
+          existingBonus,
+      });
+    }
+
+    const createdAt =
+      new Date();
+
+    const expiresAt =
+      new Date(
+        createdAt.getTime() +
+          AUTODEAR_BONUS_ECONOMICS
+            .lifetimeDays *
+            24 *
+            60 *
+            60 *
+            1000
+      );
+
+    const bonusRow = {
+      id:
+        `bonus_deal_${requestId}`,
+      user_id:
+        profileId,
+      title:
+        "Бонусы за визит",
+      amount:
+        bonusAmount,
+      type:
+        "income",
+      expires_at:
+        expiresAt.toISOString(),
+      source_type:
+        sourceType,
+      source_id:
+        requestId,
+      created_at:
+        createdAt.toISOString(),
+    };
+
+    const {
+      data: insertedBonus,
+      error: insertError,
+    } = await supabaseServiceRole
+      .from("bonuses")
+      .insert(
+        bonusRow
+      )
+      .select(
+        "id,user_id,title,amount,type,expires_at,source_type,source_id,created_at"
+      )
+      .single();
+
+    if (insertError) {
+      /*
+       * A concurrent retry may win the unique source race.
+       * Re-read the canonical row instead of creating another award.
+       */
+      if (
+        String(
+          insertError.code || ""
+        ) === "23505"
+      ) {
+        const {
+          data: duplicateBonus,
+          error: duplicateError,
+        } = await supabaseServiceRole
+          .from("bonuses")
+          .select(
+            "id,user_id,title,amount,type,expires_at,source_type,source_id,created_at"
+          )
+          .eq(
+            "user_id",
+            profileId
+          )
+          .eq(
+            "source_type",
+            sourceType
+          )
+          .eq(
+            "source_id",
+            requestId
+          )
+          .eq(
+            "type",
+            "income"
+          )
+          .maybeSingle();
+
+        if (
+          !duplicateError &&
+          duplicateBonus
+        ) {
+          return res.json({
+            ok: true,
+            duplicate: true,
+            requestId,
+            bonus:
+              duplicateBonus,
+          });
+        }
+      }
+
+      console.error(
+        "[AUTODEAR][BONUS_AWARD][INSERT_ERROR]",
+        {
+          requestId,
+          profileId,
+          code:
+            insertError.code || null,
+          message:
+            insertError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BONUS_AWARD_INSERT_FAILED",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][BONUS_AWARD][OK]",
+      {
+        authUserId,
+        profileId,
+        requestId,
+        platformRevenue,
+        bonusAmount,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      duplicate: false,
+      requestId,
+      platformRevenue,
+      bonusAmount,
+      bonus:
+        insertedBonus,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][BONUS_AWARD][FATAL]",
+      {
+        authUserId,
+        requestId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BONUS_AWARD_FAILED",
+    });
+  }
+});
+
 
 // ============================================================
 // AUTODEAR BONUS REDEMPTION — TRUSTED SERVER FLOW
