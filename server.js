@@ -17265,6 +17265,23 @@ app.post("/api/bonuses/redeem", async (req, res) => {
 // ============================================================
 
 app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUserId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
   try {
     if (!supabase) {
       return res.status(500).json({
@@ -17287,6 +17304,27 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: "OWNER_ID_REQUIRED",
+      });
+    }
+
+    /*
+     * Финансовые данные доступны только
+     * владельцу текущей авторизованной сессии.
+     */
+    if (ownerId !== authUserId) {
+      console.warn(
+        "[AUTODEAR][WALLET][GET_OWNER_MISMATCH]",
+        {
+          authUserId,
+          ownerId,
+          walletType,
+        }
+      );
+
+      return res.status(403).json({
+        ok: false,
+        error:
+          "WALLET_OWNER_FORBIDDEN",
       });
     }
 
