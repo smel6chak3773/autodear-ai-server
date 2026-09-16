@@ -17487,6 +17487,270 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
   }
 });
 
+app.post("/api/wallet/:walletType/:ownerId/charge", async (req, res) => {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUserId =
+    String(
+      authResult?.user?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return res.status(401).json({
+      ok: false,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    });
+  }
+
+  if (!supabaseServiceRole) {
+    console.error(
+      "[AUTODEAR][WALLET][CHARGE_SERVICE_ROLE_MISSING]"
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error:
+        "WALLET_SERVICE_NOT_CONFIGURED",
+    });
+  }
+
+  const ownerId =
+    String(
+      req.params?.ownerId || ""
+    ).trim();
+
+  const walletType =
+    String(
+      req.params?.walletType || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const amount =
+    Number(
+      req.body?.amount
+    );
+
+  const title =
+    String(
+      req.body?.title || ""
+    ).trim();
+
+  const transactionType =
+    String(
+      req.body?.transactionType || ""
+    ).trim();
+
+  const operationKey =
+    String(
+      req.body?.operationKey || ""
+    ).trim();
+
+  if (!ownerId) {
+    return res.status(400).json({
+      ok: false,
+      error: "OWNER_ID_REQUIRED",
+    });
+  }
+
+  if (
+    walletType !== "personal" &&
+    walletType !== "business"
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "INVALID_WALLET_TYPE",
+    });
+  }
+
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error: "INVALID_AMOUNT",
+    });
+  }
+
+  if (!title) {
+    return res.status(400).json({
+      ok: false,
+      error: "TITLE_REQUIRED",
+    });
+  }
+
+  const allowedTransactionTypes =
+    new Set([
+      "listing_payment",
+      "promotion_payment",
+      "business_payment",
+      "subscription_payment",
+      "commission_payment",
+    ]);
+
+  if (
+    !allowedTransactionTypes.has(
+      transactionType
+    )
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "INVALID_TRANSACTION_TYPE",
+    });
+  }
+
+  if (!operationKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "OPERATION_KEY_REQUIRED",
+    });
+  }
+
+  /*
+   * Never trust ownerId supplied by the client.
+   *
+   * The central wallet currently belongs to the
+   * authenticated Supabase auth UUID. This prevents
+   * a client from charging another user's wallet.
+   */
+  if (ownerId !== authUserId) {
+    console.warn(
+      "[AUTODEAR][WALLET][CHARGE_OWNER_MISMATCH]",
+      {
+        authUserId,
+        ownerId,
+        walletType,
+      }
+    );
+
+    return res.status(403).json({
+      ok: false,
+      error:
+        "WALLET_OWNER_FORBIDDEN",
+    });
+  }
+
+  try {
+    const {
+      data: chargeResult,
+      error: chargeError,
+    } =
+      await supabaseServiceRole.rpc(
+        "autodear_charge_wallet",
+        {
+          p_owner_id:
+            ownerId,
+          p_wallet_type:
+            walletType,
+          p_amount:
+            amount,
+          p_title:
+            title,
+          p_transaction_type:
+            transactionType,
+          p_operation_key:
+            operationKey,
+        }
+      );
+
+    if (chargeError) {
+      console.error(
+        "[AUTODEAR][WALLET][CHARGE_RPC_ERROR]",
+        {
+          ownerId,
+          walletType,
+          transactionType,
+          operationKey,
+          code:
+            chargeError.code || null,
+          message:
+            chargeError.message || null,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "WALLET_CHARGE_FAILED",
+      });
+    }
+
+    if (
+      chargeResult?.ok === false &&
+      chargeResult?.error ===
+        "INSUFFICIENT_FUNDS"
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error:
+          "INSUFFICIENT_FUNDS",
+        balance:
+          Number(
+            chargeResult?.balance || 0
+          ),
+      });
+    }
+
+    if (
+      chargeResult?.ok !== true
+    ) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          chargeResult?.error ||
+          "WALLET_CHARGE_INVALID_RESULT",
+      });
+    }
+
+    console.log(
+      "[AUTODEAR][WALLET][CHARGE_OK]",
+      {
+        ownerId,
+        walletType,
+        transactionType,
+        operationKey,
+        duplicate:
+          chargeResult?.duplicate === true,
+        balance:
+          Number(
+            chargeResult?.balance || 0
+          ),
+      }
+    );
+
+    return res.json({
+      ok: true,
+      duplicate:
+        chargeResult?.duplicate === true,
+      balance:
+        Number(
+          chargeResult?.balance || 0
+        ),
+      transactionId:
+        chargeResult?.transactionId ||
+        null,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][WALLET][CHARGE_FATAL]",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "WALLET_CHARGE_FATAL",
+    });
+  }
+});
+
+
 
 app.get("/api/ads/wallet/:ownerId", async (req, res) => {
   try {
