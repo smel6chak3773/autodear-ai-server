@@ -17852,6 +17852,33 @@ app.post(
       );
 
       /*
+       * Если раньше был запущен план постепенного
+       * снижения, ручное снижение цены его отменяет.
+       */
+      void cancelActiveAutodearListingPricePlan({
+        listingId,
+        ownerId:
+          authUserId,
+        reason:
+          "MANUAL_PRICE_REDUCTION",
+      }).catch(
+        (planCancelError) => {
+          console.error(
+            "[AUTODEAR][LISTING_PRICE_PLAN][CANCEL_AFTER_MANUAL_ERROR]",
+            {
+              listingId,
+              message:
+                planCancelError?.message ||
+                String(
+                  planCancelError
+                ),
+            }
+          );
+        }
+      );
+
+
+      /*
        * Цена УЖЕ подтверждена сервером.
        *
        * Push и внутренние уведомления не должны
@@ -17931,6 +17958,1627 @@ app.post(
         error:
           "LISTING_PRICE_REDUCTION_FAILED",
       });
+    }
+  }
+);
+
+
+// ============================================================
+// AUTODEAR LISTINGS — GRADUAL PRICE REDUCTION
+// Сервер постепенно ведёт цену от start_price к target_price.
+// Телефон продавца может быть выключен.
+// ============================================================
+
+const AUTODEAR_LISTING_PRICE_PLAN_DURATIONS =
+  new Set([
+    3,
+    5,
+    7,
+    10,
+    14,
+    30,
+  ]);
+
+const AUTODEAR_LISTING_PRICE_PLAN_DAY_MS =
+  24 *
+  60 *
+  60 *
+  1000;
+
+const AUTODEAR_LISTING_PRICE_PLAN_INTERVAL_MS =
+  60 * 1000;
+
+let autodearListingPricePlanSchedulerRunning =
+  false;
+
+
+function createAutodearListingPricePlanId() {
+  return [
+    "priceplan",
+    Date.now()
+      .toString(36),
+    Math.random()
+      .toString(36)
+      .slice(
+        2,
+        14
+      ),
+  ].join("_");
+}
+
+
+function getAutodearListingPricePlanPrice(
+  plan,
+  requestedStep
+) {
+  const startPrice =
+    Math.round(
+      Number(
+        plan?.start_price ||
+        plan?.startPrice ||
+        0
+      )
+    );
+
+  const targetPrice =
+    Math.round(
+      Number(
+        plan?.target_price ||
+        plan?.targetPrice ||
+        0
+      )
+    );
+
+  const totalSteps =
+    Math.max(
+      1,
+      Math.round(
+        Number(
+          plan?.total_steps ||
+          plan?.totalSteps ||
+          plan?.duration_days ||
+          plan?.durationDays ||
+          1
+        )
+      )
+    );
+
+  const step =
+    Math.min(
+      totalSteps,
+      Math.max(
+        0,
+        Math.round(
+          Number(
+            requestedStep ||
+            0
+          )
+        )
+      )
+    );
+
+  if (
+    step <= 0
+  ) {
+    return startPrice;
+  }
+
+  if (
+    step >= totalSteps
+  ) {
+    return targetPrice;
+  }
+
+  const totalDrop =
+    startPrice -
+    targetPrice;
+
+  return Math.max(
+    targetPrice,
+    Math.round(
+      startPrice -
+      (
+        totalDrop *
+        step
+      ) /
+      totalSteps
+    )
+  );
+}
+
+
+async function cancelActiveAutodearListingPricePlan({
+  listingId,
+  ownerId,
+  reason,
+}) {
+  if (
+    !supabaseServiceRole ||
+    !listingId
+  ) {
+    return null;
+  }
+
+  const nowIso =
+    new Date()
+      .toISOString();
+
+  let query =
+    supabaseServiceRole
+      .from(
+        "listing_price_reduction_plans"
+      )
+      .update({
+        status:
+          "cancelled",
+
+        cancelled_at:
+          nowIso,
+
+        cancel_reason:
+          String(
+            reason ||
+            "CANCELLED"
+          ),
+
+        updated_at:
+          nowIso,
+      })
+      .eq(
+        "listing_id",
+        String(
+          listingId
+        )
+      )
+      .eq(
+        "status",
+        "active"
+      );
+
+  if (ownerId) {
+    query =
+      query.eq(
+        "owner_id",
+        String(
+          ownerId
+        )
+      );
+  }
+
+  const {
+    data,
+    error,
+  } =
+    await query
+      .select("*");
+
+  if (error) {
+    throw error;
+  }
+
+  return Array.isArray(
+    data
+  )
+    ? data[0] || null
+    : null;
+}
+
+
+async function executeAutodearListingPricePlan(
+  plan
+) {
+  const planId =
+    String(
+      plan?.id || ""
+    ).trim();
+
+  const listingId =
+    String(
+      plan?.listing_id ||
+      ""
+    ).trim();
+
+  const ownerId =
+    String(
+      plan?.owner_id ||
+      ""
+    ).trim();
+
+  if (
+    !planId ||
+    !listingId ||
+    !ownerId
+  ) {
+    return;
+  }
+
+  const completedSteps =
+    Math.max(
+      0,
+      Math.round(
+        Number(
+          plan?.completed_steps ||
+          0
+        )
+      )
+    );
+
+  const totalSteps =
+    Math.max(
+      1,
+      Math.round(
+        Number(
+          plan?.total_steps ||
+          plan?.duration_days ||
+          1
+        )
+      )
+    );
+
+  const startedAtMs =
+    new Date(
+      plan?.started_at ||
+      plan?.created_at ||
+      Date.now()
+    ).getTime();
+
+  const elapsedSteps =
+    Math.max(
+      1,
+      Math.floor(
+        (
+          Date.now() -
+          startedAtMs
+        ) /
+        AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+      )
+    );
+
+  const nextStep =
+    Math.min(
+      totalSteps,
+      Math.max(
+        completedSteps +
+        1,
+        elapsedSteps
+      )
+    );
+
+  const expectedCurrentPrice =
+    getAutodearListingPricePlanPrice(
+      plan,
+      completedSteps
+    );
+
+  const scheduledNextPrice =
+    getAutodearListingPricePlanPrice(
+      plan,
+      nextStep
+    );
+
+  const {
+    data: listing,
+    error: listingError,
+  } =
+    await supabaseServiceRole
+      .from("listings")
+      .select(
+        [
+          "id",
+          "owner_id",
+          "title",
+          "price",
+          "status",
+          "extra_fields",
+          "payload",
+          "updated_at",
+        ].join(",")
+      )
+      .eq(
+        "id",
+        listingId
+      )
+      .maybeSingle();
+
+  if (listingError) {
+    throw listingError;
+  }
+
+  if (!listing) {
+    await cancelActiveAutodearListingPricePlan({
+      listingId,
+      ownerId,
+      reason:
+        "LISTING_NOT_FOUND",
+    });
+
+    return;
+  }
+
+  if (
+    String(
+      listing?.owner_id ||
+      listing?.payload
+        ?.ownerId ||
+      ""
+    ).trim() !==
+    ownerId
+  ) {
+    await cancelActiveAutodearListingPricePlan({
+      listingId,
+      ownerId,
+      reason:
+        "OWNER_CHANGED",
+    });
+
+    return;
+  }
+
+  if (
+    String(
+      listing?.status ||
+      ""
+    ).toLowerCase() !==
+    "active"
+  ) {
+    await cancelActiveAutodearListingPricePlan({
+      listingId,
+      ownerId,
+      reason:
+        "LISTING_NOT_ACTIVE",
+    });
+
+    return;
+  }
+
+  const currentPrice =
+    Math.round(
+      Number(
+        listing?.price ||
+        listing?.payload
+          ?.price ||
+        0
+      )
+    );
+
+  /*
+   * Если продавец самостоятельно изменил цену,
+   * старый автоплан больше не имеет права её
+   * перезаписывать.
+   */
+  if (
+    currentPrice !==
+    expectedCurrentPrice
+  ) {
+    await cancelActiveAutodearListingPricePlan({
+      listingId,
+      ownerId,
+      reason:
+        "PRICE_CHANGED_EXTERNALLY",
+    });
+
+    console.log(
+      "[AUTODEAR][LISTING_PRICE_PLAN][CANCELLED_EXTERNAL_CHANGE]",
+      {
+        planId,
+        listingId,
+        expectedCurrentPrice,
+        currentPrice,
+      }
+    );
+
+    return;
+  }
+
+  const nowIso =
+    new Date()
+      .toISOString();
+
+  /*
+   * На очень маленьком общем снижении округление
+   * может дать ту же цену на промежуточном шаге.
+   * Тогда двигаем сам план, но бессмысленную запись
+   * объявления не делаем.
+   */
+  if (
+    scheduledNextPrice >=
+    currentPrice
+  ) {
+    const completed =
+      nextStep >=
+      totalSteps;
+
+    const nextRunAt =
+      new Date(
+        startedAtMs +
+        (
+          Math.min(
+            totalSteps,
+            nextStep + 1
+          ) *
+          AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+        )
+      ).toISOString();
+
+    await supabaseServiceRole
+      .from(
+        "listing_price_reduction_plans"
+      )
+      .update({
+        completed_steps:
+          nextStep,
+
+        status:
+          completed
+            ? "completed"
+            : "active",
+
+        last_run_at:
+          nowIso,
+
+        next_run_at:
+          nextRunAt,
+
+        completed_at:
+          completed
+            ? nowIso
+            : null,
+
+        updated_at:
+          nowIso,
+
+        last_error:
+          null,
+      })
+      .eq(
+        "id",
+        planId
+      )
+      .eq(
+        "status",
+        "active"
+      )
+      .eq(
+        "completed_steps",
+        completedSteps
+      );
+
+    return;
+  }
+
+  const payload =
+    listing?.payload &&
+    typeof listing.payload ===
+      "object"
+      ? listing.payload
+      : {};
+
+  const rowExtraFields =
+    listing?.extra_fields &&
+    typeof listing
+      .extra_fields ===
+      "object"
+      ? listing.extra_fields
+      : {};
+
+  const payloadExtraFields =
+    payload?.extraFields &&
+    typeof payload
+      .extraFields ===
+      "object"
+      ? payload.extraFields
+      : {};
+
+  /*
+   * Отдельная колонка extra_fields считается
+   * более свежим источником истины.
+   */
+  const currentExtraFields = {
+    ...payloadExtraFields,
+    ...rowExtraFields,
+  };
+
+  const currentTracking =
+    currentExtraFields
+      ?.priceTracking &&
+    typeof currentExtraFields
+      .priceTracking ===
+      "object"
+      ? currentExtraFields
+          .priceTracking
+      : {};
+
+  const priceChangeAmount =
+    scheduledNextPrice -
+    currentPrice;
+
+  const priceDropAmount =
+    currentPrice -
+    scheduledNextPrice;
+
+  const priceChangePercent =
+    Math.max(
+      1,
+      Math.round(
+        (
+          priceDropAmount /
+          currentPrice
+        ) *
+        100
+      )
+    );
+
+  const badgeVisibleUntil =
+    new Date(
+      Date.now() +
+      7 *
+      24 *
+      60 *
+      60 *
+      1000
+    ).toISOString();
+
+  const operationKey =
+    [
+      "gradual-price",
+      planId,
+      `step-${nextStep}`,
+    ].join(":");
+
+  const historyEntry = {
+    from:
+      currentPrice,
+
+    to:
+      scheduledNextPrice,
+
+    amount:
+      priceChangeAmount,
+
+    percent:
+      priceChangePercent,
+
+    direction:
+      "down",
+
+    changedAt:
+      nowIso,
+
+    operationKey,
+
+    gradualPlanId:
+      planId,
+
+    gradualStep:
+      nextStep,
+
+    gradualTotalSteps:
+      totalSteps,
+  };
+
+  const currentHistory =
+    Array.isArray(
+      currentTracking
+        ?.history
+    )
+      ? currentTracking
+          .history
+      : [];
+
+  const planCompleted =
+    nextStep >=
+      totalSteps ||
+    scheduledNextPrice <=
+      Number(
+        plan?.target_price ||
+        0
+      );
+
+  const nextRunAt =
+    new Date(
+      startedAtMs +
+      (
+        Math.min(
+          totalSteps,
+          nextStep + 1
+        ) *
+        AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+      )
+    ).toISOString();
+
+  const nextTracking = {
+    ...currentTracking,
+
+    previousPrice:
+      currentPrice,
+
+    currentPrice:
+      scheduledNextPrice,
+
+    priceChangeAmount,
+
+    priceChangePercent,
+
+    direction:
+      "down",
+
+    changedAt:
+      nowIso,
+
+    badgeVisibleUntil,
+
+    lastOperationKey:
+      operationKey,
+
+    gradualPlan: {
+      id:
+        planId,
+
+      active:
+        !planCompleted,
+
+      startPrice:
+        Number(
+          plan?.start_price ||
+          0
+        ),
+
+      targetPrice:
+        Number(
+          plan?.target_price ||
+          0
+        ),
+
+      durationDays:
+        Number(
+          plan?.duration_days ||
+          totalSteps
+        ),
+
+      completedSteps:
+        nextStep,
+
+      totalSteps,
+
+      startedAt:
+        plan?.started_at ||
+        null,
+
+      nextRunAt:
+        planCompleted
+          ? null
+          : nextRunAt,
+    },
+
+    history: [
+      historyEntry,
+      ...currentHistory,
+    ].slice(
+      0,
+      20
+    ),
+  };
+
+  const nextExtraFields = {
+    ...currentExtraFields,
+
+    priceTracking:
+      nextTracking,
+  };
+
+  const nextPayload = {
+    ...payload,
+
+    price:
+      String(
+        scheduledNextPrice
+      ),
+
+    extraFields:
+      nextExtraFields,
+  };
+
+  /*
+   * Оптимистический UPDATE защищает от двух
+   * серверов, которые одновременно увидели один
+   * и тот же due-план.
+   */
+  const {
+    data: updatedListing,
+    error: updateError,
+  } =
+    await supabaseServiceRole
+      .from("listings")
+      .update({
+        price:
+          scheduledNextPrice,
+
+        extra_fields:
+          nextExtraFields,
+
+        payload:
+          nextPayload,
+
+        updated_at:
+          nowIso,
+      })
+      .eq(
+        "id",
+        listingId
+      )
+      .eq(
+        "owner_id",
+        ownerId
+      )
+      .eq(
+        "price",
+        currentPrice
+      )
+      .select(
+        "id,owner_id,title,price,status,extra_fields,payload,updated_at"
+      )
+      .maybeSingle();
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  if (!updatedListing) {
+    /*
+     * Кто-то успел изменить цену раньше нас.
+     * Следующий sweep увидит рассинхрон и отменит
+     * старый план.
+     */
+    return;
+  }
+
+  const {
+    data: updatedPlan,
+    error: planUpdateError,
+  } =
+    await supabaseServiceRole
+      .from(
+        "listing_price_reduction_plans"
+      )
+      .update({
+        completed_steps:
+          nextStep,
+
+        status:
+          planCompleted
+            ? "completed"
+            : "active",
+
+        last_run_at:
+          nowIso,
+
+        next_run_at:
+          nextRunAt,
+
+        completed_at:
+          planCompleted
+            ? nowIso
+            : null,
+
+        updated_at:
+          nowIso,
+
+        last_error:
+          null,
+      })
+      .eq(
+        "id",
+        planId
+      )
+      .eq(
+        "status",
+        "active"
+      )
+      .eq(
+        "completed_steps",
+        completedSteps
+      )
+      .select("*")
+      .maybeSingle();
+
+  if (planUpdateError) {
+    throw planUpdateError;
+  }
+
+  console.log(
+    "[AUTODEAR][LISTING_PRICE_PLAN][STEP_SAVED]",
+    {
+      planId,
+      listingId,
+      nextStep,
+      totalSteps,
+      currentPrice,
+      scheduledNextPrice,
+      planCompleted,
+    }
+  );
+
+  /*
+   * Не спамим избранное каждый день.
+   *
+   * Push/внутреннее уведомление:
+   * - на первом фактическом снижении;
+   * - когда достигнута конечная цена.
+   */
+  const shouldNotify =
+    nextStep === 1 ||
+    planCompleted;
+
+  if (
+    shouldNotify &&
+    updatedPlan
+  ) {
+    void notifyAutodearListingPriceReduced({
+      listingId,
+
+      ownerId,
+
+      title:
+        updatedListing?.title ||
+        listing?.title ||
+        "Объявление AUTODEAR",
+
+      previousPrice:
+        currentPrice,
+
+      nextPrice:
+        scheduledNextPrice,
+
+      priceDropAmount,
+
+      priceChangePercent,
+
+      operationKey,
+    }).catch(
+      (notificationError) => {
+        console.error(
+          "[AUTODEAR][LISTING_PRICE_PLAN][NOTIFY_ERROR]",
+          {
+            planId,
+            listingId,
+            message:
+              notificationError
+                ?.message ||
+              String(
+                notificationError
+              ),
+          }
+        );
+      }
+    );
+  }
+}
+
+
+async function runAutodearListingPricePlanSweep() {
+  if (
+    autodearListingPricePlanSchedulerRunning
+  ) {
+    return;
+  }
+
+  if (!supabaseServiceRole) {
+    return;
+  }
+
+  autodearListingPricePlanSchedulerRunning =
+    true;
+
+  try {
+    const nowIso =
+      new Date()
+        .toISOString();
+
+    const {
+      data: plans,
+      error,
+    } =
+      await supabaseServiceRole
+        .from(
+          "listing_price_reduction_plans"
+        )
+        .select("*")
+        .eq(
+          "status",
+          "active"
+        )
+        .lte(
+          "next_run_at",
+          nowIso
+        )
+        .order(
+          "next_run_at",
+          {
+            ascending:
+              true,
+          }
+        )
+        .limit(100);
+
+    if (error) {
+      throw error;
+    }
+
+    for (
+      const plan of
+      Array.isArray(plans)
+        ? plans
+        : []
+    ) {
+      try {
+        await executeAutodearListingPricePlan(
+          plan
+        );
+      } catch (planError) {
+        console.error(
+          "[AUTODEAR][LISTING_PRICE_PLAN][STEP_ERROR]",
+          {
+            planId:
+              plan?.id,
+            listingId:
+              plan?.listing_id,
+            message:
+              planError?.message ||
+              String(
+                planError
+              ),
+          }
+        );
+
+        try {
+          await supabaseServiceRole
+            .from(
+              "listing_price_reduction_plans"
+            )
+            .update({
+              last_error:
+                planError?.message ||
+                String(
+                  planError
+                ),
+
+              updated_at:
+                new Date()
+                  .toISOString(),
+            })
+            .eq(
+              "id",
+              String(
+                plan?.id ||
+                ""
+              )
+            )
+            .eq(
+              "status",
+              "active"
+            );
+        } catch {
+          // Основная ошибка уже записана в лог.
+        }
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][LISTING_PRICE_PLAN][SWEEP_ERROR]",
+      {
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+  } finally {
+    autodearListingPricePlanSchedulerRunning =
+      false;
+  }
+}
+
+
+function startAutodearListingPricePlanScheduler() {
+  const run = () => {
+    runAutodearListingPricePlanSweep()
+      .catch(
+        (error) => {
+          console.error(
+            "[AUTODEAR][LISTING_PRICE_PLAN][UNHANDLED]",
+            error
+          );
+        }
+      );
+  };
+
+  setTimeout(
+    run,
+    7000
+  );
+
+  const timer =
+    setInterval(
+      run,
+      AUTODEAR_LISTING_PRICE_PLAN_INTERVAL_MS
+    );
+
+  if (
+    typeof timer.unref ===
+    "function"
+  ) {
+    timer.unref();
+  }
+
+  console.log(
+    "[AUTODEAR][LISTING_PRICE_PLAN][SCHEDULER_STARTED]"
+  );
+}
+
+
+/*
+ * Получить активный план владельца.
+ */
+app.get(
+  "/api/listings/:listingId/price-reduction-plan",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(
+        req
+      );
+
+    const authUserId =
+      String(
+        authResult?.user?.id ||
+        ""
+      ).trim();
+
+    if (!authUserId) {
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+    }
+
+    if (!supabaseServiceRole) {
+      return res
+        .status(503)
+        .json({
+          ok: false,
+          error:
+            "PRICE_PLAN_SERVICE_NOT_CONFIGURED",
+        });
+    }
+
+    const listingId =
+      String(
+        req.params
+          ?.listingId ||
+        ""
+      ).trim();
+
+    try {
+      const {
+        data: plan,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "listing_price_reduction_plans"
+          )
+          .select("*")
+          .eq(
+            "listing_id",
+            listingId
+          )
+          .eq(
+            "owner_id",
+            authUserId
+          )
+          .eq(
+            "status",
+            "active"
+          )
+          .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return res.json({
+        ok: true,
+        plan:
+          plan || null,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][LISTING_PRICE_PLAN][GET_ERROR]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "PRICE_PLAN_GET_FAILED",
+        });
+    }
+  }
+);
+
+
+/*
+ * Запустить постепенное снижение.
+ */
+app.post(
+  "/api/listings/:listingId/price-reduction-plan",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(
+        req
+      );
+
+    const authUserId =
+      String(
+        authResult?.user?.id ||
+        ""
+      ).trim();
+
+    if (!authUserId) {
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+    }
+
+    if (!supabaseServiceRole) {
+      return res
+        .status(503)
+        .json({
+          ok: false,
+          error:
+            "PRICE_PLAN_SERVICE_NOT_CONFIGURED",
+        });
+    }
+
+    const listingId =
+      String(
+        req.params
+          ?.listingId ||
+        ""
+      ).trim();
+
+    const targetPrice =
+      Math.round(
+        Number(
+          req.body
+            ?.targetPrice
+        )
+      );
+
+    const durationDays =
+      Math.round(
+        Number(
+          req.body
+            ?.durationDays
+        )
+      );
+
+    const operationKey =
+      String(
+        req.body
+          ?.operationKey ||
+        ""
+      ).trim();
+
+    if (
+      !listingId ||
+      !Number.isFinite(
+        targetPrice
+      ) ||
+      targetPrice <= 0 ||
+      !AUTODEAR_LISTING_PRICE_PLAN_DURATIONS
+        .has(
+          durationDays
+        ) ||
+      !operationKey ||
+      operationKey.length >
+        220
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "INVALID_PRICE_PLAN",
+        });
+    }
+
+    try {
+      /*
+       * Идемпотентный повтор той же кнопки.
+       */
+      const {
+        data: duplicatePlan,
+        error: duplicateError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "listing_price_reduction_plans"
+          )
+          .select("*")
+          .eq(
+            "owner_id",
+            authUserId
+          )
+          .eq(
+            "operation_key",
+            operationKey
+          )
+          .maybeSingle();
+
+      if (duplicateError) {
+        throw duplicateError;
+      }
+
+      if (duplicatePlan) {
+        return res.json({
+          ok: true,
+          duplicate:
+            true,
+          plan:
+            duplicatePlan,
+        });
+      }
+
+      const {
+        data: listing,
+        error: listingError,
+      } =
+        await supabaseServiceRole
+          .from("listings")
+          .select(
+            "id,owner_id,title,price,status,payload,extra_fields"
+          )
+          .eq(
+            "id",
+            listingId
+          )
+          .maybeSingle();
+
+      if (listingError) {
+        throw listingError;
+      }
+
+      if (!listing) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "LISTING_NOT_FOUND",
+          });
+      }
+
+      const listingOwnerId =
+        String(
+          listing
+            ?.owner_id ||
+          listing?.payload
+            ?.ownerId ||
+          ""
+        ).trim();
+
+      if (
+        listingOwnerId !==
+        authUserId
+      ) {
+        return res
+          .status(403)
+          .json({
+            ok: false,
+            error:
+              "LISTING_OWNER_FORBIDDEN",
+          });
+      }
+
+      if (
+        String(
+          listing?.status ||
+          ""
+        ).toLowerCase() !==
+        "active"
+      ) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "LISTING_NOT_ACTIVE",
+          });
+      }
+
+      const startPrice =
+        Math.round(
+          Number(
+            listing?.price ||
+            listing?.payload
+              ?.price ||
+            0
+          )
+        );
+
+      if (
+        !Number.isFinite(
+          startPrice
+        ) ||
+        startPrice <= 0
+      ) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "LISTING_CURRENT_PRICE_INVALID",
+          });
+      }
+
+      if (
+        targetPrice >=
+        startPrice
+      ) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "TARGET_PRICE_MUST_BE_LOWER",
+            currentPrice:
+              startPrice,
+          });
+      }
+
+      const {
+        data: activePlan,
+        error: activeError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "listing_price_reduction_plans"
+          )
+          .select("*")
+          .eq(
+            "listing_id",
+            listingId
+          )
+          .eq(
+            "status",
+            "active"
+          )
+          .maybeSingle();
+
+      if (activeError) {
+        throw activeError;
+      }
+
+      if (activePlan) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "PRICE_PLAN_ALREADY_ACTIVE",
+            plan:
+              activePlan,
+          });
+      }
+
+      const startedAt =
+        new Date();
+
+      const nextRunAt =
+        new Date(
+          startedAt.getTime() +
+          AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+        );
+
+      const plan = {
+        id:
+          createAutodearListingPricePlanId(),
+
+        listing_id:
+          listingId,
+
+        owner_id:
+          authUserId,
+
+        start_price:
+          startPrice,
+
+        target_price:
+          targetPrice,
+
+        duration_days:
+          durationDays,
+
+        total_steps:
+          durationDays,
+
+        completed_steps:
+          0,
+
+        status:
+          "active",
+
+        operation_key:
+          operationKey,
+
+        started_at:
+          startedAt
+            .toISOString(),
+
+        next_run_at:
+          nextRunAt
+            .toISOString(),
+
+        created_at:
+          startedAt
+            .toISOString(),
+
+        updated_at:
+          startedAt
+            .toISOString(),
+      };
+
+      const {
+        data: insertedPlan,
+        error: insertError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "listing_price_reduction_plans"
+          )
+          .insert(plan)
+          .select("*")
+          .single();
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      console.log(
+        "[AUTODEAR][LISTING_PRICE_PLAN][CREATED]",
+        {
+          planId:
+            insertedPlan?.id,
+          listingId,
+          ownerId:
+            authUserId,
+          startPrice,
+          targetPrice,
+          durationDays,
+          nextRunAt:
+            nextRunAt
+              .toISOString(),
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        duplicate:
+          false,
+
+        plan:
+          insertedPlan,
+
+        estimatedDailyDrop:
+          Math.round(
+            (
+              startPrice -
+              targetPrice
+            ) /
+            durationDays
+          ),
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][LISTING_PRICE_PLAN][CREATE_ERROR]",
+        {
+          listingId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "PRICE_PLAN_CREATE_FAILED",
+        });
+    }
+  }
+);
+
+
+/*
+ * Отменить постепенное снижение.
+ */
+app.post(
+  "/api/listings/:listingId/price-reduction-plan/cancel",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(
+        req
+      );
+
+    const authUserId =
+      String(
+        authResult?.user?.id ||
+        ""
+      ).trim();
+
+    if (!authUserId) {
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+    }
+
+    try {
+      const cancelled =
+        await cancelActiveAutodearListingPricePlan({
+          listingId:
+            String(
+              req.params
+                ?.listingId ||
+              ""
+            ),
+
+          ownerId:
+            authUserId,
+
+          reason:
+            "USER_CANCELLED",
+        });
+
+      return res.json({
+        ok: true,
+        cancelled:
+          Boolean(
+            cancelled
+          ),
+        plan:
+          cancelled,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][LISTING_PRICE_PLAN][CANCEL_ERROR]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "PRICE_PLAN_CANCEL_FAILED",
+        });
     }
   }
 );
@@ -25141,4 +26789,5 @@ app.listen(PORT, "0.0.0.0", () => {
 
   startCustomerBookingReminderScheduler();
 startBusinessTomorrowReminderScheduler();
+  startAutodearListingPricePlanScheduler();
 });
