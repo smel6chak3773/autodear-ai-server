@@ -16921,6 +16921,1022 @@ app.post("/api/bonuses/redeem", async (req, res) => {
 
 
 // ============================================================
+// AUTODEAR LISTINGS — SERVER PRICE REDUCTION
+//
+// Источник истины: Supabase.
+//
+// Клиент передаёт только:
+// - listingId в URL;
+// - новую цену;
+// - operationKey.
+//
+// Сервер сам:
+// - проверяет auth;
+// - проверяет владельца;
+// - проверяет, что цена действительно уменьшена;
+// - считает процент;
+// - сохраняет историю;
+// - после успешной записи запускает уведомления
+//   пользователям, у которых объявление в избранном.
+// ============================================================
+
+function formatAutodearListingPrice(value) {
+  return `${new Intl.NumberFormat(
+    "ru-RU"
+  ).format(
+    Math.max(
+      0,
+      Math.round(
+        Number(value) || 0
+      )
+    )
+  )} ₽`;
+}
+
+
+async function sendAutodearListingPriceFcmPush({
+  tokens,
+  title,
+  body,
+  data,
+}) {
+  const cleanTokens =
+    Array.from(
+      new Set(
+        (
+          Array.isArray(tokens)
+            ? tokens
+            : []
+        )
+          .map(
+            (item) =>
+              String(
+                item || ""
+              ).trim()
+          )
+          .filter(Boolean)
+      )
+    );
+
+  if (!cleanTokens.length) {
+    return {
+      ok: true,
+      sent: 0,
+      reason:
+        "NO_PUSH_TOKENS",
+    };
+  }
+
+  /*
+   * device_push_tokens.expo_push_token —
+   * историческое имя колонки.
+   * Сейчас внутри хранится настоящий FCM token.
+   */
+  const functionBaseUrl =
+    String(
+      process.env.SUPABASE_URL ||
+      process.env
+        .EXPO_PUBLIC_SUPABASE_URL ||
+      ""
+    )
+      .trim()
+      .replace(
+        /\/+$/,
+        ""
+      );
+
+  const functionKey =
+    String(
+      process.env.SUPABASE_ANON_KEY ||
+      process.env
+        .EXPO_PUBLIC_SUPABASE_ANON_KEY ||
+      process.env
+        .SUPABASE_SERVICE_ROLE_KEY ||
+      ""
+    ).trim();
+
+  if (!functionBaseUrl) {
+    throw new Error(
+      "LISTING_PRICE_FCM_SUPABASE_URL_MISSING"
+    );
+  }
+
+  if (!functionKey) {
+    throw new Error(
+      "LISTING_PRICE_FCM_SUPABASE_KEY_MISSING"
+    );
+  }
+
+  const response =
+    await fetch(
+      `${functionBaseUrl}/functions/v1/send-fcm-push`,
+      {
+        method:
+          "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+
+          apikey:
+            functionKey,
+
+          Authorization:
+            `Bearer ${functionKey}`,
+        },
+
+        body:
+          JSON.stringify({
+            title:
+              String(
+                title || ""
+              ),
+
+            body:
+              String(
+                body || ""
+              ),
+
+            type:
+              data?.type ||
+              data?.eventType ||
+              "listing_price_reduced",
+
+            data:
+              data || {},
+
+            tokens:
+              cleanTokens,
+          }),
+      }
+    );
+
+  const responseText =
+    await response.text();
+
+  let payload = null;
+
+  try {
+    payload =
+      JSON.parse(
+        responseText
+      );
+  } catch {
+    payload = {
+      raw:
+        responseText,
+    };
+  }
+
+  if (
+    !response.ok ||
+    payload?.ok !== true
+  ) {
+    throw new Error(
+      `LISTING_PRICE_FCM_FAILED_${response.status}: ${
+        payload?.reason ||
+        responseText
+      }`
+    );
+  }
+
+  return {
+    ok: true,
+
+    sent:
+      Number(
+        payload?.sent || 0
+      ),
+
+    total:
+      cleanTokens.length,
+
+    payload,
+  };
+}
+
+
+async function notifyAutodearListingPriceReduced({
+  listingId,
+  ownerId,
+  title,
+  previousPrice,
+  nextPrice,
+  priceDropAmount,
+  priceChangePercent,
+  operationKey,
+}) {
+  if (!supabaseServiceRole) {
+    throw new Error(
+      "LISTING_PRICE_REDUCTION_SERVICE_ROLE_MISSING"
+    );
+  }
+
+  const {
+    data: favoriteRows,
+    error: favoritesError,
+  } =
+    await supabaseServiceRole
+      .from("favorites")
+      .select("user_id")
+      .eq(
+        "target_type",
+        "listing"
+      )
+      .eq(
+        "target_id",
+        listingId
+      )
+      .eq(
+        "status",
+        "active"
+      );
+
+  if (favoritesError) {
+    throw favoritesError;
+  }
+
+  const recipientIds =
+    Array.from(
+      new Set(
+        (
+          Array.isArray(
+            favoriteRows
+          )
+            ? favoriteRows
+            : []
+        )
+          .map(
+            (row) =>
+              String(
+                row?.user_id ||
+                ""
+              ).trim()
+          )
+          .filter(
+            (userId) =>
+              Boolean(userId) &&
+              userId !==
+                String(
+                  ownerId ||
+                  ""
+                ).trim()
+          )
+      )
+    );
+
+  if (!recipientIds.length) {
+    console.log(
+      "[AUTODEAR][LISTING_PRICE_REDUCTION][NO_RECIPIENTS]",
+      {
+        listingId,
+        operationKey,
+      }
+    );
+
+    return {
+      recipients: 0,
+      pushSent: 0,
+    };
+  }
+
+  const notificationTitle =
+    `Цена снижена на ${priceChangePercent}%`;
+
+  const notificationBody =
+    `«${
+      String(
+        title ||
+        "Объявление AUTODEAR"
+      ).trim()
+    }»: ` +
+    `${formatAutodearListingPrice(
+      previousPrice
+    )} → ` +
+    `${formatAutodearListingPrice(
+      nextPrice
+    )}. ` +
+    `Экономия ${formatAutodearListingPrice(
+      priceDropAmount
+    )}.`;
+
+  /*
+   * Внутренние уведомления создаём независимо
+   * от наличия FCM-токена.
+   */
+  const notificationRows =
+    recipientIds.map(
+      (recipientId) => ({
+        recipient_role:
+          "user",
+
+        recipient_id:
+          recipientId,
+
+        title:
+          notificationTitle,
+
+        body:
+          notificationBody,
+
+        type:
+          "listing_price_reduced",
+
+        related_type:
+          "listing",
+
+        related_id:
+          listingId,
+
+        is_read:
+          false,
+      })
+    );
+
+  const {
+    error: notificationError,
+  } =
+    await supabaseServiceRole
+      .from("notifications")
+      .insert(
+        notificationRows
+      );
+
+  if (notificationError) {
+    console.error(
+      "[AUTODEAR][LISTING_PRICE_REDUCTION][NOTIFICATION_INSERT_ERROR]",
+      {
+        listingId,
+        operationKey,
+        code:
+          notificationError.code ||
+          null,
+        message:
+          notificationError.message ||
+          null,
+      }
+    );
+
+    /*
+     * Push всё равно пробуем отправить.
+     * Изменение цены уже состоялось.
+     */
+  }
+
+  const {
+    data: tokenRows,
+    error: tokensError,
+  } =
+    await supabaseServiceRole
+      .from(
+        "device_push_tokens"
+      )
+      .select(
+        "user_id,expo_push_token"
+      )
+      .in(
+        "user_id",
+        recipientIds
+      )
+      .eq(
+        "is_active",
+        true
+      );
+
+  if (tokensError) {
+    throw tokensError;
+  }
+
+  const tokens =
+    Array.from(
+      new Set(
+        (
+          Array.isArray(
+            tokenRows
+          )
+            ? tokenRows
+            : []
+        )
+          .map(
+            (row) =>
+              String(
+                row?.expo_push_token ||
+                ""
+              ).trim()
+          )
+          .filter(Boolean)
+      )
+    );
+
+  let pushSent = 0;
+
+  if (tokens.length) {
+    const pushResult =
+      await sendAutodearListingPriceFcmPush({
+        tokens,
+
+        title:
+          notificationTitle,
+
+        body:
+          notificationBody,
+
+        data: {
+          type:
+            "listing_price_reduced",
+
+          eventType:
+            "listing_price_reduced",
+
+          category:
+            "listing",
+
+          listingId,
+
+          relatedType:
+            "listing",
+
+          relatedId:
+            listingId,
+
+          route:
+            `/listing/${encodeURIComponent(
+              listingId
+            )}`,
+        },
+      });
+
+    pushSent =
+      Number(
+        pushResult?.sent || 0
+      );
+  }
+
+  console.log(
+    "[AUTODEAR][LISTING_PRICE_REDUCTION][NOTIFIED]",
+    {
+      listingId,
+      operationKey,
+      recipients:
+        recipientIds.length,
+      tokens:
+        tokens.length,
+      pushSent,
+    }
+  );
+
+  return {
+    recipients:
+      recipientIds.length,
+    pushSent,
+  };
+}
+
+
+app.post(
+  "/api/listings/:listingId/reduce-price",
+  async (req, res) => {
+    const startedAt =
+      Date.now();
+
+    const authResult =
+      await resolveAuthenticatedUser(
+        req
+      );
+
+    const authUserId =
+      String(
+        authResult?.user?.id ||
+        ""
+      ).trim();
+
+    if (!authUserId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          "LISTING_PRICE_REDUCTION_SERVICE_NOT_CONFIGURED",
+      });
+    }
+
+    const listingId =
+      String(
+        req.params?.listingId ||
+        ""
+      ).trim();
+
+    const nextPrice =
+      Number(
+        req.body?.nextPrice
+      );
+
+    const operationKey =
+      String(
+        req.body?.operationKey ||
+        ""
+      ).trim();
+
+    if (!listingId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "LISTING_ID_REQUIRED",
+      });
+    }
+
+    if (
+      !Number.isFinite(
+        nextPrice
+      ) ||
+      nextPrice <= 0 ||
+      !Number.isInteger(
+        nextPrice
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "INVALID_NEXT_PRICE",
+      });
+    }
+
+    if (
+      !operationKey ||
+      operationKey.length > 220
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "INVALID_OPERATION_KEY",
+      });
+    }
+
+    try {
+      const {
+        data: listing,
+        error: listingError,
+      } =
+        await supabaseServiceRole
+          .from("listings")
+          .select(
+            [
+              "id",
+              "owner_id",
+              "title",
+              "price",
+              "status",
+              "extra_fields",
+              "payload",
+              "updated_at",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            listingId
+          )
+          .maybeSingle();
+
+      if (listingError) {
+        throw listingError;
+      }
+
+      if (!listing) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "LISTING_NOT_FOUND",
+        });
+      }
+
+      const ownerId =
+        String(
+          listing?.owner_id ||
+          listing?.payload
+            ?.ownerId ||
+          ""
+        ).trim();
+
+      if (
+        !ownerId ||
+        ownerId !==
+          authUserId
+      ) {
+        console.warn(
+          "[AUTODEAR][LISTING_PRICE_REDUCTION][OWNER_MISMATCH]",
+          {
+            listingId,
+            authUserId,
+            ownerId,
+          }
+        );
+
+        return res.status(403).json({
+          ok: false,
+          error:
+            "LISTING_OWNER_FORBIDDEN",
+        });
+      }
+
+      if (
+        String(
+          listing?.status ||
+          ""
+        ).toLowerCase() !==
+        "active"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "LISTING_NOT_ACTIVE",
+        });
+      }
+
+      const previousPrice =
+        Math.round(
+          Number(
+            listing?.price ||
+            listing?.payload
+              ?.price ||
+            0
+          )
+        );
+
+      if (
+        !Number.isFinite(
+          previousPrice
+        ) ||
+        previousPrice <= 0
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "LISTING_CURRENT_PRICE_INVALID",
+        });
+      }
+
+      const payload =
+        listing?.payload &&
+        typeof listing.payload ===
+          "object"
+          ? listing.payload
+          : {};
+
+      const rowExtraFields =
+        listing?.extra_fields &&
+        typeof listing
+          .extra_fields ===
+          "object"
+          ? listing.extra_fields
+          : {};
+
+      const payloadExtraFields =
+        payload?.extraFields &&
+        typeof payload
+          .extraFields ===
+          "object"
+          ? payload.extraFields
+          : {};
+
+      const currentExtraFields = {
+        ...rowExtraFields,
+        ...payloadExtraFields,
+      };
+
+      const currentTracking =
+        currentExtraFields
+          ?.priceTracking &&
+        typeof currentExtraFields
+          .priceTracking ===
+          "object"
+          ? currentExtraFields
+              .priceTracking
+          : {};
+
+      /*
+       * Безопасный повтор того же запроса:
+       * цену второй раз не меняем и push
+       * второй раз не запускаем.
+       */
+      if (
+        String(
+          currentTracking
+            ?.lastOperationKey ||
+          ""
+        ) === operationKey &&
+        previousPrice ===
+          nextPrice
+      ) {
+        return res.json({
+          ok: true,
+          duplicate: true,
+          listingId,
+          previousPrice:
+            Number(
+              currentTracking
+                ?.previousPrice ||
+              previousPrice
+            ),
+          price:
+            nextPrice,
+          priceChangePercent:
+            Number(
+              currentTracking
+                ?.priceChangePercent ||
+              0
+            ),
+          priceDropAmount:
+            Math.abs(
+              Number(
+                currentTracking
+                  ?.priceChangeAmount ||
+                0
+              )
+            ),
+        });
+      }
+
+      if (
+        nextPrice >=
+        previousPrice
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "PRICE_MUST_BE_LOWER",
+          currentPrice:
+            previousPrice,
+        });
+      }
+
+      const priceChangeAmount =
+        nextPrice -
+        previousPrice;
+
+      const priceDropAmount =
+        previousPrice -
+        nextPrice;
+
+      const priceChangePercent =
+        Math.max(
+          1,
+          Math.round(
+            (
+              priceDropAmount /
+              previousPrice
+            ) *
+              100
+          )
+        );
+
+      const changedAt =
+        new Date()
+          .toISOString();
+
+      const badgeVisibleUntil =
+        new Date(
+          Date.now() +
+            7 *
+              24 *
+              60 *
+              60 *
+              1000
+        ).toISOString();
+
+      const currentHistory =
+        Array.isArray(
+          currentTracking
+            ?.history
+        )
+          ? currentTracking
+              .history
+          : [];
+
+      const historyEntry = {
+        from:
+          previousPrice,
+        to:
+          nextPrice,
+        amount:
+          priceChangeAmount,
+        percent:
+          priceChangePercent,
+        direction:
+          "down",
+        changedAt,
+        operationKey,
+      };
+
+      const nextTracking = {
+        ...currentTracking,
+
+        previousPrice,
+        currentPrice:
+          nextPrice,
+
+        priceChangeAmount,
+        priceChangePercent,
+
+        direction:
+          "down",
+
+        changedAt,
+        badgeVisibleUntil,
+
+        lastOperationKey:
+          operationKey,
+
+        history: [
+          historyEntry,
+          ...currentHistory,
+        ].slice(
+          0,
+          20
+        ),
+      };
+
+      const nextExtraFields = {
+        ...currentExtraFields,
+
+        priceTracking:
+          nextTracking,
+      };
+
+      const nextPayload = {
+        ...payload,
+
+        price:
+          String(
+            nextPrice
+          ),
+
+        extraFields:
+          nextExtraFields,
+      };
+
+      /*
+       * Оптимистическая защита:
+       * если между SELECT и UPDATE другой запрос
+       * уже изменил цену, этот запрос ничего
+       * не перезаписывает.
+       */
+      const {
+        data: updatedListing,
+        error: updateError,
+      } =
+        await supabaseServiceRole
+          .from("listings")
+          .update({
+            price:
+              nextPrice,
+
+            extra_fields:
+              nextExtraFields,
+
+            payload:
+              nextPayload,
+
+            updated_at:
+              changedAt,
+          })
+          .eq(
+            "id",
+            listingId
+          )
+          .eq(
+            "owner_id",
+            authUserId
+          )
+          .eq(
+            "price",
+            previousPrice
+          )
+          .select(
+            "id,owner_id,title,price,status,extra_fields,payload,updated_at"
+          )
+          .maybeSingle();
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      if (!updatedListing) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "LISTING_PRICE_CONFLICT",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][LISTING_PRICE_REDUCTION][SAVED]",
+        {
+          listingId,
+          ownerId:
+            authUserId,
+          operationKey,
+          previousPrice,
+          nextPrice,
+          priceChangePercent,
+          ms:
+            Date.now() -
+            startedAt,
+        }
+      );
+
+      /*
+       * Цена УЖЕ подтверждена сервером.
+       *
+       * Push и внутренние уведомления не должны
+       * держать продавца на кнопке «Подождите».
+       * Рассылка идёт после подтверждённой записи.
+       */
+      void notifyAutodearListingPriceReduced({
+        listingId,
+
+        ownerId:
+          authUserId,
+
+        title:
+          updatedListing?.title ||
+          listing?.title ||
+          "Объявление AUTODEAR",
+
+        previousPrice,
+        nextPrice,
+        priceDropAmount,
+        priceChangePercent,
+        operationKey,
+      }).catch(
+        (notificationError) => {
+          console.error(
+            "[AUTODEAR][LISTING_PRICE_REDUCTION][NOTIFY_ERROR]",
+            {
+              listingId,
+              operationKey,
+              message:
+                notificationError
+                  ?.message ||
+                String(
+                  notificationError
+                ),
+            }
+          );
+        }
+      );
+
+      return res.json({
+        ok: true,
+        duplicate: false,
+
+        listingId,
+
+        previousPrice,
+
+        price:
+          nextPrice,
+
+        priceDropAmount,
+
+        priceChangePercent,
+
+        changedAt,
+
+        badgeVisibleUntil,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][LISTING_PRICE_REDUCTION][FATAL]",
+        {
+          listingId,
+          operationKey,
+          message:
+            error?.message ||
+            String(error),
+          ms:
+            Date.now() -
+            startedAt,
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "LISTING_PRICE_REDUCTION_FAILED",
+      });
+    }
+  }
+);
+
+
+// ============================================================
 // AUTODEAR ADS — REAL SERVER WALLET
 // Supabase is the source of truth.
 // Client can read the wallet through AUTODEAR API,
