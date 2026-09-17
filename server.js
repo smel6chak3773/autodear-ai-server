@@ -17621,6 +17621,39 @@ app.post(
           : {};
 
       /*
+       * Проверяем, работает ли уже автоснижение.
+       *
+       * Ручное дополнительное снижение больше
+       * не должно автоматически отменять план.
+       */
+      const {
+        data: activePricePlan,
+        error: activePricePlanError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "listing_price_reduction_plans"
+          )
+          .select("*")
+          .eq(
+            "listing_id",
+            listingId
+          )
+          .eq(
+            "owner_id",
+            authUserId
+          )
+          .eq(
+            "status",
+            "active"
+          )
+          .maybeSingle();
+
+      if (activePricePlanError) {
+        throw activePricePlanError;
+      }
+
+      /*
        * Безопасный повтор того же запроса:
        * цену второй раз не меняем и push
        * второй раз не запускаем.
@@ -17652,6 +17685,26 @@ app.post(
                 ?.priceChangePercent ||
               0
             ),
+
+          cumulativeDropPercent:
+            Number(
+              currentTracking
+                ?.cumulativeDropPercent ||
+              currentTracking
+                ?.priceChangePercent ||
+              0
+            ),
+
+          reductionBasePrice:
+            Number(
+              currentTracking
+                ?.reductionBasePrice ||
+              currentTracking
+                ?.gradualPlan
+                ?.startPrice ||
+              previousPrice
+            ),
+
           priceDropAmount:
             Math.abs(
               Number(
@@ -17696,6 +17749,90 @@ app.post(
           )
         );
 
+      const trackingPlanId =
+        String(
+          currentTracking
+            ?.gradualPlan
+            ?.id ||
+          ""
+        ).trim();
+
+      const activePlanId =
+        String(
+          activePricePlan
+            ?.id ||
+          ""
+        ).trim();
+
+      const badgeCycleActive =
+        Boolean(
+          currentTracking
+            ?.badgeVisibleUntil &&
+          Number.isFinite(
+            Date.parse(
+              String(
+                currentTracking
+                  .badgeVisibleUntil
+              )
+            )
+          ) &&
+          Date.parse(
+            String(
+              currentTracking
+                .badgeVisibleUntil
+            )
+          ) >
+            Date.now()
+        );
+
+      const existingCycleBase =
+        Math.round(
+          Number(
+            currentTracking
+              ?.reductionBasePrice ||
+            0
+          )
+        );
+
+      const gradualHumanStartPrice =
+        Math.round(
+          Number(
+            trackingPlanId &&
+            trackingPlanId ===
+              activePlanId
+              ? currentTracking
+                  ?.gradualPlan
+                  ?.startPrice
+              : activePricePlan
+                  ?.start_price ||
+                0
+          )
+        );
+
+      const reductionBasePrice =
+        activePricePlan &&
+        gradualHumanStartPrice > 0
+          ? gradualHumanStartPrice
+          : badgeCycleActive &&
+            existingCycleBase > 0
+            ? existingCycleBase
+            : previousPrice;
+
+      const cumulativeDropPercent =
+        Math.max(
+          1,
+          Math.round(
+            (
+              (
+                reductionBasePrice -
+                nextPrice
+              ) /
+              reductionBasePrice
+            ) *
+              100
+          )
+        );
+
       const changedAt =
         new Date()
           .toISOString();
@@ -17734,6 +17871,83 @@ app.post(
         operationKey,
       };
 
+      const nextGradualPlanTracking =
+        activePricePlan
+          ? {
+              ...(
+                currentTracking
+                  ?.gradualPlan &&
+                typeof currentTracking
+                  .gradualPlan ===
+                  "object"
+                  ? currentTracking
+                      .gradualPlan
+                  : {}
+              ),
+
+              id:
+                activePlanId,
+
+              active:
+                nextPrice >
+                Number(
+                  activePricePlan
+                    ?.target_price ||
+                  0
+                ),
+
+              startPrice:
+                reductionBasePrice,
+
+              targetPrice:
+                Number(
+                  activePricePlan
+                    ?.target_price ||
+                  0
+                ),
+
+              durationDays:
+                Number(
+                  activePricePlan
+                    ?.duration_days ||
+                  0
+                ),
+
+              completedSteps:
+                Number(
+                  activePricePlan
+                    ?.completed_steps ||
+                  0
+                ),
+
+              totalSteps:
+                Number(
+                  activePricePlan
+                    ?.total_steps ||
+                  0
+                ),
+
+              startedAt:
+                activePricePlan
+                  ?.started_at ||
+                null,
+
+              nextRunAt:
+                nextPrice >
+                Number(
+                  activePricePlan
+                    ?.target_price ||
+                  0
+                )
+                  ? activePricePlan
+                      ?.next_run_at ||
+                    null
+                  : null,
+            }
+          : currentTracking
+              ?.gradualPlan ||
+            null;
+
       const nextTracking = {
         ...currentTracking,
 
@@ -17743,6 +17957,16 @@ app.post(
 
         priceChangeAmount,
         priceChangePercent,
+
+        reductionBasePrice,
+        cumulativeDropPercent,
+
+        ...(nextGradualPlanTracking
+          ? {
+              gradualPlan:
+                nextGradualPlanTracking,
+            }
+          : {}),
 
         direction:
           "down",
@@ -17852,30 +18076,275 @@ app.post(
       );
 
       /*
-       * Если раньше был запущен план постепенного
-       * снижения, ручное снижение цены его отменяет.
+       * Ручное дополнительное снижение не отменяет
+       * уже работающий gradual-план.
+       *
+       * Если ручная цена дошла до цели — план
+       * считается завершённым.
+       *
+       * Если цель ещё впереди — математически
+       * перебазируем start_price плана, сохраняя
+       * target_price, completed_steps и расписание.
        */
-      void cancelActiveAutodearListingPricePlan({
-        listingId,
-        ownerId:
-          authUserId,
-        reason:
-          "MANUAL_PRICE_REDUCTION",
-      }).catch(
-        (planCancelError) => {
-          console.error(
-            "[AUTODEAR][LISTING_PRICE_PLAN][CANCEL_AFTER_MANUAL_ERROR]",
+      let pricePlanStillActive =
+        false;
+
+      if (activePricePlan) {
+        const planId =
+          String(
+            activePricePlan
+              ?.id ||
+            ""
+          ).trim();
+
+        const planTargetPrice =
+          Math.round(
+            Number(
+              activePricePlan
+                ?.target_price ||
+              0
+            )
+          );
+
+        const planCompletedSteps =
+          Math.max(
+            0,
+            Math.round(
+              Number(
+                activePricePlan
+                  ?.completed_steps ||
+                0
+              )
+            )
+          );
+
+        const planTotalSteps =
+          Math.max(
+            1,
+            Math.round(
+              Number(
+                activePricePlan
+                  ?.total_steps ||
+                activePricePlan
+                  ?.duration_days ||
+                1
+              )
+            )
+          );
+
+        if (
+          planId &&
+          planTargetPrice > 0 &&
+          nextPrice <=
+            planTargetPrice
+        ) {
+          const {
+            error: completePlanError,
+          } =
+            await supabaseServiceRole
+              .from(
+                "listing_price_reduction_plans"
+              )
+              .update({
+                completed_steps:
+                  planTotalSteps,
+
+                status:
+                  "completed",
+
+                last_run_at:
+                  changedAt,
+
+                next_run_at:
+                  null,
+
+                completed_at:
+                  changedAt,
+
+                updated_at:
+                  changedAt,
+
+                last_error:
+                  null,
+              })
+              .eq(
+                "id",
+                planId
+              )
+              .eq(
+                "status",
+                "active"
+              )
+              .eq(
+                "completed_steps",
+                planCompletedSteps
+              );
+
+          if (completePlanError) {
+            throw completePlanError;
+          }
+
+          pricePlanStillActive =
+            false;
+        } else if (
+          planId &&
+          planTargetPrice > 0 &&
+          planCompletedSteps <
+            planTotalSteps
+        ) {
+          const remainingSteps =
+            planTotalSteps -
+            planCompletedSteps;
+
+          let rebasedStartPrice =
+            planCompletedSteps <= 0
+              ? nextPrice
+              : Math.round(
+                  (
+                    nextPrice *
+                      planTotalSteps -
+                    planTargetPrice *
+                      planCompletedSteps
+                  ) /
+                  remainingSteps
+                );
+
+          /*
+           * Основная формула округляет цену.
+           * Подбираем ближайший start_price,
+           * который даёт текущую ручную цену
+           * точно на completed_steps.
+           */
+          if (
+            planCompletedSteps > 0
+          ) {
+            let exactCandidate =
+              null;
+
+            for (
+              let delta = -20;
+              delta <= 20;
+              delta += 1
+            ) {
+              const candidate =
+                rebasedStartPrice +
+                delta;
+
+              if (
+                candidate <=
+                planTargetPrice
+              ) {
+                continue;
+              }
+
+              const candidatePrice =
+                getAutodearListingPricePlanPrice(
+                  {
+                    ...activePricePlan,
+
+                    start_price:
+                      candidate,
+                  },
+                  planCompletedSteps
+                );
+
+              if (
+                candidatePrice ===
+                nextPrice
+              ) {
+                exactCandidate =
+                  candidate;
+
+                break;
+              }
+            }
+
+            if (
+              exactCandidate !==
+              null
+            ) {
+              rebasedStartPrice =
+                exactCandidate;
+            } else {
+              throw new Error(
+                "PRICE_PLAN_REBASE_ROUNDING_FAILED"
+              );
+            }
+          }
+
+          const {
+            data: rebasedPlan,
+            error: rebasePlanError,
+          } =
+            await supabaseServiceRole
+              .from(
+                "listing_price_reduction_plans"
+              )
+              .update({
+                start_price:
+                  rebasedStartPrice,
+
+                updated_at:
+                  changedAt,
+
+                last_error:
+                  null,
+              })
+              .eq(
+                "id",
+                planId
+              )
+              .eq(
+                "status",
+                "active"
+              )
+              .eq(
+                "completed_steps",
+                planCompletedSteps
+              )
+              .select(
+                "id,status,start_price,target_price,completed_steps,total_steps,next_run_at"
+              )
+              .maybeSingle();
+
+          if (rebasePlanError) {
+            throw rebasePlanError;
+          }
+
+          if (!rebasedPlan) {
+            throw new Error(
+              "PRICE_PLAN_REBASE_CONFLICT"
+            );
+          }
+
+          pricePlanStillActive =
+            true;
+
+          console.log(
+            "[AUTODEAR][LISTING_PRICE_PLAN][REBASED_AFTER_MANUAL]",
             {
+              planId,
               listingId,
-              message:
-                planCancelError?.message ||
-                String(
-                  planCancelError
-                ),
+              previousPrice,
+              nextPrice,
+              humanStartPrice:
+                reductionBasePrice,
+              internalStartPrice:
+                rebasedStartPrice,
+              targetPrice:
+                planTargetPrice,
+              completedSteps:
+                planCompletedSteps,
+              totalSteps:
+                planTotalSteps,
+              nextRunAt:
+                rebasedPlan
+                  ?.next_run_at ||
+                null,
             }
           );
         }
-      );
+      }
 
 
       /*
@@ -17933,6 +18402,13 @@ app.post(
         priceDropAmount,
 
         priceChangePercent,
+
+        cumulativeDropPercent,
+
+        reductionBasePrice,
+
+        pricePlanActive:
+          pricePlanStillActive,
 
         changedAt,
 
@@ -18553,6 +19029,54 @@ async function executeAutodearListingPricePlan(
       )
     );
 
+  const sameTrackedPlan =
+    String(
+      currentTracking
+        ?.gradualPlan
+        ?.id ||
+      ""
+    ) ===
+    planId;
+
+  const trackedHumanStartPrice =
+    Math.round(
+      Number(
+        sameTrackedPlan
+          ? currentTracking
+              ?.gradualPlan
+              ?.startPrice ||
+            currentTracking
+              ?.reductionBasePrice ||
+            0
+          : 0
+      )
+    );
+
+  const reductionBasePrice =
+    trackedHumanStartPrice > 0
+      ? trackedHumanStartPrice
+      : Math.round(
+          Number(
+            plan?.start_price ||
+            currentPrice
+          )
+        );
+
+  const cumulativeDropPercent =
+    Math.max(
+      1,
+      Math.round(
+        (
+          (
+            reductionBasePrice -
+            scheduledNextPrice
+          ) /
+          reductionBasePrice
+        ) *
+          100
+      )
+    );
+
   const badgeVisibleUntil =
     new Date(
       Date.now() +
@@ -18651,6 +19175,10 @@ async function executeAutodearListingPricePlan(
 
     priceChangePercent,
 
+    reductionBasePrice,
+
+    cumulativeDropPercent,
+
     direction:
       "down",
 
@@ -18670,10 +19198,7 @@ async function executeAutodearListingPricePlan(
         !planCompleted,
 
       startPrice:
-        Number(
-          plan?.start_price ||
-          0
-        ),
+        reductionBasePrice,
 
       targetPrice:
         Number(
