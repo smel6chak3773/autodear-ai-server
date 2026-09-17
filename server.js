@@ -18222,17 +18222,55 @@ async function executeAutodearListingPricePlan(
       Date.now()
     ).getTime();
 
-  const elapsedSteps =
+  const durationDays =
     Math.max(
       1,
-      Math.floor(
-        (
-          Date.now() -
-          startedAtMs
-        ) /
-        AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+      Math.round(
+        Number(
+          plan?.duration_days ||
+          totalSteps
+        )
       )
     );
+
+  /*
+   * Новые gradual-планы:
+   *
+   * total_steps = duration_days + 1
+   *
+   * Первый шаг выполняется сразу,
+   * остальные — каждые 24 часа.
+   *
+   * Старые планы сохраняют прежнюю
+   * схему и не меняют поведение.
+   */
+  const immediateFirstStep =
+    totalSteps ===
+    durationDays + 1;
+
+  const elapsedSteps =
+    immediateFirstStep
+      ? Math.max(
+          1,
+          Math.floor(
+            (
+              Date.now() -
+              startedAtMs
+            ) /
+            AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+          ) +
+          1
+        )
+      : Math.max(
+          1,
+          Math.floor(
+            (
+              Date.now() -
+              startedAtMs
+            ) /
+            AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
+          )
+        );
 
   const nextStep =
     Math.min(
@@ -18392,9 +18430,16 @@ async function executeAutodearListingPricePlan(
       new Date(
         startedAtMs +
         (
-          Math.min(
-            totalSteps,
-            nextStep + 1
+          (
+            immediateFirstStep
+              ? Math.min(
+                  durationDays,
+                  nextStep
+                )
+              : Math.min(
+                  totalSteps,
+                  nextStep + 1
+                )
           ) *
           AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
         )
@@ -18578,9 +18623,16 @@ async function executeAutodearListingPricePlan(
     new Date(
       startedAtMs +
       (
-        Math.min(
-          totalSteps,
-          nextStep + 1
+        (
+          immediateFirstStep
+            ? Math.min(
+                durationDays,
+                nextStep
+              )
+            : Math.min(
+                totalSteps,
+                nextStep + 1
+              )
         ) *
         AUTODEAR_LISTING_PRICE_PLAN_DAY_MS
       )
@@ -19410,7 +19462,7 @@ app.post(
           durationDays,
 
         total_steps:
-          durationDays,
+          durationDays + 1,
 
         completed_steps:
           0,
@@ -19454,11 +19506,53 @@ app.post(
         throw insertError;
       }
 
+      /*
+       * Первый фактический шаг выполняется
+       * непосредственно при создании плана.
+       *
+       * next_run_at уже установлен на +24 часа,
+       * поэтому scheduler не конкурирует
+       * с этим немедленным шагом.
+       */
+      await executeAutodearListingPricePlan(
+        insertedPlan
+      );
+
+      const {
+        data: refreshedPlan,
+        error: refreshedPlanError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "listing_price_reduction_plans"
+          )
+          .select("*")
+          .eq(
+            "id",
+            insertedPlan.id
+          )
+          .maybeSingle();
+
+      if (refreshedPlanError) {
+        throw refreshedPlanError;
+      }
+
+      const responsePlan =
+        refreshedPlan ||
+        insertedPlan;
+
       console.log(
         "[AUTODEAR][LISTING_PRICE_PLAN][CREATED]",
         {
           planId:
-            insertedPlan?.id,
+            responsePlan?.id,
+
+          completedSteps:
+            Number(
+              responsePlan
+                ?.completed_steps ||
+              0
+            ),
           listingId,
           ownerId:
             authUserId,
@@ -19478,7 +19572,14 @@ app.post(
           false,
 
         plan:
-          insertedPlan,
+          responsePlan,
+
+        firstStepApplied:
+          Number(
+            responsePlan
+              ?.completed_steps ||
+            0
+          ) >= 1,
 
         estimatedDailyDrop:
           Math.round(
@@ -19486,7 +19587,9 @@ app.post(
               startPrice -
               targetPrice
             ) /
-            durationDays
+            (
+              durationDays + 1
+            )
           ),
       });
     } catch (error) {
