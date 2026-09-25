@@ -1226,6 +1226,905 @@ async function sendAdminListingModerationPush({
 }
 
 
+
+// ADMIN_ACCOUNT_MODERATION_V1
+//
+// Реальная блокировка аккаунта выполняется только сервером.
+// Клиентский roleSwitcher не является источником полномочий.
+//
+// Два уровня:
+// 1. public.profiles.account_status — состояние AUTODEAR;
+// 2. Supabase Auth ban_duration — блокировка авторизации.
+//
+// Бессрочная блокировка AUTODEAR хранится как:
+// account_status = blocked + blocked_until = null.
+// В Supabase Auth ставим технически очень большой срок.
+
+const ADMIN_ACCOUNT_BLOCK_DURATIONS = {
+  "24h": {
+    banDuration: "24h",
+    milliseconds:
+      24 * 60 * 60 * 1000,
+  },
+
+  "7d": {
+    banDuration: "168h",
+    milliseconds:
+      7 * 24 * 60 * 60 * 1000,
+  },
+
+  "30d": {
+    banDuration: "720h",
+    milliseconds:
+      30 * 24 * 60 * 60 * 1000,
+  },
+
+  permanent: {
+    banDuration: "876000h",
+    milliseconds: null,
+  },
+};
+
+
+const ADMIN_ACCOUNT_REASON_CODES =
+  new Set([
+    "fraud_suspicion",
+    "spam",
+    "threats_or_abuse",
+    "suspicious_activity",
+    "rules_violation",
+    "other",
+
+    // Разблокировка.
+    "review_completed",
+    "appeal_accepted",
+    "moderation_mistake",
+  ]);
+
+
+async function resolveAdminAccountProfile(
+  targetId
+) {
+  const targetUuid =
+    adminModerationUuidOrNull(
+      targetId
+    );
+
+  if (!targetUuid) {
+    return {
+      profile: null,
+      error:
+        "ACCOUNT_ID_INVALID",
+    };
+  }
+
+  if (!supabaseServiceRole) {
+    return {
+      profile: null,
+      error:
+        "STAFF_SERVICE_ROLE_NOT_CONFIGURED",
+    };
+  }
+
+  const selectFields = [
+    "id",
+    "auth_user_id",
+    "name",
+    "email",
+    "role",
+    "account_status",
+    "moderation_reason",
+    "blocked_at",
+    "blocked_until",
+    "blocked_by_auth_user_id",
+    "moderation_updated_at",
+  ].join(",");
+
+  let {
+    data: profile,
+    error,
+  } =
+    await supabaseServiceRole
+      .from("profiles")
+      .select(selectFields)
+      .eq(
+        "auth_user_id",
+        targetUuid
+      )
+      .limit(1)
+      .maybeSingle();
+
+  if (error) {
+    return {
+      profile: null,
+      error:
+        "ACCOUNT_PROFILE_LOAD_FAILED",
+      details:
+        error.message || null,
+    };
+  }
+
+  if (!profile) {
+    const result =
+      await supabaseServiceRole
+        .from("profiles")
+        .select(selectFields)
+        .eq(
+          "id",
+          targetUuid
+        )
+        .limit(1)
+        .maybeSingle();
+
+    profile =
+      result.data || null;
+
+    error =
+      result.error || null;
+
+    if (error) {
+      return {
+        profile: null,
+        error:
+          "ACCOUNT_PROFILE_LOAD_FAILED",
+        details:
+          error.message || null,
+      };
+    }
+  }
+
+  if (!profile) {
+    return {
+      profile: null,
+      error:
+        "ACCOUNT_PROFILE_NOT_FOUND",
+    };
+  }
+
+  const authUserId =
+    adminModerationUuidOrNull(
+      profile.auth_user_id
+    );
+
+  if (!authUserId) {
+    return {
+      profile: null,
+      error:
+        "ACCOUNT_AUTH_USER_NOT_RESOLVED",
+    };
+  }
+
+  return {
+    profile: {
+      ...profile,
+      auth_user_id:
+        authUserId,
+    },
+    error: null,
+  };
+}
+
+
+app.get(
+  "/api/admin/moderation/accounts/:targetId",
+  async (req, res) => {
+    const access =
+      await resolveStaffAccess(
+        req,
+        "admin"
+      );
+
+    if (!access.ok) {
+      return res
+        .status(
+          access.status || 403
+        )
+        .json({
+          ok: false,
+          error:
+            access.error ||
+            "STAFF_ACCESS_DENIED",
+        });
+    }
+
+    const targetId =
+      String(
+        req.params?.targetId ||
+          ""
+      ).trim();
+
+    const resolved =
+      await resolveAdminAccountProfile(
+        targetId
+      );
+
+    if (!resolved.profile) {
+      const notFound =
+        resolved.error ===
+        "ACCOUNT_PROFILE_NOT_FOUND";
+
+      return res
+        .status(
+          notFound
+            ? 404
+            : 400
+        )
+        .json({
+          ok: false,
+          error:
+            resolved.error ||
+            "ACCOUNT_NOT_RESOLVED",
+        });
+    }
+
+    const profile =
+      resolved.profile;
+
+    return res.json({
+      ok: true,
+
+      account: {
+        profileId:
+          profile.id,
+
+        authUserId:
+          profile.auth_user_id,
+
+        name:
+          profile.name || "",
+
+        email:
+          profile.email || "",
+
+        role:
+          profile.role || "user",
+
+        status:
+          profile.account_status ||
+          "active",
+
+        moderationReason:
+          profile.moderation_reason ||
+          "",
+
+        blockedAt:
+          profile.blocked_at ||
+          null,
+
+        blockedUntil:
+          profile.blocked_until ||
+          null,
+      },
+    });
+  }
+);
+
+
+app.post(
+  "/api/admin/moderation/accounts/:targetId/action",
+  async (req, res) => {
+    const targetId =
+      String(
+        req.params?.targetId ||
+          ""
+      ).trim();
+
+    const action =
+      String(
+        req.body?.action ||
+          ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const duration =
+      String(
+        req.body?.duration ||
+          ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const reasonCode =
+      String(
+        req.body?.reasonCode ||
+          ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const reasonText =
+      String(
+        req.body?.reasonText ||
+          ""
+      ).trim();
+
+    const complaintId =
+      String(
+        req.body?.complaintId ||
+          ""
+      ).trim();
+
+    if (
+      action !== "block" &&
+      action !== "unblock"
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_ACCOUNT_ACTION_INVALID",
+        });
+    }
+
+    const durationConfig =
+      action === "block"
+        ? ADMIN_ACCOUNT_BLOCK_DURATIONS[
+            duration
+          ]
+        : null;
+
+    if (
+      action === "block" &&
+      !durationConfig
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_ACCOUNT_DURATION_INVALID",
+        });
+    }
+
+    if (
+      !ADMIN_ACCOUNT_REASON_CODES
+        .has(reasonCode)
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "MODERATION_REASON_CODE_INVALID",
+        });
+    }
+
+    if (
+      reasonText.length < 3 ||
+      reasonText.length > 1000
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "MODERATION_REASON_REQUIRED",
+        });
+    }
+
+    const access =
+      await resolveStaffAccess(
+        req,
+        "admin"
+      );
+
+    if (!access.ok) {
+      return res
+        .status(
+          access.status || 403
+        )
+        .json({
+          ok: false,
+          error:
+            access.error ||
+            "STAFF_ACCESS_DENIED",
+        });
+    }
+
+    if (!supabaseServiceRole) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+    }
+
+    const actorAuthUserId =
+      adminModerationUuidOrNull(
+        access.actor
+          ?.authUserId
+      );
+
+    if (!actorAuthUserId) {
+      return res
+        .status(403)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_ACTOR_NOT_RESOLVED",
+        });
+    }
+
+    const resolved =
+      await resolveAdminAccountProfile(
+        targetId
+      );
+
+    if (!resolved.profile) {
+      const notFound =
+        resolved.error ===
+        "ACCOUNT_PROFILE_NOT_FOUND";
+
+      return res
+        .status(
+          notFound
+            ? 404
+            : 400
+        )
+        .json({
+          ok: false,
+          error:
+            resolved.error ||
+            "ACCOUNT_NOT_RESOLVED",
+        });
+    }
+
+    const profile =
+      resolved.profile;
+
+    const targetAuthUserId =
+      profile.auth_user_id;
+
+    if (
+      targetAuthUserId ===
+      actorAuthUserId
+    ) {
+      return res
+        .status(409)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_SELF_BLOCK_FORBIDDEN",
+        });
+    }
+
+    const {
+      data: targetStaff,
+      error: targetStaffError,
+    } =
+      await supabaseServiceRole
+        .from("staff_accounts")
+        .select(
+          "auth_user_id,is_active,roles"
+        )
+        .eq(
+          "auth_user_id",
+          targetAuthUserId
+        )
+        .eq(
+          "is_active",
+          true
+        )
+        .maybeSingle();
+
+    if (targetStaffError) {
+      console.error(
+        "[AUTODEAR][ADMIN][ACCOUNT_STAFF_CHECK_FAILED]",
+        {
+          targetAuthUserId,
+          message:
+            targetStaffError.message ||
+            null,
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "ACCOUNT_STAFF_CHECK_FAILED",
+        });
+    }
+
+    if (targetStaff) {
+      return res
+        .status(409)
+        .json({
+          ok: false,
+          error:
+            "STAFF_ACCOUNT_BLOCK_FORBIDDEN",
+        });
+    }
+
+    const {
+      data: authLookup,
+      error: authLookupError,
+    } =
+      await supabaseServiceRole
+        .auth
+        .admin
+        .getUserById(
+          targetAuthUserId
+        );
+
+    if (
+      authLookupError ||
+      !authLookup?.user
+    ) {
+      return res
+        .status(404)
+        .json({
+          ok: false,
+          error:
+            "AUTH_USER_NOT_FOUND",
+        });
+    }
+
+    const now =
+      new Date();
+
+    const nowIso =
+      now.toISOString();
+
+    const blockedUntil =
+      action === "block" &&
+      durationConfig
+        ?.milliseconds != null
+        ? new Date(
+            now.getTime() +
+              durationConfig
+                .milliseconds
+          ).toISOString()
+        : null;
+
+    const previousProfileState = {
+      account_status:
+        profile.account_status ||
+        "active",
+
+      moderation_reason:
+        profile.moderation_reason ||
+        null,
+
+      blocked_at:
+        profile.blocked_at ||
+        null,
+
+      blocked_until:
+        profile.blocked_until ||
+        null,
+
+      blocked_by_auth_user_id:
+        profile
+          .blocked_by_auth_user_id ||
+        null,
+
+      moderation_updated_at:
+        profile
+          .moderation_updated_at ||
+        null,
+    };
+
+    const nextProfileState =
+      action === "block"
+        ? {
+            account_status:
+              "blocked",
+
+            moderation_reason:
+              reasonText,
+
+            blocked_at:
+              nowIso,
+
+            blocked_until:
+              blockedUntil,
+
+            blocked_by_auth_user_id:
+              actorAuthUserId,
+
+            moderation_updated_at:
+              nowIso,
+          }
+        : {
+            account_status:
+              "active",
+
+            moderation_reason:
+              reasonText,
+
+            blocked_at:
+              null,
+
+            blocked_until:
+              null,
+
+            blocked_by_auth_user_id:
+              null,
+
+            moderation_updated_at:
+              nowIso,
+          };
+
+    const {
+      data: updatedProfile,
+      error: profileUpdateError,
+    } =
+      await supabaseServiceRole
+        .from("profiles")
+        .update(
+          nextProfileState
+        )
+        .eq(
+          "id",
+          profile.id
+        )
+        .select(
+          [
+            "id",
+            "auth_user_id",
+            "name",
+            "email",
+            "role",
+            "account_status",
+            "moderation_reason",
+            "blocked_at",
+            "blocked_until",
+            "blocked_by_auth_user_id",
+            "moderation_updated_at",
+          ].join(",")
+        )
+        .single();
+
+    if (profileUpdateError) {
+      console.error(
+        "[AUTODEAR][ADMIN][ACCOUNT_PROFILE_UPDATE_FAILED]",
+        {
+          targetAuthUserId,
+          action,
+          message:
+            profileUpdateError
+              .message ||
+            null,
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "ACCOUNT_PROFILE_UPDATE_FAILED",
+        });
+    }
+
+    const authBanDuration =
+      action === "block"
+        ? durationConfig
+            .banDuration
+        : "none";
+
+    const {
+      data: authUpdated,
+      error: authUpdateError,
+    } =
+      await supabaseServiceRole
+        .auth
+        .admin
+        .updateUserById(
+          targetAuthUserId,
+          {
+            ban_duration:
+              authBanDuration,
+          }
+        );
+
+    if (authUpdateError) {
+      const {
+        error: rollbackError,
+      } =
+        await supabaseServiceRole
+          .from("profiles")
+          .update(
+            previousProfileState
+          )
+          .eq(
+            "id",
+            profile.id
+          );
+
+      if (rollbackError) {
+        console.error(
+          "[AUTODEAR][ADMIN][ACCOUNT_PROFILE_ROLLBACK_FAILED]",
+          {
+            targetAuthUserId,
+            action,
+            message:
+              rollbackError.message ||
+              null,
+          }
+        );
+      }
+
+      console.error(
+        "[AUTODEAR][ADMIN][ACCOUNT_AUTH_UPDATE_FAILED]",
+        {
+          targetAuthUserId,
+          action,
+          message:
+            authUpdateError.message ||
+            null,
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "ACCOUNT_AUTH_UPDATE_FAILED",
+        });
+    }
+
+    const warnings = [];
+
+    const {
+      error: auditError,
+    } =
+      await supabaseServiceRole
+        .from(
+          "moderation_actions"
+        )
+        .insert({
+          actor_auth_user_id:
+            actorAuthUserId,
+
+          actor_role:
+            "admin",
+
+          action_type:
+            action === "block"
+              ? "account_block"
+              : "account_unblock",
+
+          target_type:
+            "account",
+
+          target_id:
+            targetAuthUserId,
+
+          target_owner_auth_user_id:
+            targetAuthUserId,
+
+          reason_code:
+            reasonCode,
+
+          reason_text:
+            reasonText,
+
+          metadata: {
+            complaintId:
+              complaintId ||
+              null,
+
+            requestedTargetId:
+              targetId,
+
+            profileId:
+              profile.id,
+
+            duration:
+              action === "block"
+                ? duration
+                : null,
+
+            blockedUntil,
+          },
+        });
+
+    if (auditError) {
+      warnings.push(
+        "AUDIT_LOG_FAILED"
+      );
+
+      console.error(
+        "[AUTODEAR][ADMIN][ACCOUNT_AUDIT_FAILED]",
+        {
+          targetAuthUserId,
+          action,
+          message:
+            auditError.message ||
+            null,
+        }
+      );
+    }
+
+    console.log(
+      "[AUTODEAR][ADMIN][ACCOUNT_MODERATED]",
+      {
+        targetAuthUserId,
+        action,
+        duration:
+          action === "block"
+            ? duration
+            : null,
+        actorAuthUserId,
+        complaintId:
+          complaintId || null,
+      }
+    );
+
+    return res.json({
+      ok: true,
+
+      account: {
+        profileId:
+          updatedProfile.id,
+
+        authUserId:
+          targetAuthUserId,
+
+        name:
+          updatedProfile.name ||
+          "",
+
+        status:
+          updatedProfile
+            .account_status ||
+          (
+            action === "block"
+              ? "blocked"
+              : "active"
+          ),
+
+        moderationReason:
+          updatedProfile
+            .moderation_reason ||
+          "",
+
+        blockedAt:
+          updatedProfile
+            .blocked_at ||
+          null,
+
+        blockedUntil:
+          updatedProfile
+            .blocked_until ||
+          null,
+
+        authBannedUntil:
+          authUpdated
+            ?.user
+            ?.banned_until ||
+          null,
+      },
+
+      moderation: {
+        action,
+
+        duration:
+          action === "block"
+            ? duration
+            : null,
+
+        reasonCode,
+        reasonText,
+        actorAuthUserId,
+        moderatedAt:
+          nowIso,
+      },
+
+      warnings,
+    });
+  }
+);
+
+
 app.post(
   "/api/admin/moderation/listings/:listingId/action",
   async (req, res) => {
