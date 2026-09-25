@@ -656,6 +656,1215 @@ async function resolveAuthenticatedUser(req) {
   }
 }
 
+// ADMIN_STAFF_AUTH_V1
+//
+// Все опасные административные операции AUTODEAR
+// должны проходить через реальный Supabase Auth token.
+//
+// Клиентский roleSwitcherStore НЕ является источником
+// полномочий и здесь намеренно не используется.
+//
+async function resolveStaffAccess(
+  req,
+  requiredRole = "admin"
+) {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const authUser =
+    authResult?.user || null;
+
+  const authUserId =
+    String(
+      authUser?.id || ""
+    ).trim();
+
+  if (!authUserId) {
+    return {
+      ok: false,
+      status: 401,
+      error:
+        authResult?.error ||
+        "AUTH_REQUIRED",
+    };
+  }
+
+  /*
+   * staff_accounts доступен только service_role.
+   * Не разрешаем административному API молча
+   * работать через anon key.
+   */
+  const serviceRoleKey =
+    String(
+      process.env
+        .SUPABASE_SERVICE_ROLE_KEY ||
+      ""
+    ).trim();
+
+  if (
+    !supabase ||
+    !serviceRoleKey
+  ) {
+    console.error(
+      "[AUTODEAR][ADMIN][SERVICE_ROLE_MISSING]",
+      {
+        authUserId,
+        hasSupabase:
+          Boolean(supabase),
+        hasServiceRole:
+          Boolean(serviceRoleKey),
+      }
+    );
+
+    return {
+      ok: false,
+      status: 500,
+      error:
+        "STAFF_SERVICE_ROLE_NOT_CONFIGURED",
+    };
+  }
+
+  const {
+    data: staff,
+    error: staffError,
+  } =
+    await supabase
+      .from("staff_accounts")
+      .select(
+        [
+          "auth_user_id",
+          "email",
+          "roles",
+          "is_active",
+        ].join(",")
+      )
+      .eq(
+        "auth_user_id",
+        authUserId
+      )
+      .maybeSingle();
+
+  if (staffError) {
+    console.error(
+      "[AUTODEAR][ADMIN][STAFF_LOOKUP_ERROR]",
+      {
+        authUserId,
+        code:
+          staffError.code || null,
+        message:
+          staffError.message || null,
+      }
+    );
+
+    return {
+      ok: false,
+      status: 500,
+      error:
+        "STAFF_LOOKUP_FAILED",
+    };
+  }
+
+  if (
+    !staff ||
+    staff.is_active !== true
+  ) {
+    console.warn(
+      "[AUTODEAR][ADMIN][ACCESS_DENIED]",
+      {
+        authUserId,
+        reason:
+          !staff
+            ? "STAFF_NOT_FOUND"
+            : "STAFF_DISABLED",
+      }
+    );
+
+    return {
+      ok: false,
+      status: 403,
+      error:
+        !staff
+          ? "STAFF_ACCESS_REQUIRED"
+          : "STAFF_ACCOUNT_DISABLED",
+    };
+  }
+
+  const roles =
+    Array.isArray(
+      staff.roles
+    )
+      ? staff.roles
+          .map(
+            (role) =>
+              String(
+                role || ""
+              )
+                .trim()
+                .toLowerCase()
+          )
+          .filter(Boolean)
+      : [];
+
+  const normalizedRequiredRole =
+    String(
+      requiredRole || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (
+    normalizedRequiredRole &&
+    !roles.includes(
+      normalizedRequiredRole
+    )
+  ) {
+    console.warn(
+      "[AUTODEAR][ADMIN][ROLE_DENIED]",
+      {
+        authUserId,
+        requiredRole:
+          normalizedRequiredRole,
+        roles,
+      }
+    );
+
+    return {
+      ok: false,
+      status: 403,
+      error:
+        "STAFF_ROLE_REQUIRED",
+    };
+  }
+
+  return {
+    ok: true,
+    status: 200,
+
+    actor: {
+      authUserId,
+      email:
+        String(
+          staff.email ||
+          authUser?.email ||
+          ""
+        ).trim(),
+      roles,
+    },
+  };
+}
+
+
+/*
+ * Безопасная read-only проверка служебной сессии.
+ *
+ * Нужна прежде чем подключать реальные операции
+ * блокировки объявлений и аккаунтов.
+ */
+app.get(
+  "/api/admin/me",
+  async (req, res) => {
+    try {
+      const access =
+        await resolveStaffAccess(
+          req,
+          "admin"
+        );
+
+      if (!access.ok) {
+        return res
+          .status(
+            access.status || 403
+          )
+          .json({
+            ok: false,
+            error:
+              access.error ||
+              "STAFF_ACCESS_DENIED",
+          });
+      }
+
+      return res.json({
+        ok: true,
+
+        staff: {
+          authUserId:
+            access.actor.authUserId,
+
+          email:
+            access.actor.email,
+
+          roles:
+            access.actor.roles,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][ADMIN][ME_ERROR]",
+        {
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_SESSION_CHECK_FAILED",
+        });
+    }
+  }
+);
+
+// ADMIN_LISTING_MODERATION_V1
+
+const ADMIN_LISTING_ACTIONS = {
+  request_changes: {
+    status: "action_required",
+    moderationAction:
+      "request_changes",
+    title:
+      "Объявление требует исправления",
+  },
+
+  block: {
+    status: "rejected",
+    moderationAction:
+      "blocked",
+    title:
+      "Объявление заблокировано",
+  },
+
+  remove: {
+    status: "archive",
+    moderationAction:
+      "removed",
+    title:
+      "Объявление снято с публикации",
+  },
+};
+
+const ADMIN_LISTING_REASON_CODES =
+  new Set([
+    "fraud_suspicion",
+    "false_information",
+    "duplicate",
+    "wrong_category",
+    "prohibited",
+    "incorrect_price",
+    "rules_violation",
+    "other",
+  ]);
+
+
+function adminModerationUuidOrNull(
+  value
+) {
+  const normalized =
+    String(
+      value || ""
+    ).trim();
+
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      normalized
+    )
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
+
+async function resolveAdminListingOwner(
+  ownerId
+) {
+  const normalizedOwnerId =
+    String(
+      ownerId || ""
+    ).trim();
+
+  if (!normalizedOwnerId) {
+    return {
+      ownerId: "",
+      authUserId: null,
+      email: "",
+    };
+  }
+
+  const ownerUuid =
+    adminModerationUuidOrNull(
+      normalizedOwnerId
+    );
+
+  if (
+    !ownerUuid ||
+    !supabase
+  ) {
+    return {
+      ownerId:
+        normalizedOwnerId,
+      authUserId:
+        ownerUuid,
+      email: "",
+    };
+  }
+
+  try {
+    const {
+      data: profile,
+      error,
+    } =
+      await supabase
+        .from("profiles")
+        .select(
+          "id,auth_user_id,email"
+        )
+        .or(
+          [
+            `auth_user_id.eq.${ownerUuid}`,
+            `id.eq.${ownerUuid}`,
+          ].join(",")
+        )
+        .limit(1)
+        .maybeSingle();
+
+    if (error) {
+      console.warn(
+        "[AUTODEAR][ADMIN][LISTING_OWNER_PROFILE_LOOKUP]",
+        {
+          ownerId:
+            normalizedOwnerId,
+          code:
+            error.code || null,
+          message:
+            error.message || null,
+        }
+      );
+    }
+
+    return {
+      ownerId:
+        normalizedOwnerId,
+
+      authUserId:
+        adminModerationUuidOrNull(
+          profile?.auth_user_id
+        ) ||
+        ownerUuid,
+
+      email:
+        String(
+          profile?.email || ""
+        ).trim(),
+    };
+  } catch (error) {
+    console.warn(
+      "[AUTODEAR][ADMIN][LISTING_OWNER_PROFILE_FATAL]",
+      {
+        ownerId:
+          normalizedOwnerId,
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return {
+      ownerId:
+        normalizedOwnerId,
+      authUserId:
+        ownerUuid,
+      email: "",
+    };
+  }
+}
+
+
+async function sendAdminListingModerationPush({
+  ownerAuthUserId,
+  ownerEmail,
+  listingId,
+  title,
+  body,
+}) {
+  const authId =
+    String(
+      ownerAuthUserId || ""
+    ).trim();
+
+  const email =
+    String(
+      ownerEmail || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (
+    !supabase ||
+    (!authId && !email)
+  ) {
+    return {
+      ok: true,
+      sent: 0,
+      reason:
+        "RECIPIENT_NOT_RESOLVED",
+    };
+  }
+
+  let query =
+    supabase
+      .from(
+        "device_push_tokens"
+      )
+      .select(
+        [
+          "expo_push_token",
+          "user_id",
+          "user_email",
+        ].join(",")
+      )
+      .eq(
+        "is_active",
+        true
+      );
+
+  if (
+    authId &&
+    email
+  ) {
+    query =
+      query.or(
+        `user_id.eq.${authId},user_email.eq.${email}`
+      );
+  } else if (authId) {
+    query =
+      query.eq(
+        "user_id",
+        authId
+      );
+  } else {
+    query =
+      query.eq(
+        "user_email",
+        email
+      );
+  }
+
+  const {
+    data: rows,
+    error,
+  } =
+    await query;
+
+  if (error) {
+    throw error;
+  }
+
+  const tokens =
+    Array.from(
+      new Set(
+        (
+          Array.isArray(rows)
+            ? rows
+            : []
+        )
+          .map(
+            (row) =>
+              String(
+                row?.expo_push_token ||
+                ""
+              ).trim()
+          )
+          .filter(Boolean)
+      )
+    );
+
+  if (!tokens.length) {
+    return {
+      ok: true,
+      sent: 0,
+      reason:
+        "NO_PUSH_TOKENS",
+    };
+  }
+
+  return sendAutodearExpoPush({
+    tokens,
+
+    title,
+
+    body,
+
+    data: {
+      type:
+        "listing_moderation",
+
+      eventType:
+        "listing_moderation",
+
+      category:
+        "listing",
+
+      listingId,
+
+      relatedType:
+        "listing",
+
+      relatedId:
+        listingId,
+
+      route:
+        `/listing/${encodeURIComponent(
+          listingId
+        )}`,
+    },
+  });
+}
+
+
+app.post(
+  "/api/admin/moderation/listings/:listingId/action",
+  async (req, res) => {
+    const listingId =
+      String(
+        req.params?.listingId ||
+        ""
+      ).trim();
+
+    const action =
+      String(
+        req.body?.action ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const reasonCode =
+      String(
+        req.body?.reasonCode ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const reasonText =
+      String(
+        req.body?.reasonText ||
+        ""
+      ).trim();
+
+    const complaintId =
+      String(
+        req.body?.complaintId ||
+        ""
+      ).trim();
+
+    if (!listingId) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "LISTING_ID_REQUIRED",
+        });
+    }
+
+    const actionConfig =
+      ADMIN_LISTING_ACTIONS[
+        action
+      ];
+
+    if (!actionConfig) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_LISTING_ACTION_INVALID",
+        });
+    }
+
+    if (
+      !ADMIN_LISTING_REASON_CODES
+        .has(reasonCode)
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "MODERATION_REASON_CODE_INVALID",
+        });
+    }
+
+    if (
+      reasonText.length < 3
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "MODERATION_REASON_REQUIRED",
+        });
+    }
+
+    const access =
+      await resolveStaffAccess(
+        req,
+        "admin"
+      );
+
+    if (!access.ok) {
+      return res
+        .status(
+          access.status || 403
+        )
+        .json({
+          ok: false,
+          error:
+            access.error ||
+            "STAFF_ACCESS_DENIED",
+        });
+    }
+
+    if (!supabase) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+    }
+
+    const actorAuthUserId =
+      String(
+        access.actor
+          ?.authUserId ||
+        ""
+      ).trim();
+
+    const nowIso =
+      new Date()
+        .toISOString();
+
+    try {
+      const {
+        data: listing,
+        error:
+          listingError,
+      } =
+        await supabase
+          .from("listings")
+          .select(
+            [
+              "id",
+              "owner_id",
+              "title",
+              "status",
+              "payload",
+              "moderation_action",
+              "moderation_reason",
+              "moderated_at",
+              "moderated_by_auth_user_id",
+              "removed_at",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            listingId
+          )
+          .maybeSingle();
+
+      if (listingError) {
+        console.error(
+          "[AUTODEAR][ADMIN][LISTING_LOAD_ERROR]",
+          {
+            listingId,
+            code:
+              listingError.code ||
+              null,
+            message:
+              listingError.message ||
+              null,
+          }
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "ADMIN_LISTING_LOAD_FAILED",
+          });
+      }
+
+      if (!listing) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "LISTING_NOT_FOUND",
+          });
+      }
+
+      const owner =
+        await resolveAdminListingOwner(
+          listing.owner_id
+        );
+
+      const oldPayload =
+        listing.payload &&
+        typeof listing.payload ===
+          "object" &&
+        !Array.isArray(
+          listing.payload
+        )
+          ? listing.payload
+          : {};
+
+      const nextPayload = {
+        ...oldPayload,
+
+        status:
+          actionConfig.status,
+
+        moderationRejectReason:
+          reasonText,
+
+        moderationAction:
+          actionConfig
+            .moderationAction,
+
+        moderatedAt:
+          nowIso,
+      };
+
+      if (
+        action === "remove"
+      ) {
+        nextPayload.removedAt =
+          nowIso;
+      } else {
+        delete nextPayload.removedAt;
+      }
+
+      const listingPatch = {
+        status:
+          actionConfig.status,
+
+        moderation_action:
+          actionConfig
+            .moderationAction,
+
+        moderation_reason:
+          reasonText,
+
+        moderated_at:
+          nowIso,
+
+        moderated_by_auth_user_id:
+          actorAuthUserId,
+
+        removed_at:
+          action === "remove"
+            ? nowIso
+            : null,
+
+        payload:
+          nextPayload,
+      };
+
+      const {
+        data: updated,
+        error:
+          updateError,
+      } =
+        await supabase
+          .from("listings")
+          .update(
+            listingPatch
+          )
+          .eq(
+            "id",
+            listingId
+          )
+          .select(
+            [
+              "id",
+              "owner_id",
+              "status",
+              "moderation_action",
+              "moderation_reason",
+              "moderated_at",
+              "removed_at",
+            ].join(",")
+          )
+          .maybeSingle();
+
+      if (updateError) {
+        console.error(
+          "[AUTODEAR][ADMIN][LISTING_UPDATE_ERROR]",
+          {
+            listingId,
+            action,
+            code:
+              updateError.code ||
+              null,
+            message:
+              updateError.message ||
+              null,
+          }
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "ADMIN_LISTING_UPDATE_FAILED",
+          });
+      }
+
+      if (!updated) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "LISTING_NOT_FOUND_AFTER_UPDATE",
+          });
+      }
+
+      const auditRow = {
+        actor_auth_user_id:
+          actorAuthUserId,
+
+        actor_role:
+          "admin",
+
+        action_type:
+          actionConfig
+            .moderationAction,
+
+        target_type:
+          "listing",
+
+        target_id:
+          listingId,
+
+        target_owner_auth_user_id:
+          owner.authUserId,
+
+        reason_code:
+          reasonCode,
+
+        reason_text:
+          reasonText,
+
+        metadata: {
+          complaintId:
+            complaintId ||
+            null,
+
+          listingTitle:
+            String(
+              listing.title ||
+              oldPayload?.title ||
+              ""
+            ).trim() ||
+            null,
+
+          previousStatus:
+            listing.status ||
+            null,
+
+          nextStatus:
+            actionConfig.status,
+        },
+      };
+
+      const {
+        error:
+          auditError,
+      } =
+        await supabase
+          .from(
+            "moderation_actions"
+          )
+          .insert(
+            auditRow
+          );
+
+      if (auditError) {
+        console.error(
+          "[AUTODEAR][ADMIN][AUDIT_INSERT_ERROR]",
+          {
+            listingId,
+            action,
+            code:
+              auditError.code ||
+              null,
+            message:
+              auditError.message ||
+              null,
+          }
+        );
+
+        const {
+          error:
+            rollbackError,
+        } =
+          await supabase
+            .from("listings")
+            .update({
+              status:
+                listing.status,
+
+              payload:
+                listing.payload,
+
+              moderation_action:
+                listing
+                  .moderation_action,
+
+              moderation_reason:
+                listing
+                  .moderation_reason,
+
+              moderated_at:
+                listing
+                  .moderated_at,
+
+              moderated_by_auth_user_id:
+                listing
+                  .moderated_by_auth_user_id,
+
+              removed_at:
+                listing
+                  .removed_at,
+            })
+            .eq(
+              "id",
+              listingId
+            );
+
+        if (rollbackError) {
+          console.error(
+            "[AUTODEAR][ADMIN][AUDIT_ROLLBACK_CRITICAL]",
+            {
+              listingId,
+              code:
+                rollbackError.code ||
+                null,
+              message:
+                rollbackError.message ||
+                null,
+            }
+          );
+        }
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "MODERATION_AUDIT_FAILED",
+            rolledBack:
+              !rollbackError,
+          });
+      }
+
+      const notificationTitle =
+        actionConfig.title;
+
+      const notificationBody =
+        `Причина: ${reasonText}`;
+
+      let notificationCreated =
+        false;
+
+      let pushSent = 0;
+
+      const warnings = [];
+
+      const recipientId =
+        String(
+          owner.authUserId ||
+          owner.ownerId ||
+          ""
+        ).trim();
+
+      if (recipientId) {
+        const {
+          error:
+            notificationError,
+        } =
+          await supabase
+            .from(
+              "notifications"
+            )
+            .insert({
+              recipient_role:
+                "user",
+
+              recipient_id:
+                recipientId,
+
+              title:
+                notificationTitle,
+
+              body:
+                notificationBody,
+
+              type:
+                "listing_moderation",
+
+              related_type:
+                "listing",
+
+              related_id:
+                listingId,
+            });
+
+        if (
+          notificationError
+        ) {
+          console.warn(
+            "[AUTODEAR][ADMIN][LISTING_NOTIFICATION_ERROR]",
+            {
+              listingId,
+              recipientId,
+              code:
+                notificationError
+                  .code ||
+                null,
+              message:
+                notificationError
+                  .message ||
+                null,
+            }
+          );
+
+          warnings.push(
+            "NOTIFICATION_CREATE_FAILED"
+          );
+        } else {
+          notificationCreated =
+            true;
+        }
+
+        try {
+          const pushResult =
+            await sendAdminListingModerationPush({
+              ownerAuthUserId:
+                owner.authUserId,
+
+              ownerEmail:
+                owner.email,
+
+              listingId,
+
+              title:
+                notificationTitle,
+
+              body:
+                notificationBody,
+            });
+
+          pushSent =
+            Number(
+              pushResult?.sent ||
+              0
+            );
+        } catch (pushError) {
+          console.warn(
+            "[AUTODEAR][ADMIN][LISTING_PUSH_ERROR]",
+            {
+              listingId,
+              recipientId,
+              message:
+                pushError?.message ||
+                String(
+                  pushError
+                ),
+            }
+          );
+
+          warnings.push(
+            "PUSH_SEND_FAILED"
+          );
+        }
+      } else {
+        warnings.push(
+          "LISTING_OWNER_RECIPIENT_NOT_RESOLVED"
+        );
+      }
+
+      console.log(
+        "[AUTODEAR][ADMIN][LISTING_MODERATED]",
+        {
+          listingId,
+          action,
+          reasonCode,
+          actorAuthUserId,
+          ownerAuthUserId:
+            owner.authUserId,
+          notificationCreated,
+          pushSent,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        listing: updated,
+
+        moderation: {
+          action,
+          reasonCode,
+          reasonText,
+          actorAuthUserId,
+          moderatedAt:
+            nowIso,
+        },
+
+        delivery: {
+          notificationCreated,
+          pushSent,
+        },
+
+        warnings,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][ADMIN][LISTING_MODERATION_FATAL]",
+        {
+          listingId,
+          action,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "ADMIN_LISTING_MODERATION_FAILED",
+        });
+    }
+  }
+);
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
