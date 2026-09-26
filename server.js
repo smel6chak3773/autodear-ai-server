@@ -24752,6 +24752,407 @@ app.post(
   }
 );
 
+/*
+ * Delete an AUTODEAR staff-created listing
+ * only while it is still completely unclaimed.
+ *
+ * This route must never become a generic station delete.
+ */
+app.delete(
+  "/api/business-directory/staff/listings/:stationId",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      await requireBusinessDirectoryStaffUser(
+        req
+      );
+
+      const stationId =
+        String(
+          req.params
+            ?.stationId ||
+          ""
+        ).trim();
+
+      if (!stationId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_ID_REQUIRED",
+          message:
+            "Не указан ID карточки.",
+        });
+      }
+
+
+      /*
+       * Сначала читаем карточку.
+       * Никаких удалений до проверки владения.
+       */
+      const {
+        data: station,
+        error: stationError,
+      } =
+        await supabase
+          .from(
+            "stations"
+          )
+          .select(
+            [
+              "id",
+              "owner_id",
+              "name",
+              "photo_url",
+              "created_source",
+              "ownership_status",
+              "claimed_by_user_id",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            stationId
+          )
+          .maybeSingle();
+
+      if (stationError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DELETE_LOOKUP_ERROR]",
+          {
+            stationId,
+
+            code:
+              stationError
+                .code ||
+              null,
+
+            message:
+              stationError
+                .message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_DELETE_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_NOT_FOUND",
+          message:
+            "Карточка уже удалена или не существует.",
+        });
+      }
+
+
+      const canDelete =
+        !station.owner_id &&
+        String(
+          station
+            .created_source ||
+          ""
+        ) ===
+          "autodear_staff" &&
+        String(
+          station
+            .ownership_status ||
+          ""
+        ) ===
+          "unclaimed" &&
+        !station
+          .claimed_by_user_id;
+
+      if (!canDelete) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_DELETE_NOT_ALLOWED",
+          message:
+            "Эту карточку уже нельзя удалить как служебную: у неё появился владелец или началась процедура передачи.",
+        });
+      }
+
+
+      /*
+       * Запоминаем только staff-фото.
+       *
+       * После успешного DELETE попробуем удалить
+       * соответствующий объект из Storage.
+       * Ошибка удаления фото не должна возвращать
+       * удалённую station обратно.
+       */
+      let staffPhotoPath =
+        null;
+
+      const photoUrl =
+        String(
+          station
+            .photo_url ||
+          ""
+        ).trim();
+
+      if (photoUrl) {
+        try {
+          const parsed =
+            new URL(
+              photoUrl
+            );
+
+          const marker =
+            "/storage/v1/object/public/business-photos/";
+
+          const markerIndex =
+            parsed.pathname.indexOf(
+              marker
+            );
+
+          if (
+            markerIndex >=
+            0
+          ) {
+            const encodedPath =
+              parsed.pathname.slice(
+                markerIndex +
+                  marker.length
+              );
+
+            const decodedPath =
+              decodeURIComponent(
+                encodedPath
+              )
+                .replace(
+                  /^\/+/,
+                  ""
+                );
+
+            /*
+             * Не удаляем произвольное бизнес-фото.
+             * Только фотографии, которые создал
+             * именно staff-flow.
+             */
+            if (
+              decodedPath.includes(
+                "/staff_directory_"
+              )
+            ) {
+              staffPhotoPath =
+                decodedPath;
+            }
+          }
+        } catch {}
+      }
+
+
+      const {
+        data:
+          deletedStation,
+        error:
+          deleteError,
+      } =
+        await supabase
+          .from(
+            "stations"
+          )
+          .delete()
+          .eq(
+            "id",
+            stationId
+          )
+          .is(
+            "owner_id",
+            null
+          )
+          .eq(
+            "created_source",
+            "autodear_staff"
+          )
+          .eq(
+            "ownership_status",
+            "unclaimed"
+          )
+          .is(
+            "claimed_by_user_id",
+            null
+          )
+          .select(
+            "id"
+          )
+          .maybeSingle();
+
+      if (deleteError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DELETE_ERROR]",
+          {
+            stationId,
+
+            code:
+              deleteError
+                .code ||
+              null,
+
+            message:
+              deleteError
+                .message ||
+              null,
+          }
+        );
+
+        /*
+         * FK restrict — значит карточка уже участвует
+         * в рабочих данных. Ничего принудительно
+         * каскадом не уничтожаем.
+         */
+        if (
+          String(
+            deleteError
+              .code ||
+            ""
+          ) ===
+          "23503"
+        ) {
+          return res.status(409).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_DELETE_BLOCKED",
+            message:
+              "Карточка уже связана с рабочими данными AUTODEAR и не может быть удалена автоматически.",
+          });
+        }
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_DELETE_FAILED",
+          message:
+            deleteError
+              .message ||
+            "Не удалось удалить карточку.",
+        });
+      }
+
+      if (!deletedStation?.id) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_DELETE_STATE_CHANGED",
+          message:
+            "Статус карточки изменился. Удаление отменено.",
+        });
+      }
+
+
+      let photoRemoved =
+        false;
+
+      if (staffPhotoPath) {
+        const {
+          error:
+            photoDeleteError,
+        } =
+          await supabase
+            .storage
+            .from(
+              "business-photos"
+            )
+            .remove([
+              staffPhotoPath,
+            ]);
+
+        if (
+          photoDeleteError
+        ) {
+          console.warn(
+            "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DELETE_PHOTO_WARNING]",
+            {
+              stationId,
+
+              path:
+                staffPhotoPath,
+
+              message:
+                photoDeleteError
+                  .message ||
+                null,
+            }
+          );
+        } else {
+          photoRemoved =
+            true;
+        }
+      }
+
+
+      console.log(
+        "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DELETE_OK]",
+        {
+          stationId,
+          name:
+            station.name ||
+            null,
+
+          photoRemoved,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        deleted:
+          true,
+
+        stationId,
+
+        photoRemoved,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DELETE_FATAL]",
+        {
+          status,
+
+          message:
+            error?.message ||
+            String(
+              error
+            ),
+        }
+      );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_DELETE_FATAL",
+        });
+    }
+  }
+);
+
+
 
 /*
  * Candidate discovery for a logged-in business account.
