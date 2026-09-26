@@ -25899,6 +25899,45 @@ app.post(
           body.phone || ""
         ).trim();
 
+
+      const addressFull =
+        String(
+          body.addressFull ||
+          body.address_full ||
+          address ||
+          ""
+        ).trim();
+
+      const latitudeValue =
+        body.latitude == null ||
+        body.latitude === ""
+          ? null
+          : Number(
+              body.latitude
+            );
+
+      const longitudeValue =
+        body.longitude == null ||
+        body.longitude === ""
+          ? null
+          : Number(
+              body.longitude
+            );
+
+      const latitude =
+        Number.isFinite(
+          latitudeValue
+        )
+          ? latitudeValue
+          : null;
+
+      const longitude =
+        Number.isFinite(
+          longitudeValue
+        )
+          ? longitudeValue
+          : null;
+
       const rawPhotoUrl =
         String(
           body.photoUrl ||
@@ -25928,6 +25967,34 @@ app.post(
           ok: false,
           error:
             "BUSINESS_LISTING_ADDRESS_REQUIRED",
+        });
+      }
+
+
+      if (!city) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_CITY_REQUIRED",
+          message:
+            "Выберите город сервиса.",
+        });
+      }
+
+      if (
+        latitude == null ||
+        longitude == null ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_GEO_REQUIRED",
+          message:
+            "Выберите точный адрес из подсказок AUTODEAR.",
         });
       }
 
@@ -26003,6 +26070,14 @@ app.post(
         address,
         city: city || null,
         phone: phone || null,
+
+        address_full:
+          addressFull ||
+          address,
+
+        latitude,
+
+        longitude,
 
         ...(photoUrl
           ? {
