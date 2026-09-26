@@ -23607,6 +23607,1519 @@ app.get("/api/ads/wallet/:ownerId", async (req, res) => {
 // ============================================================
 
 
+
+
+// ============================================================
+// AUTODEAR — BUSINESS LISTING BILLING / DIRECTOR SETTINGS
+//
+// IMPORTANT:
+// - separate from Business PRO / MAX;
+// - billing is attached to stations.id;
+// - client never writes billing tables directly;
+// - no charge / renewal / broadcast runs here;
+// - LIVE mode is deliberately blocked until the complete
+//   server billing engine is ready.
+// ============================================================
+
+
+async function requireBusinessListingBillingDirectorUser(
+  req
+) {
+  const staff =
+    await requireAdsStaffUser(
+      req
+    );
+
+  /*
+   * Финансовые настройки размещения:
+   * директор + разработчик.
+   *
+   * Admin занимается модерацией, но не должен
+   * менять коммерческую модель приложения.
+   */
+  if (
+    ![
+      "director",
+      "developer",
+    ].includes(
+      String(
+        staff?.role || ""
+      )
+    )
+  ) {
+    const error =
+      new Error(
+        "BUSINESS_LISTING_BILLING_DIRECTOR_REQUIRED"
+      );
+
+    error.statusCode =
+      403;
+
+    throw error;
+  }
+
+  return staff;
+}
+
+
+function businessListingBillingSchemaMissing(
+  error
+) {
+  const code =
+    String(
+      error?.code || ""
+    ).trim();
+
+  const message =
+    String(
+      error?.message || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    code ===
+      "42P01" ||
+    code ===
+      "PGRST205" ||
+    (
+      message.includes(
+        "business_listing_billing_"
+      ) &&
+      (
+        message.includes(
+          "does not exist"
+        ) ||
+        message.includes(
+          "could not find the table"
+        )
+      )
+    )
+  );
+}
+
+
+function normalizeBusinessListingBillingInteger(
+  value,
+  {
+    min = 0,
+    max =
+      Number.MAX_SAFE_INTEGER,
+  } = {}
+) {
+  const number =
+    Number(
+      value
+    );
+
+  if (
+    !Number.isFinite(
+      number
+    )
+  ) {
+    return null;
+  }
+
+  const integer =
+    Math.round(
+      number
+    );
+
+  if (
+    integer < min ||
+    integer > max
+  ) {
+    return null;
+  }
+
+  return integer;
+}
+
+
+function normalizeBusinessListingBillingPercent(
+  value
+) {
+  const number =
+    Number(
+      value
+    );
+
+  if (
+    !Number.isFinite(
+      number
+    ) ||
+    number < 0 ||
+    number > 100
+  ) {
+    return null;
+  }
+
+  return Math.round(
+    number * 100
+  ) / 100;
+}
+
+
+function normalizeBusinessListingBillingReminderDays(
+  value
+) {
+  if (
+    !Array.isArray(
+      value
+    )
+  ) {
+    return null;
+  }
+
+  const days =
+    [
+      ...new Set(
+        value
+          .map(
+            (item) =>
+              normalizeBusinessListingBillingInteger(
+                item,
+                {
+                  min: 0,
+                  max: 365,
+                }
+              )
+          )
+          .filter(
+            (item) =>
+              item !== null
+          )
+      ),
+    ]
+      .sort(
+        (a, b) =>
+          b - a
+      );
+
+  if (
+    !days.length ||
+    days.length > 20
+  ) {
+    return null;
+  }
+
+  return days;
+}
+
+
+function normalizeBusinessListingBillingText(
+  value,
+  maxLength = 4000
+) {
+  const raw =
+    String(
+      value ?? ""
+    ).trim();
+
+  if (
+    !raw ||
+    raw.length >
+      maxLength
+  ) {
+    return null;
+  }
+
+  return raw;
+}
+
+
+function mapBusinessListingBillingSettings(
+  row
+) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id:
+      row.id,
+
+    billingMode:
+      row.billing_mode,
+
+    billingStartsAt:
+      row.billing_starts_at ||
+      null,
+
+    monthlyPriceKopecks:
+      Number(
+        row.monthly_price_kopecks ||
+        0
+      ),
+
+    claimFreeDays:
+      Number(
+        row.claim_free_days ||
+        0
+      ),
+
+    graceDays:
+      Number(
+        row.grace_days ||
+        0
+      ),
+
+    reminderDays:
+      Array.isArray(
+        row.reminder_days
+      )
+        ? row.reminder_days
+            .map(Number)
+            .filter(
+              Number.isFinite
+            )
+        : [],
+
+    templates: {
+      transition: {
+        title:
+          row.transition_notice_title ||
+          "",
+
+        body:
+          row.transition_notice_body ||
+          "",
+      },
+
+      renewalReminder: {
+        title:
+          row.renewal_reminder_title ||
+          "",
+
+        body:
+          row.renewal_reminder_body ||
+          "",
+      },
+
+      lowBalance: {
+        title:
+          row.low_balance_title ||
+          "",
+
+        body:
+          row.low_balance_body ||
+          "",
+      },
+
+      renewalSuccess: {
+        title:
+          row.renewal_success_title ||
+          "",
+
+        body:
+          row.renewal_success_body ||
+          "",
+      },
+
+      renewalFailed: {
+        title:
+          row.renewal_failed_title ||
+          "",
+
+        body:
+          row.renewal_failed_body ||
+          "",
+      },
+
+      suspended: {
+        title:
+          row.suspended_title ||
+          "",
+
+        body:
+          row.suspended_body ||
+          "",
+      },
+    },
+
+    updatedAt:
+      row.updated_at ||
+      null,
+
+    updatedByUserId:
+      row.updated_by_user_id ||
+      null,
+  };
+}
+
+
+function mapBusinessListingBillingPlan(
+  row
+) {
+  return {
+    id:
+      row.id,
+
+    months:
+      Number(
+        row.months ||
+        0
+      ),
+
+    discountPercent:
+      Number(
+        row.discount_percent ||
+        0
+      ),
+
+    isEnabled:
+      row.is_enabled !==
+      false,
+
+    sortOrder:
+      Number(
+        row.sort_order ||
+        0
+      ),
+
+    createdAt:
+      row.created_at ||
+      null,
+
+    updatedAt:
+      row.updated_at ||
+      null,
+  };
+}
+
+
+/*
+ * Director billing settings.
+ *
+ * Read only.
+ * Does not start billing.
+ */
+app.get(
+  "/api/director/business-listing-billing/settings",
+  async (req, res) => {
+    try {
+      if (
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+      }
+
+      await requireBusinessListingBillingDirectorUser(
+        req
+      );
+
+      const [
+        settingsResult,
+        plansResult,
+      ] =
+        await Promise.all([
+          supabaseServiceRole
+            .from(
+              "business_listing_billing_settings"
+            )
+            .select("*")
+            .eq(
+              "id",
+              "global"
+            )
+            .maybeSingle(),
+
+          supabaseServiceRole
+            .from(
+              "business_listing_billing_plans"
+            )
+            .select("*")
+            .order(
+              "sort_order",
+              {
+                ascending:
+                  true,
+              }
+            ),
+        ]);
+
+      if (
+        settingsResult.error ||
+        plansResult.error
+      ) {
+        const error =
+          settingsResult.error ||
+          plansResult.error;
+
+        if (
+          businessListingBillingSchemaMissing(
+            error
+          )
+        ) {
+          return res.status(503).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_SCHEMA_NOT_READY",
+            message:
+              "Схема платного размещения ещё не применена.",
+          });
+        }
+
+        console.error(
+          "[AUTODEAR][BUSINESS_LISTING_BILLING][SETTINGS_GET_ERROR]",
+          error
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_SETTINGS_GET_FAILED",
+        });
+      }
+
+      if (
+        !settingsResult.data
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_SETTINGS_MISSING",
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        settings:
+          mapBusinessListingBillingSettings(
+            settingsResult.data
+          ),
+
+        plans:
+          (
+            plansResult.data ||
+            []
+          ).map(
+            mapBusinessListingBillingPlan
+          ),
+
+        /*
+         * Пока это false, backend не имеет
+         * права запускать реальные списания.
+         */
+        liveBillingReady:
+          false,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_LISTING_BILLING][SETTINGS_GET_FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(
+              error
+            ),
+        }
+      );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_BILLING_SETTINGS_GET_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Update commercial settings and message templates.
+ *
+ * IMPORTANT:
+ * billing_mode is NOT accepted here.
+ */
+app.patch(
+  "/api/director/business-listing-billing/settings",
+  async (req, res) => {
+    try {
+      if (
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessListingBillingDirectorUser(
+          req
+        );
+
+      const body =
+        req.body &&
+        typeof req.body ===
+          "object" &&
+        !Array.isArray(
+          req.body
+        )
+          ? req.body
+          : {};
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "billingMode"
+          ) ||
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "billing_mode"
+          )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_MODE_REQUIRES_EXPLICIT_ACTION",
+          message:
+            "Режим тарификации меняется отдельным подтверждаемым действием.",
+        });
+      }
+
+      const update = {
+        updated_at:
+          new Date()
+            .toISOString(),
+
+        updated_by_user_id:
+          user.id,
+      };
+
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "monthlyPriceKopecks"
+          )
+      ) {
+        const value =
+          normalizeBusinessListingBillingInteger(
+            body.monthlyPriceKopecks,
+            {
+              min: 0,
+              max:
+                1000000000,
+            }
+          );
+
+        if (
+          value ===
+          null
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_PRICE_INVALID",
+          });
+        }
+
+        update.monthly_price_kopecks =
+          value;
+      }
+
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "claimFreeDays"
+          )
+      ) {
+        const value =
+          normalizeBusinessListingBillingInteger(
+            body.claimFreeDays,
+            {
+              min: 0,
+              max: 3650,
+            }
+          );
+
+        if (
+          value ===
+          null
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_FREE_DAYS_INVALID",
+          });
+        }
+
+        update.claim_free_days =
+          value;
+      }
+
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "graceDays"
+          )
+      ) {
+        const value =
+          normalizeBusinessListingBillingInteger(
+            body.graceDays,
+            {
+              min: 0,
+              max: 365,
+            }
+          );
+
+        if (
+          value ===
+          null
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_GRACE_DAYS_INVALID",
+          });
+        }
+
+        update.grace_days =
+          value;
+      }
+
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "reminderDays"
+          )
+      ) {
+        const value =
+          normalizeBusinessListingBillingReminderDays(
+            body.reminderDays
+          );
+
+        if (!value) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_REMINDER_DAYS_INVALID",
+          });
+        }
+
+        update.reminder_days =
+          value;
+      }
+
+
+      const templateMap = [
+        [
+          "transitionTitle",
+          "transition_notice_title",
+          160,
+        ],
+        [
+          "transitionBody",
+          "transition_notice_body",
+          4000,
+        ],
+        [
+          "renewalReminderTitle",
+          "renewal_reminder_title",
+          160,
+        ],
+        [
+          "renewalReminderBody",
+          "renewal_reminder_body",
+          4000,
+        ],
+        [
+          "lowBalanceTitle",
+          "low_balance_title",
+          160,
+        ],
+        [
+          "lowBalanceBody",
+          "low_balance_body",
+          4000,
+        ],
+        [
+          "renewalSuccessTitle",
+          "renewal_success_title",
+          160,
+        ],
+        [
+          "renewalSuccessBody",
+          "renewal_success_body",
+          4000,
+        ],
+        [
+          "renewalFailedTitle",
+          "renewal_failed_title",
+          160,
+        ],
+        [
+          "renewalFailedBody",
+          "renewal_failed_body",
+          4000,
+        ],
+        [
+          "suspendedTitle",
+          "suspended_title",
+          160,
+        ],
+        [
+          "suspendedBody",
+          "suspended_body",
+          4000,
+        ],
+      ];
+
+      for (
+        const [
+          inputKey,
+          dbKey,
+          maxLength,
+        ] of templateMap
+      ) {
+        if (
+          !Object.prototype
+            .hasOwnProperty
+            .call(
+              body,
+              inputKey
+            )
+        ) {
+          continue;
+        }
+
+        const value =
+          normalizeBusinessListingBillingText(
+            body[
+              inputKey
+            ],
+            maxLength
+          );
+
+        if (!value) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_TEMPLATE_INVALID",
+            field:
+              inputKey,
+          });
+        }
+
+        update[
+          dbKey
+        ] =
+          value;
+      }
+
+
+      if (
+        Object.keys(
+          update
+        ).length ===
+        2
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_NO_CHANGES",
+        });
+      }
+
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "business_listing_billing_settings"
+          )
+          .update(
+            update
+          )
+          .eq(
+            "id",
+            "global"
+          )
+          .select("*")
+          .single();
+
+      if (error) {
+        if (
+          businessListingBillingSchemaMissing(
+            error
+          )
+        ) {
+          return res.status(503).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_SCHEMA_NOT_READY",
+          });
+        }
+
+        console.error(
+          "[AUTODEAR][BUSINESS_LISTING_BILLING][SETTINGS_UPDATE_ERROR]",
+          error
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_SETTINGS_UPDATE_FAILED",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][BUSINESS_LISTING_BILLING][SETTINGS_UPDATE_OK]",
+        {
+          userId:
+            user.id,
+
+          monthlyPriceKopecks:
+            data.monthly_price_kopecks,
+
+          claimFreeDays:
+            data.claim_free_days,
+
+          graceDays:
+            data.grace_days,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        settings:
+          mapBusinessListingBillingSettings(
+            data
+          ),
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_LISTING_BILLING][SETTINGS_UPDATE_FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(
+              error
+            ),
+        }
+      );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_BILLING_SETTINGS_UPDATE_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Change one billing period.
+ *
+ * months cannot be changed after creation.
+ */
+app.patch(
+  "/api/director/business-listing-billing/plans/:planId",
+  async (req, res) => {
+    try {
+      if (
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+      }
+
+      await requireBusinessListingBillingDirectorUser(
+        req
+      );
+
+      const planId =
+        String(
+          req.params
+            ?.planId ||
+          ""
+        ).trim();
+
+      if (!planId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_PLAN_ID_REQUIRED",
+        });
+      }
+
+      const body =
+        req.body &&
+        typeof req.body ===
+          "object" &&
+        !Array.isArray(
+          req.body
+        )
+          ? req.body
+          : {};
+
+      const update = {
+        updated_at:
+          new Date()
+            .toISOString(),
+      };
+
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "discountPercent"
+          )
+      ) {
+        const value =
+          normalizeBusinessListingBillingPercent(
+            body.discountPercent
+          );
+
+        if (
+          value ===
+          null
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_DISCOUNT_INVALID",
+          });
+        }
+
+        update.discount_percent =
+          value;
+      }
+
+
+      if (
+        Object.prototype
+          .hasOwnProperty
+          .call(
+            body,
+            "isEnabled"
+          )
+      ) {
+        if (
+          typeof body.isEnabled !==
+          "boolean"
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_PLAN_ENABLED_INVALID",
+          });
+        }
+
+        update.is_enabled =
+          body.isEnabled;
+      }
+
+
+      if (
+        Object.keys(
+          update
+        ).length ===
+        1
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_NO_CHANGES",
+        });
+      }
+
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "business_listing_billing_plans"
+          )
+          .update(
+            update
+          )
+          .eq(
+            "id",
+            planId
+          )
+          .select("*")
+          .maybeSingle();
+
+      if (error) {
+        if (
+          businessListingBillingSchemaMissing(
+            error
+          )
+        ) {
+          return res.status(503).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_SCHEMA_NOT_READY",
+          });
+        }
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_PLAN_UPDATE_FAILED",
+        });
+      }
+
+      if (!data) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_PLAN_NOT_FOUND",
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        plan:
+          mapBusinessListingBillingPlan(
+            data
+          ),
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_BILLING_PLAN_UPDATE_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Schedule a future transition.
+ *
+ * This does NOT send notifications and does NOT charge money.
+ */
+app.post(
+  "/api/director/business-listing-billing/schedule",
+  async (req, res) => {
+    try {
+      if (
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessListingBillingDirectorUser(
+          req
+        );
+
+      const body =
+        req.body &&
+        typeof req.body ===
+          "object" &&
+        !Array.isArray(
+          req.body
+        )
+          ? req.body
+          : {};
+
+      if (
+        String(
+          body.confirmation ||
+          ""
+        ).trim() !==
+        "ЗАПЛАНИРОВАТЬ"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_SCHEDULE_CONFIRMATION_REQUIRED",
+        });
+      }
+
+      const startsAt =
+        new Date(
+          String(
+            body.billingStartsAt ||
+            ""
+          )
+        );
+
+      if (
+        Number.isNaN(
+          startsAt.getTime()
+        ) ||
+        startsAt.getTime() <=
+          Date.now()
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_START_DATE_INVALID",
+          message:
+            "Дата запуска должна быть в будущем.",
+        });
+      }
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "business_listing_billing_settings"
+          )
+          .update({
+            billing_mode:
+              "scheduled",
+
+            billing_starts_at:
+              startsAt
+                .toISOString(),
+
+            updated_by_user_id:
+              user.id,
+
+            updated_at:
+              new Date()
+                .toISOString(),
+          })
+          .eq(
+            "id",
+            "global"
+          )
+          .select("*")
+          .single();
+
+      if (error) {
+        if (
+          businessListingBillingSchemaMissing(
+            error
+          )
+        ) {
+          return res.status(503).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_SCHEMA_NOT_READY",
+          });
+        }
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_SCHEDULE_FAILED",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][BUSINESS_LISTING_BILLING][SCHEDULED]",
+        {
+          userId:
+            user.id,
+
+          billingStartsAt:
+            data.billing_starts_at,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        settings:
+          mapBusinessListingBillingSettings(
+            data
+          ),
+
+        notificationsSent:
+          false,
+
+        chargesStarted:
+          false,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_BILLING_SCHEDULE_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Explicitly return billing to OFF.
+ *
+ * This does not refund past payments and does not
+ * delete subscription history.
+ */
+app.post(
+  "/api/director/business-listing-billing/off",
+  async (req, res) => {
+    try {
+      if (
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessListingBillingDirectorUser(
+          req
+        );
+
+      const body =
+        req.body &&
+        typeof req.body ===
+          "object" &&
+        !Array.isArray(
+          req.body
+        )
+          ? req.body
+          : {};
+
+      if (
+        String(
+          body.confirmation ||
+          ""
+        ).trim() !==
+        "ВЫКЛЮЧИТЬ"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_OFF_CONFIRMATION_REQUIRED",
+        });
+      }
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "business_listing_billing_settings"
+          )
+          .update({
+            billing_mode:
+              "off",
+
+            billing_starts_at:
+              null,
+
+            updated_by_user_id:
+              user.id,
+
+            updated_at:
+              new Date()
+                .toISOString(),
+          })
+          .eq(
+            "id",
+            "global"
+          )
+          .select("*")
+          .single();
+
+      if (error) {
+        if (
+          businessListingBillingSchemaMissing(
+            error
+          )
+        ) {
+          return res.status(503).json({
+            ok: false,
+            error:
+              "BUSINESS_LISTING_BILLING_SCHEMA_NOT_READY",
+          });
+        }
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_BILLING_OFF_FAILED",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][BUSINESS_LISTING_BILLING][OFF]",
+        {
+          userId:
+            user.id,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        settings:
+          mapBusinessListingBillingSettings(
+            data
+          ),
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_BILLING_OFF_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Deliberate hard stop.
+ *
+ * Even a director cannot switch LIVE until the
+ * payment scheduler, notification chain and visibility
+ * gate are implemented and tested.
+ */
+app.post(
+  "/api/director/business-listing-billing/live",
+  async (req, res) => {
+    try {
+      await requireBusinessListingBillingDirectorUser(
+        req
+      );
+
+      return res.status(409).json({
+        ok: false,
+
+        error:
+          "BUSINESS_LISTING_BILLING_LIVE_NOT_READY",
+
+        message:
+          "Платное размещение ещё не готово к включению. Настройки можно подготовить заранее, но реальные списания пока заблокированы.",
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_BILLING_LIVE_FATAL",
+        });
+    }
+  }
+);
+
+
 /*
  * ============================================================
  * AUTODEAR — BUSINESS LISTING CLAIM FOUNDATION
