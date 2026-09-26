@@ -23766,6 +23766,575 @@ function normalizeBusinessListingPhone(
   return digits;
 }
 
+function normalizeBusinessListingText(
+  value
+) {
+  return String(
+    value || ""
+  )
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(
+      /[^a-zа-я0-9]+/gi,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+
+function normalizeBusinessListingAddress(
+  value
+) {
+  return normalizeBusinessListingText(
+    value
+  )
+    .replace(
+      /\bулица\b/g,
+      "ул"
+    )
+    .replace(
+      /\bпроспект\b/g,
+      "пр"
+    )
+    .replace(
+      /\bпереулок\b/g,
+      "пер"
+    )
+    .replace(
+      /\bдом\b/g,
+      "д"
+    )
+    .replace(
+      /\s+/g,
+      ""
+    );
+}
+
+
+function scoreBusinessListingCandidate(
+  row,
+  input
+) {
+  let score = 0;
+
+  const reasons = [];
+
+  const wantedPhone =
+    normalizeBusinessListingPhone(
+      input?.phone
+    );
+
+  const rowPhone =
+    normalizeBusinessListingPhone(
+      row?.phone
+    );
+
+  if (
+    wantedPhone &&
+    rowPhone &&
+    wantedPhone === rowPhone
+  ) {
+    score += 70;
+    reasons.push(
+      "Совпадает телефон"
+    );
+  }
+
+
+  const wantedAddress =
+    normalizeBusinessListingAddress(
+      input?.address
+    );
+
+  const rowAddress =
+    normalizeBusinessListingAddress(
+      row?.address
+    );
+
+  if (
+    wantedAddress &&
+    rowAddress &&
+    wantedAddress === rowAddress
+  ) {
+    score += 50;
+    reasons.push(
+      "Совпадает адрес"
+    );
+  }
+
+
+  const wantedCity =
+    normalizeBusinessListingText(
+      input?.city
+    );
+
+  const rowCity =
+    normalizeBusinessListingText(
+      row?.city
+    );
+
+  if (
+    wantedCity &&
+    rowCity &&
+    wantedCity === rowCity
+  ) {
+    score += 10;
+    reasons.push(
+      "Совпадает город"
+    );
+  }
+
+
+  const wantedName =
+    normalizeBusinessListingText(
+      input?.name
+    );
+
+  const rowName =
+    normalizeBusinessListingText(
+      row?.name
+    );
+
+  if (
+    wantedName &&
+    rowName
+  ) {
+    if (
+      wantedName === rowName
+    ) {
+      score += 30;
+      reasons.push(
+        "Совпадает название"
+      );
+    } else if (
+      Math.min(
+        wantedName.length,
+        rowName.length
+      ) >= 5 &&
+      (
+        wantedName.includes(
+          rowName
+        ) ||
+        rowName.includes(
+          wantedName
+        )
+      )
+    ) {
+      score += 20;
+      reasons.push(
+        "Похожее название"
+      );
+    }
+  }
+
+
+  return {
+    id:
+      row?.id || null,
+
+    ownerId:
+      row?.owner_id || null,
+
+    name:
+      row?.name || null,
+
+    address:
+      row?.address || null,
+
+    city:
+      row?.city || null,
+
+    phone:
+      row?.phone || null,
+
+    photoUrl:
+      row?.photo_url ||
+      row?.image_url ||
+      null,
+
+    businessType:
+      row?.business_type ||
+      null,
+
+    ownershipStatus:
+      row?.ownership_status ||
+      null,
+
+    createdSource:
+      row?.created_source ||
+      null,
+
+    matchScore:
+      score,
+
+    matchReason:
+      reasons.join(" · ") ||
+      null,
+  };
+}
+
+
+async function findBusinessListingDuplicateCandidates(
+  input,
+  options = {}
+) {
+  if (!supabase) {
+    throw new Error(
+      "SUPABASE_NOT_CONFIGURED"
+    );
+  }
+
+  let query =
+    supabase
+      .from("stations")
+      .select(
+        [
+          "id",
+          "owner_id",
+          "name",
+          "address",
+          "city",
+          "phone",
+          "photo_url",
+          "image_url",
+          "business_type",
+          "ownership_status",
+          "created_source",
+        ].join(",")
+      );
+
+  if (
+    options?.unclaimedOnly ===
+    true
+  ) {
+    query =
+      query
+        .is(
+          "owner_id",
+          null
+        )
+        .eq(
+          "created_source",
+          "autodear_staff"
+        )
+        .eq(
+          "ownership_status",
+          "unclaimed"
+        );
+  }
+
+  const {
+    data: rows,
+    error,
+  } =
+    await query.limit(
+      300
+    );
+
+  if (error) {
+    console.error(
+      "[AUTODEAR][BUSINESS_DIRECTORY][DUPLICATE_LOOKUP_ERROR]",
+      {
+        code:
+          error.code ||
+          null,
+
+        message:
+          error.message ||
+          null,
+      }
+    );
+
+    throw new Error(
+      "BUSINESS_LISTING_DUPLICATE_LOOKUP_FAILED"
+    );
+  }
+
+  return (
+    Array.isArray(rows)
+      ? rows
+      : []
+  )
+    .map(
+      (row) =>
+        scoreBusinessListingCandidate(
+          row,
+          input
+        )
+    )
+    .filter(
+      (item) =>
+        Number(
+          item.matchScore ||
+          0
+        ) >= 50
+    )
+    .sort(
+      (a, b) =>
+        Number(
+          b.matchScore ||
+          0
+        ) -
+        Number(
+          a.matchScore ||
+          0
+        )
+    );
+}
+
+
+function normalizeBusinessListingPhotoUrl(
+  value
+) {
+  const raw =
+    String(
+      value || ""
+    ).trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const parsed =
+      new URL(
+        raw
+      );
+
+    if (
+      parsed.protocol !==
+      "https:"
+    ) {
+      return null;
+    }
+
+    if (
+      !parsed.pathname.includes(
+        "/storage/v1/object/public/business-photos/"
+      )
+    ) {
+      return null;
+    }
+
+    const configuredSupabaseUrl =
+      String(
+        process.env
+          .SUPABASE_URL ||
+        ""
+      ).trim();
+
+    if (
+      configuredSupabaseUrl
+    ) {
+      const configuredHost =
+        new URL(
+          configuredSupabaseUrl
+        ).hostname;
+
+      if (
+        parsed.hostname !==
+        configuredHost
+      ) {
+        return null;
+      }
+    }
+
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+
+
+/*
+ * Dry-run duplicate check for AUTODEAR staff.
+ *
+ * IMPORTANT:
+ * - creates nothing;
+ * - changes no ownership;
+ * - returns only possible matches;
+ * - the real POST /staff/listings performs the same
+ *   duplicate protection again to avoid races.
+ */
+app.post(
+  "/api/business-directory/staff/listings/check",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      await requireBusinessDirectoryStaffUser(
+        req
+      );
+
+      const body =
+        req.body &&
+        typeof req.body ===
+          "object" &&
+        !Array.isArray(
+          req.body
+        )
+          ? req.body
+          : {};
+
+      const name =
+        String(
+          body.name || ""
+        ).trim();
+
+      const address =
+        String(
+          body.address || ""
+        ).trim();
+
+      const city =
+        String(
+          body.city || ""
+        ).trim();
+
+      const phone =
+        String(
+          body.phone || ""
+        ).trim();
+
+      if (!name) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_NAME_REQUIRED",
+          message:
+            "Укажите название сервиса.",
+        });
+      }
+
+      if (!address) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_ADDRESS_REQUIRED",
+          message:
+            "Укажите адрес сервиса.",
+        });
+      }
+
+      const candidates =
+        await findBusinessListingDuplicateCandidates({
+          name,
+          address,
+          city,
+          phone,
+        });
+
+      /*
+       * 70+:
+       * - точный телефон;
+       * - адрес + название;
+       * - другие сильные комбинации.
+       *
+       * Один только адрес = 50 и НЕ блокирует создание.
+       */
+      const blockingCandidates =
+        candidates
+          .filter(
+            (item) =>
+              Number(
+                item.matchScore ||
+                0
+              ) >= 70
+          )
+          .slice(
+            0,
+            5
+          );
+
+      console.log(
+        "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DUPLICATE_CHECK]",
+        {
+          name,
+          city:
+            city || null,
+
+          candidates:
+            candidates.length,
+
+          blocking:
+            blockingCandidates
+              .length,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        duplicate:
+          blockingCandidates.length >
+          0,
+
+        candidates:
+          blockingCandidates,
+
+        possibleCandidates:
+          candidates
+            .filter(
+              (item) =>
+                Number(
+                  item.matchScore ||
+                  0
+                ) < 70
+            )
+            .slice(
+              0,
+              5
+            ),
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_DUPLICATE_CHECK_FATAL]",
+        {
+          status,
+
+          message:
+            error?.message ||
+            String(
+              error
+            ),
+        }
+      );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "BUSINESS_LISTING_DUPLICATE_CHECK_FAILED",
+        });
+    }
+  }
+);
+
 
 /*
  * Staff creates an ownerless business listing and receives
@@ -23817,6 +24386,22 @@ app.post(
           body.phone || ""
         ).trim();
 
+      const rawPhotoUrl =
+        String(
+          body.photoUrl ||
+          body.photo_url ||
+          ""
+        ).trim();
+
+      const photoUrl =
+        normalizeBusinessListingPhotoUrl(
+          rawPhotoUrl
+        );
+
+      const allowDuplicate =
+        body.allowDuplicate ===
+        true;
+
       if (!name) {
         return res.status(400).json({
           ok: false,
@@ -23833,6 +24418,67 @@ app.post(
         });
       }
 
+
+      if (
+        rawPhotoUrl &&
+        !photoUrl
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_LISTING_PHOTO_INVALID",
+          message:
+            "Фотография должна быть загружена в хранилище AUTODEAR.",
+        });
+      }
+
+
+      /*
+       * Проверка выполняется ДО INSERT.
+       *
+       * Адрес сам по себе никогда не подтверждает,
+       * что это один и тот же бизнес. Но он может
+       * участвовать в оценке вместе с названием,
+       * городом или телефоном.
+       */
+      const duplicateCandidates =
+        await findBusinessListingDuplicateCandidates({
+          name,
+          address,
+          city,
+          phone,
+        });
+
+      const blockingDuplicates =
+        duplicateCandidates.filter(
+          (item) =>
+            Number(
+              item.matchScore ||
+              0
+            ) >= 70
+        );
+
+      if (
+        blockingDuplicates.length &&
+        !allowDuplicate
+      ) {
+        return res.status(409).json({
+          ok: false,
+
+          error:
+            "BUSINESS_LISTING_DUPLICATE_SUSPECTED",
+
+          message:
+            "Похоже, этот сервис уже есть в AUTODEAR.",
+
+          candidates:
+            blockingDuplicates.slice(
+              0,
+              5
+            ),
+        });
+      }
+
       /*
        * IMPORTANT:
        * Do not pass arbitrary client fields into stations.
@@ -23844,6 +24490,19 @@ app.post(
         address,
         city: city || null,
         phone: phone || null,
+
+        ...(photoUrl
+          ? {
+              image:
+                photoUrl,
+
+              photo:
+                photoUrl,
+
+              photo_url:
+                photoUrl,
+            }
+          : {}),
 
         created_source:
           "autodear_staff",
@@ -23880,6 +24539,7 @@ app.post(
             "address",
             "city",
             "phone",
+            "photo_url",
             "created_source",
             "created_by_user_id",
             "ownership_status",
@@ -24040,6 +24700,10 @@ app.post(
           phone:
             station.phone,
 
+          photoUrl:
+            station.photo_url ||
+            null,
+
           ownershipStatus:
             station.ownership_status,
 
@@ -24054,7 +24718,12 @@ app.post(
         confirmationCode:
           claimCode,
 
+        claimCode,
+
         codeHint,
+
+        claimCodeHint:
+          codeHint,
       });
     } catch (error) {
       const status =
@@ -24146,19 +24815,23 @@ app.get(
         });
       }
 
-      const profilePhone =
-        normalizeBusinessListingPhone(
-          profile?.phone
-        );
-
+      /*
+       * Если экран регистрации передал телефон бизнеса,
+       * он важнее общего телефона профиля.
+       */
       const requestedPhone =
         normalizeBusinessListingPhone(
           req.query?.phone
         );
 
+      const profilePhone =
+        normalizeBusinessListingPhone(
+          profile?.phone
+        );
+
       const phone =
-        profilePhone ||
-        requestedPhone;
+        requestedPhone ||
+        profilePhone;
 
       const city =
         String(
@@ -24167,11 +24840,23 @@ app.get(
           ""
         ).trim();
 
-      /*
-       * We deliberately do not discover by address alone.
-       * Several independent businesses may share one address.
-       */
-      if (!phone) {
+      const name =
+        String(
+          req.query?.name ||
+          ""
+        ).trim();
+
+      const address =
+        String(
+          req.query?.address ||
+          ""
+        ).trim();
+
+      if (
+        !phone &&
+        !name &&
+        !address
+      ) {
         return res.json({
           ok: true,
           candidates: [],
@@ -24181,120 +24866,51 @@ app.get(
         });
       }
 
-      const {
-        data: rows,
-        error: rowsError,
-      } = await supabase
-        .from("stations")
-        .select(
-          [
-            "id",
-            "name",
-            "address",
-            "city",
-            "phone",
-            "photo_url",
-            "image_url",
-            "business_type",
-            "ownership_status",
-            "created_source",
-          ].join(",")
-        )
-        .is(
-          "owner_id",
-          null
-        )
-        .eq(
-          "created_source",
-          "autodear_staff"
-        )
-        .eq(
-          "ownership_status",
-          "unclaimed"
-        )
-        .limit(100);
-
-      if (rowsError) {
-        console.error(
-          "[AUTODEAR][BUSINESS_DIRECTORY][CANDIDATES_ERROR]",
-          rowsError
+      /*
+       * Здесь ищем ТОЛЬКО созданные AUTODEAR
+       * карточки без владельца.
+       *
+       * Совпадение никогда не передаёт владение
+       * автоматически. Оно лишь предлагает
+       * существующую карточку пользователю.
+       */
+      const candidates =
+        await findBusinessListingDuplicateCandidates(
+          {
+            name,
+            address,
+            city,
+            phone,
+          },
+          {
+            unclaimedOnly:
+              true,
+          }
         );
 
-        return res.status(500).json({
-          ok: false,
-          error:
-            "BUSINESS_CLAIM_CANDIDATES_FAILED",
-        });
-      }
-
-      const candidates =
-        (Array.isArray(rows)
-          ? rows
-          : [])
-          .filter(
-            (row) =>
-              normalizeBusinessListingPhone(
-                row?.phone
-              ) === phone
-          )
-          .map((row) => ({
-            id:
-              row.id,
-
-            name:
-              row.name ||
-              "Бизнес AUTODEAR",
-
-            address:
-              row.address ||
-              null,
-
-            city:
-              row.city ||
-              null,
-
-            phone:
-              row.phone ||
-              null,
-
-            photoUrl:
-              row.photo_url ||
-              row.image_url ||
-              null,
-
-            businessType:
-              row.business_type ||
-              null,
-
-            ownershipStatus:
-              row.ownership_status,
-
-            cityMatch:
-              Boolean(
-                city &&
-                row.city &&
-                String(row.city)
-                  .trim()
-                  .toLowerCase() ===
-                  city.toLowerCase()
-              ),
-          }));
+      const limitedCandidates =
+        candidates.slice(
+          0,
+          20
+        );
 
       return res.json({
         ok: true,
 
-        candidates,
+        candidates:
+          limitedCandidates,
 
         count:
-          candidates.length,
+          limitedCandidates.length,
 
         match:
-          candidates.length === 1
+          limitedCandidates.length === 1
             ? "single"
-            : candidates.length > 1
+            : limitedCandidates.length > 1
               ? "multiple"
               : "none",
       });
+
     } catch (error) {
       console.error(
         "[AUTODEAR][BUSINESS_DIRECTORY][CANDIDATES_FATAL]",
@@ -24304,6 +24920,7 @@ app.get(
       return res.status(500).json({
         ok: false,
         error:
+          error?.message ||
           "BUSINESS_CLAIM_CANDIDATES_FATAL",
       });
     }
