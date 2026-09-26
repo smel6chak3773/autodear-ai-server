@@ -1227,6 +1227,224 @@ async function sendAdminListingModerationPush({
 
 
 
+// ADMIN_COMPLAINT_EVIDENCE_V1
+//
+// Фото жалобы лежат в приватном Storage.
+// Администратор получает только временные signed URL
+// после реальной server-side проверки staff access.
+
+app.get(
+  "/api/admin/moderation/complaints/:complaintId/attachments",
+  async (req, res) => {
+    const access =
+      await resolveStaffAccess(
+        req,
+        "admin"
+      );
+
+    if (!access.ok) {
+      return res
+        .status(
+          access.status || 403
+        )
+        .json({
+          ok: false,
+          error:
+            access.error ||
+            "STAFF_ACCESS_DENIED",
+        });
+    }
+
+    if (!supabaseServiceRole) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+    }
+
+    const complaintId =
+      String(
+        req.params?.complaintId ||
+          ""
+      ).trim();
+
+    if (
+      !adminModerationUuidOrNull(
+        complaintId
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "COMPLAINT_ID_INVALID",
+        });
+    }
+
+    try {
+      const {
+        data: rows,
+        error: rowsError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "complaint_attachments"
+          )
+          .select(
+            [
+              "id",
+              "complaint_id",
+              "storage_bucket",
+              "storage_path",
+              "mime_type",
+              "file_size_bytes",
+              "created_at",
+            ].join(",")
+          )
+          .eq(
+            "complaint_id",
+            complaintId
+          )
+          .order(
+            "created_at",
+            {
+              ascending: true,
+            }
+          );
+
+      if (rowsError) {
+        console.error(
+          "[AUTODEAR][ADMIN][COMPLAINT_ATTACHMENTS_LOAD_FAILED]",
+          {
+            complaintId,
+            message:
+              rowsError.message ||
+              null,
+          }
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "COMPLAINT_ATTACHMENTS_LOAD_FAILED",
+          });
+      }
+
+      const attachments = [];
+
+      for (
+        const row of
+        Array.isArray(rows)
+          ? rows
+          : []
+      ) {
+        const bucket =
+          String(
+            row?.storage_bucket ||
+              "complaint-attachments"
+          ).trim();
+
+        const storagePath =
+          String(
+            row?.storage_path ||
+              ""
+          ).trim();
+
+        if (!storagePath) {
+          continue;
+        }
+
+        const {
+          data: signed,
+          error: signedError,
+        } =
+          await supabaseServiceRole
+            .storage
+            .from(bucket)
+            .createSignedUrl(
+              storagePath,
+              10 * 60
+            );
+
+        if (
+          signedError ||
+          !signed?.signedUrl
+        ) {
+          console.warn(
+            "[AUTODEAR][ADMIN][COMPLAINT_ATTACHMENT_SIGN_FAILED]",
+            {
+              complaintId,
+              attachmentId:
+                row?.id || null,
+              bucket,
+              storagePath,
+              message:
+                signedError
+                  ?.message ||
+                null,
+            }
+          );
+
+          continue;
+        }
+
+        attachments.push({
+          id:
+            row.id,
+
+          complaintId:
+            row.complaint_id,
+
+          mimeType:
+            row.mime_type ||
+            null,
+
+          fileSizeBytes:
+            row.file_size_bytes ||
+            null,
+
+          createdAt:
+            row.created_at ||
+            null,
+
+          url:
+            signed.signedUrl,
+        });
+      }
+
+      return res.json({
+        ok: true,
+        attachments,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][ADMIN][COMPLAINT_ATTACHMENTS_FATAL]",
+        {
+          complaintId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "COMPLAINT_ATTACHMENTS_FATAL",
+        });
+    }
+  }
+);
+
+
 // ADMIN_ACCOUNT_MODERATION_V1
 //
 // Реальная блокировка аккаунта выполняется только сервером.
