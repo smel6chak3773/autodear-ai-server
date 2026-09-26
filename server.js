@@ -1450,13 +1450,18 @@ app.get(
 // Реальная блокировка аккаунта выполняется только сервером.
 // Клиентский roleSwitcher не является источником полномочий.
 //
-// Два уровня:
-// 1. public.profiles.account_status — состояние AUTODEAR;
-// 2. Supabase Auth ban_duration — блокировка авторизации.
+// ACCOUNT_BLOCK_GATE_V2
 //
-// Бессрочная блокировка AUTODEAR хранится как:
+// Источник истины блокировки:
+// public.profiles.account_status.
+//
+// Supabase Auth НЕ блокируем через ban_duration:
+// пользователь должен иметь возможность корректно войти,
+// получить статус модерации и увидеть полноэкранное
+// уведомление AUTODEAR с причиной, сроком и кнопкой выхода.
+//
+// Бессрочная блокировка AUTODEAR:
 // account_status = blocked + blocked_until = null.
-// В Supabase Auth ставим технически очень большой срок.
 
 const ADMIN_ACCOUNT_BLOCK_DURATIONS = {
   "24h": {
@@ -1623,6 +1628,313 @@ async function resolveAdminAccountProfile(
 }
 
 
+// ACCOUNT_MODERATION_STATUS_V1
+//
+// Обычный авторизованный пользователь может узнать только
+// собственный статус модерации.
+//
+// Этот endpoint используется:
+// - сразу после успешного входа;
+// - после восстановления сессии;
+// - при возврате приложения из background.
+//
+// Временная блокировка автоматически снимается после срока.
+
+app.get(
+  "/api/account/moderation-status",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(
+        req
+      );
+
+    const authUserId =
+      adminModerationUuidOrNull(
+        authResult?.user?.id
+      );
+
+    if (!authUserId) {
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+    }
+
+    if (!supabaseServiceRole) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+    }
+
+    try {
+      const selectFields = [
+        "id",
+        "auth_user_id",
+        "account_status",
+        "moderation_reason",
+        "blocked_at",
+        "blocked_until",
+        "moderation_updated_at",
+      ].join(",");
+
+      const {
+        data: profile,
+        error: profileError,
+      } =
+        await supabaseServiceRole
+          .from("profiles")
+          .select(selectFields)
+          .eq(
+            "auth_user_id",
+            authUserId
+          )
+          .limit(1)
+          .maybeSingle();
+
+      if (profileError) {
+        console.error(
+          "[AUTODEAR][ACCOUNT][MODERATION_STATUS_LOAD_FAILED]",
+          {
+            authUserId,
+            message:
+              profileError.message ||
+              null,
+          }
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "ACCOUNT_MODERATION_STATUS_LOAD_FAILED",
+          });
+      }
+
+      /*
+       * Старые аккаунты без строки profiles
+       * не считаем заблокированными.
+       */
+      if (!profile) {
+        return res.json({
+          ok: true,
+
+          account: {
+            status:
+              "active",
+
+            moderationReason:
+              "",
+
+            blockedAt:
+              null,
+
+            blockedUntil:
+              null,
+
+            expired:
+              false,
+          },
+        });
+      }
+
+      const status =
+        String(
+          profile.account_status ||
+            "active"
+        )
+          .trim()
+          .toLowerCase();
+
+      const blockedUntil =
+        profile.blocked_until ||
+        null;
+
+      const blockedUntilMs =
+        blockedUntil
+          ? new Date(
+              blockedUntil
+            ).getTime()
+          : NaN;
+
+      const expired =
+        status === "blocked" &&
+        Boolean(blockedUntil) &&
+        Number.isFinite(
+          blockedUntilMs
+        ) &&
+        blockedUntilMs <=
+          Date.now();
+
+      /*
+       * Временный срок закончился.
+       * Снимаем блокировку автоматически.
+       */
+      if (expired) {
+        const nowIso =
+          new Date()
+            .toISOString();
+
+        const {
+          data: restored,
+          error: restoreError,
+        } =
+          await supabaseServiceRole
+            .from("profiles")
+            .update({
+              account_status:
+                "active",
+
+              moderation_reason:
+                null,
+
+              blocked_at:
+                null,
+
+              blocked_until:
+                null,
+
+              blocked_by_auth_user_id:
+                null,
+
+              moderation_updated_at:
+                nowIso,
+            })
+            .eq(
+              "id",
+              profile.id
+            )
+            .select(
+              selectFields
+            )
+            .single();
+
+        if (restoreError) {
+          console.error(
+            "[AUTODEAR][ACCOUNT][AUTO_UNBLOCK_FAILED]",
+            {
+              authUserId,
+              message:
+                restoreError.message ||
+                null,
+            }
+          );
+
+          /*
+           * При ошибке снятия не разрешаем обходить
+           * действующий blocked state.
+           */
+          return res.json({
+            ok: true,
+
+            account: {
+              status:
+                "blocked",
+
+              moderationReason:
+                profile
+                  .moderation_reason ||
+                "",
+
+              blockedAt:
+                profile.blocked_at ||
+                null,
+
+              blockedUntil,
+
+              expired:
+                true,
+            },
+          });
+        }
+
+        console.log(
+          "[AUTODEAR][ACCOUNT][AUTO_UNBLOCKED]",
+          {
+            authUserId,
+            profileId:
+              profile.id,
+            expiredAt:
+              blockedUntil,
+          }
+        );
+
+        return res.json({
+          ok: true,
+
+          account: {
+            status:
+              restored
+                ?.account_status ||
+              "active",
+
+            moderationReason:
+              "",
+
+            blockedAt:
+              null,
+
+            blockedUntil:
+              null,
+
+            expired:
+              true,
+          },
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        account: {
+          status,
+
+          moderationReason:
+            profile
+              .moderation_reason ||
+            "",
+
+          blockedAt:
+            profile.blocked_at ||
+            null,
+
+          blockedUntil,
+
+          expired:
+            false,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][ACCOUNT][MODERATION_STATUS_FATAL]",
+        {
+          authUserId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "ACCOUNT_MODERATION_STATUS_FATAL",
+        });
+    }
+  }
+);
+
+
 app.get(
   "/api/admin/moderation/accounts/:targetId",
   async (req, res) => {
@@ -1677,6 +1989,67 @@ app.get(
 
     const profile =
       resolved.profile;
+
+    /*
+     * LEGACY_AUTH_BAN_RELEASE_ON_ADMIN_READ_V1
+     *
+     * До ACCOUNT_BLOCK_GATE_V2 часть заблокированных
+     * пользователей могла иметь Supabase Auth ban.
+     *
+     * При открытии такого аккаунта администратором
+     * снимаем старый Auth-ban в фоне, сохраняя
+     * profiles.account_status = blocked.
+     */
+    if (
+      String(
+        profile.account_status ||
+          ""
+      ).toLowerCase() ===
+      "blocked"
+    ) {
+      void supabaseServiceRole
+        .auth
+        .admin
+        .updateUserById(
+          profile.auth_user_id,
+          {
+            ban_duration:
+              "none",
+          }
+        )
+        .then(
+          ({ error }) => {
+            if (error) {
+              console.warn(
+                "[AUTODEAR][ADMIN][LEGACY_AUTH_BAN_READ_RELEASE_FAILED]",
+                {
+                  targetAuthUserId:
+                    profile
+                      .auth_user_id,
+                  message:
+                    error.message ||
+                    null,
+                }
+              );
+            }
+          }
+        )
+        .catch(
+          (error) => {
+            console.warn(
+              "[AUTODEAR][ADMIN][LEGACY_AUTH_BAN_READ_RELEASE_ERROR]",
+              {
+                targetAuthUserId:
+                  profile
+                    .auth_user_id,
+                message:
+                  error?.message ||
+                  String(error),
+              }
+            );
+          }
+        );
+    }
 
     return res.json({
       ok: true,
@@ -1959,30 +2332,6 @@ app.post(
         });
     }
 
-    const {
-      data: authLookup,
-      error: authLookupError,
-    } =
-      await supabaseServiceRole
-        .auth
-        .admin
-        .getUserById(
-          targetAuthUserId
-        );
-
-    if (
-      authLookupError ||
-      !authLookup?.user
-    ) {
-      return res
-        .status(404)
-        .json({
-          ok: false,
-          error:
-            "AUTH_USER_NOT_FOUND",
-        });
-    }
-
     const now =
       new Date();
 
@@ -1999,34 +2348,6 @@ app.post(
                 .milliseconds
           ).toISOString()
         : null;
-
-    const previousProfileState = {
-      account_status:
-        profile.account_status ||
-        "active",
-
-      moderation_reason:
-        profile.moderation_reason ||
-        null,
-
-      blocked_at:
-        profile.blocked_at ||
-        null,
-
-      blocked_until:
-        profile.blocked_until ||
-        null,
-
-      blocked_by_auth_user_id:
-        profile
-          .blocked_by_auth_user_id ||
-        null,
-
-      moderation_updated_at:
-        profile
-          .moderation_updated_at ||
-        null,
-    };
 
     const nextProfileState =
       action === "block"
@@ -2121,73 +2442,55 @@ app.post(
         });
     }
 
-    const authBanDuration =
-      action === "block"
-        ? durationConfig
-            .banDuration
-        : "none";
-
-    const {
-      data: authUpdated,
-      error: authUpdateError,
-    } =
-      await supabaseServiceRole
-        .auth
-        .admin
-        .updateUserById(
-          targetAuthUserId,
-          {
-            ban_duration:
-              authBanDuration,
-          }
-        );
-
-    if (authUpdateError) {
-      const {
-        error: rollbackError,
-      } =
-        await supabaseServiceRole
-          .from("profiles")
-          .update(
-            previousProfileState
-          )
-          .eq(
-            "id",
-            profile.id
-          );
-
-      if (rollbackError) {
-        console.error(
-          "[AUTODEAR][ADMIN][ACCOUNT_PROFILE_ROLLBACK_FAILED]",
-          {
-            targetAuthUserId,
-            action,
-            message:
-              rollbackError.message ||
-              null,
-          }
-        );
-      }
-
-      console.error(
-        "[AUTODEAR][ADMIN][ACCOUNT_AUTH_UPDATE_FAILED]",
+    /*
+     * ACCOUNT_AUTH_BAN_REMOVED_V2
+     *
+     * AUTODEAR блокирует доступ через profiles.account_status.
+     * Supabase Auth должен оставаться доступным, иначе
+     * пользователь не сможет войти и увидеть причину блокировки.
+     *
+     * Одновременно снимаем возможный legacy-ban от старой схемы.
+     * Не ждём этот запрос, чтобы административное действие
+     * не зависело от задержек Supabase Auth Admin API.
+     */
+    void supabaseServiceRole
+      .auth
+      .admin
+      .updateUserById(
+        targetAuthUserId,
         {
-          targetAuthUserId,
-          action,
-          message:
-            authUpdateError.message ||
-            null,
+          ban_duration:
+            "none",
+        }
+      )
+      .then(
+        ({ error }) => {
+          if (error) {
+            console.warn(
+              "[AUTODEAR][ADMIN][LEGACY_AUTH_BAN_RELEASE_FAILED]",
+              {
+                targetAuthUserId,
+                message:
+                  error.message ||
+                  null,
+              }
+            );
+          }
+        }
+      )
+      .catch(
+        (error) => {
+          console.warn(
+            "[AUTODEAR][ADMIN][LEGACY_AUTH_BAN_RELEASE_ERROR]",
+            {
+              targetAuthUserId,
+              message:
+                error?.message ||
+                String(error),
+            }
+          );
         }
       );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            "ACCOUNT_AUTH_UPDATE_FAILED",
-        });
-    }
 
     const warnings = [];
 
@@ -2316,9 +2619,6 @@ app.post(
           null,
 
         authBannedUntil:
-          authUpdated
-            ?.user
-            ?.banned_until ||
           null,
       },
 
