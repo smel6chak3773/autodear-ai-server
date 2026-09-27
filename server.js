@@ -25731,6 +25731,55 @@ function normalizeBusinessListingPhotoUrl(
 
 
 /*
+ * STAFF_CREATE_DIAGNOSTICS_V1
+ *
+ * TEMPORARY release diagnostic.
+ *
+ * Stores only technical stage/timing information.
+ * No business form payload, phone, address or photo is stored.
+ */
+let latestStaffBusinessListingCreateDiagnostic =
+  null;
+
+
+function markStaffBusinessListingCreateDiagnostic(
+  requestId,
+  startedAt,
+  stage,
+  extra = {}
+) {
+  const now =
+    Date.now();
+
+  latestStaffBusinessListingCreateDiagnostic = {
+    requestId,
+    stage,
+
+    startedAt:
+      new Date(
+        startedAt
+      ).toISOString(),
+
+    updatedAt:
+      new Date(
+        now
+      ).toISOString(),
+
+    elapsedMs:
+      now -
+      startedAt,
+
+    ...extra,
+  };
+
+  console.log(
+    "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_DIAG]",
+    latestStaffBusinessListingCreateDiagnostic
+  );
+}
+
+
+/*
  * Dry-run duplicate check for AUTODEAR staff.
  *
  * IMPORTANT:
@@ -25920,6 +25969,18 @@ app.post(
 app.post(
   "/api/business-directory/staff/listings",
   async (req, res) => {
+    const diagnosticRequestId =
+      crypto.randomUUID();
+
+    const diagnosticStartedAt =
+      Date.now();
+
+    markStaffBusinessListingCreateDiagnostic(
+      diagnosticRequestId,
+      diagnosticStartedAt,
+      "received"
+    );
+
     try {
       if (!supabase) {
         return res.status(500).json({
@@ -25929,12 +25990,24 @@ app.post(
         });
       }
 
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "auth_start"
+      );
+
       const {
         user,
       } =
         await requireBusinessDirectoryStaffUser(
           req
         );
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "auth_done"
+      );
 
       const body =
         req.body &&
@@ -26301,6 +26374,16 @@ app.post(
       if (
         requestedServiceIds.length
       ) {
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "service_catalog_start",
+          {
+            serviceCount:
+              requestedServiceIds.length,
+          }
+        );
+
         const {
           data: catalog,
           error: catalogError,
@@ -26317,6 +26400,18 @@ app.post(
             "id",
             requestedServiceIds
           );
+
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "service_catalog_done",
+          {
+            hasError:
+              Boolean(
+                catalogError
+              ),
+          }
+        );
 
         if (catalogError) {
           console.error(
@@ -26462,6 +26557,12 @@ app.post(
        * участвовать в оценке вместе с названием,
        * городом или телефоном.
        */
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "duplicate_lookup_start"
+      );
+
       const duplicateCandidates =
         await findBusinessListingDuplicateCandidates({
           name,
@@ -26469,6 +26570,16 @@ app.post(
           city,
           phone,
         });
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "duplicate_lookup_done",
+        {
+          candidateCount:
+            duplicateCandidates.length,
+        }
+      );
 
       const blockingDuplicates =
         duplicateCandidates.filter(
@@ -26599,6 +26710,12 @@ app.post(
           false,
       };
 
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "station_insert_start"
+      );
+
       const {
         data: station,
         error: stationError,
@@ -26625,6 +26742,23 @@ app.post(
           ].join(",")
         )
         .single();
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "station_insert_done",
+        {
+          hasError:
+            Boolean(
+              stationError
+            ),
+
+          stationCreated:
+            Boolean(
+              station?.id
+            ),
+        }
+      );
 
       if (stationError) {
         console.error(
@@ -26669,6 +26803,16 @@ app.post(
             })
           );
 
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "station_services_start",
+          {
+            serviceCount:
+              stationServiceTemplates.length,
+          }
+        );
+
         const {
           error:
             servicesSaveError,
@@ -26679,6 +26823,18 @@ app.post(
           .upsert(
             stationServiceRows
           );
+
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "station_services_done",
+          {
+            hasError:
+              Boolean(
+                servicesSaveError
+              ),
+          }
+        );
 
         if (
           servicesSaveError
@@ -26763,6 +26919,12 @@ app.post(
        * Revoke any unexpected active code before inserting
        * the current one. Normally a brand-new station has none.
        */
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "claim_revoke_start"
+      );
+
       await supabase
         .from(
           "business_listing_claim_codes"
@@ -26782,6 +26944,18 @@ app.post(
           "status",
           "active"
         );
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "claim_revoke_done"
+      );
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "claim_code_insert_start"
+      );
 
       const {
         error: codeError,
@@ -26805,6 +26979,18 @@ app.post(
           issued_by_user_id:
             user.id,
         });
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "claim_code_insert_done",
+        {
+          hasError:
+            Boolean(
+              codeError
+            ),
+        }
+      );
 
       if (codeError) {
         /*
@@ -26858,6 +27044,16 @@ app.post(
             "BUSINESS_LISTING_CODE_CREATE_FAILED",
         });
       }
+
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "success",
+        {
+          stationCreated:
+            true,
+        }
+      );
 
       return res.status(201).json({
         ok: true,
@@ -26918,6 +27114,23 @@ app.post(
           codeHint,
       });
     } catch (error) {
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "fatal",
+        {
+          error:
+            String(
+              error?.message ||
+              error ||
+              "UNKNOWN"
+            ).slice(
+              0,
+              160
+            ),
+        }
+      );
+
       const status =
         Number(
           error?.statusCode ||
@@ -26943,6 +27156,48 @@ app.post(
     }
   }
 );
+
+/*
+ * TEMPORARY STAFF CREATE DIAGNOSTIC.
+ *
+ * Protected by the same staff authorization as creation.
+ * Remove after release blocker is diagnosed.
+ */
+app.get(
+  "/api/business-directory/staff/listings/diagnostics/latest",
+  async (req, res) => {
+    try {
+      await requireBusinessDirectoryStaffUser(
+        req
+      );
+
+      return res.json({
+        ok: true,
+
+        diagnostic:
+          latestStaffBusinessListingCreateDiagnostic,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res
+        .status(status)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "STAFF_CREATE_DIAGNOSTIC_FAILED",
+        });
+    }
+  }
+);
+
 
 /*
  * Delete an AUTODEAR staff-created listing
