@@ -25961,6 +25961,153 @@ app.post(
           body.phone || ""
         ).trim();
 
+      /*
+       * STAFF_DIRECTORY_WORK_SCHEDULE_FINAL_V1
+       */
+      const effectivePhone =
+        String(phone || "")
+          .replace(/\D/g, "")
+          .length > 1
+            ? phone
+            : "";
+
+      const works24x7 =
+        body.works24x7 === true ||
+        body.works_24_7 === true;
+
+      const rawWorkSchedule =
+        Array.isArray(
+          body.workSchedule
+        )
+          ? body.workSchedule
+          : Array.isArray(
+              body.work_schedule
+            )
+          ? body.work_schedule
+          : [];
+
+      const dayDefinitions = [
+        ["mon", "Понедельник", "Пн"],
+        ["tue", "Вторник", "Вт"],
+        ["wed", "Среда", "Ср"],
+        ["thu", "Четверг", "Чт"],
+        ["fri", "Пятница", "Пт"],
+        ["sat", "Суббота", "Сб"],
+        ["sun", "Воскресенье", "Вс"],
+      ];
+
+      const workSchedule =
+        dayDefinitions.map(
+          ([id, title, short]) => {
+            const source =
+              rawWorkSchedule.find(
+                (item) =>
+                  String(
+                    item?.id || ""
+                  )
+                    .trim()
+                    .toLowerCase() ===
+                  id
+              );
+
+            return {
+              id,
+              title,
+              short,
+
+              enabled:
+                source?.enabled ===
+                true,
+
+              open:
+                String(
+                  source?.open ||
+                    "08:00"
+                ).trim(),
+
+              close:
+                String(
+                  source?.close ||
+                    "18:00"
+                ).trim(),
+            };
+          }
+        );
+
+      if (!works24x7) {
+        const activeDays =
+          workSchedule.filter(
+            (day) =>
+              day.enabled
+          );
+
+        if (!activeDays.length) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+
+              error:
+                "BUSINESS_LISTING_WORK_SCHEDULE_REQUIRED",
+
+              message:
+                "Выберите хотя бы один рабочий день.",
+            });
+        }
+
+        const timePattern =
+          /^([01]\d|2[0-3]):[0-5]\d$/;
+
+        const invalidDay =
+          activeDays.find(
+            (day) =>
+              !timePattern.test(
+                day.open
+              ) ||
+              !timePattern.test(
+                day.close
+              ) ||
+              day.open ===
+                day.close
+          );
+
+        if (invalidDay) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+
+              error:
+                "BUSINESS_LISTING_WORK_SCHEDULE_INVALID",
+
+              message:
+                `Проверьте график для дня «${invalidDay.title}».`,
+            });
+        }
+      }
+
+      const workHours =
+        works24x7
+          ? "Круглосуточно"
+          : (
+              String(
+                body.workHours ||
+                  body.work_hours ||
+                  ""
+              ).trim() ||
+              workSchedule
+                .filter(
+                  (day) =>
+                    day.enabled
+                )
+                .map(
+                  (day) =>
+                    `${day.short} · ${day.open}–${day.close}`
+                )
+                .join("; ")
+            );
+
+
 
       const addressFull =
         String(
@@ -26392,7 +26539,25 @@ app.post(
         name,
         address,
         city: city || null,
-        phone: phone || null,
+        phone:
+          effectivePhone ||
+          null,
+
+        work_hours:
+          workHours,
+
+        work_schedule:
+          workSchedule,
+
+        works_24_7:
+          works24x7,
+
+        /*
+         * Карточка без подтверждённого владельца
+         * не принимает онлайн-записи.
+         */
+        online_booking_enabled:
+          false,
 
         directions,
 
