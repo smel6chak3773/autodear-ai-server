@@ -23997,7 +23997,18 @@ function mapBusinessListingBillingPlan(
 app.get(
   "/api/director/business-listing-billing/settings",
   async (req, res) => {
+    const billingPerfStartedAt =
+      Date.now();
+
     try {
+      console.log(
+        "[AUTODEAR][BILLING_PERF][REQUEST_START]",
+        {
+          at:
+            billingPerfStartedAt,
+        }
+      );
+
       if (
         !supabaseServiceRole
       ) {
@@ -24008,9 +24019,28 @@ app.get(
         });
       }
 
+      const authStartedAt =
+        Date.now();
+
       await requireBusinessListingBillingDirectorUser(
         req
       );
+
+      console.log(
+        "[AUTODEAR][BILLING_PERF][AUTH_DONE]",
+        {
+          ms:
+            Date.now() -
+            authStartedAt,
+
+          totalMs:
+            Date.now() -
+            billingPerfStartedAt,
+        }
+      );
+
+      const queriesStartedAt =
+        Date.now();
 
       const [
         settingsResult,
@@ -24041,6 +24071,29 @@ app.get(
               }
             ),
         ]);
+
+      console.log(
+        "[AUTODEAR][BILLING_PERF][QUERIES_DONE]",
+        {
+          ms:
+            Date.now() -
+            queriesStartedAt,
+
+          totalMs:
+            Date.now() -
+            billingPerfStartedAt,
+
+          settingsError:
+            settingsResult.error
+              ?.code ||
+            null,
+
+          plansError:
+            plansResult.error
+              ?.code ||
+            null,
+        }
+      );
 
       if (
         settingsResult.error ||
@@ -24085,6 +24138,15 @@ app.get(
             "BUSINESS_LISTING_BILLING_SETTINGS_MISSING",
         });
       }
+
+      console.log(
+        "[AUTODEAR][BILLING_PERF][RESPONSE_READY]",
+        {
+          totalMs:
+            Date.now() -
+            billingPerfStartedAt,
+        }
+      );
 
       return res.json({
         ok: true,
