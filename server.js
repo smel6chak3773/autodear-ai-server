@@ -25954,6 +25954,74 @@ app.post(
         body.allowDuplicate ===
         true;
 
+      /*
+       * Classification comes from the canonical
+       * AUTODEAR business catalog selected by staff.
+       *
+       * These are explicit whitelisted fields only.
+       * No arbitrary client properties are spread
+       * into the stations row.
+       */
+      const directions =
+        Array.from(
+          new Set(
+            (
+              Array.isArray(
+                body.directions
+              )
+                ? body.directions
+                : []
+            )
+              .map(
+                (item) =>
+                  String(
+                    item || ""
+                  )
+                    .trim()
+                    .slice(
+                      0,
+                      80
+                    )
+              )
+              .filter(
+                Boolean
+              )
+          )
+        ).slice(
+          0,
+          12
+        );
+
+      const services =
+        Array.from(
+          new Set(
+            (
+              Array.isArray(
+                body.services
+              )
+                ? body.services
+                : []
+            )
+              .map(
+                (item) =>
+                  String(
+                    item || ""
+                  )
+                    .trim()
+                    .slice(
+                      0,
+                      160
+                    )
+              )
+              .filter(
+                Boolean
+              )
+          )
+        ).slice(
+          0,
+          100
+        );
+
       if (!name) {
         return res.status(400).json({
           ok: false,
@@ -25980,6 +26048,21 @@ app.post(
             "Выберите город сервиса.",
         });
       }
+
+      if (
+        !directions.length
+      ) {
+        return res.status(400).json({
+          ok: false,
+
+          error:
+            "BUSINESS_LISTING_DIRECTION_REQUIRED",
+
+          message:
+            "Выберите направление бизнеса.",
+        });
+      }
+
 
       if (
         latitude == null ||
@@ -26071,6 +26154,10 @@ app.post(
         city: city || null,
         phone: phone || null,
 
+        directions,
+
+        services,
+
         address_full:
           addressFull ||
           address,
@@ -26127,6 +26214,8 @@ app.post(
             "address",
             "city",
             "phone",
+            "directions",
+            "services",
             "photo_url",
             "created_source",
             "created_by_user_id",
@@ -26287,6 +26376,20 @@ app.post(
 
           phone:
             station.phone,
+
+          directions:
+            Array.isArray(
+              station.directions
+            )
+              ? station.directions
+              : [],
+
+          services:
+            Array.isArray(
+              station.services
+            )
+              ? station.services
+              : [],
 
           photoUrl:
             station.photo_url ||
