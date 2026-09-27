@@ -25992,35 +25992,55 @@ app.post(
           12
         );
 
-      const services =
+      const requestedServices =
+        Array.isArray(
+          body.services
+        )
+          ? body.services
+          : [];
+
+      const requestedServiceMap =
+        new Map();
+
+      for (
+        const raw of
+        requestedServices
+      ) {
+        const serviceId =
+          String(
+            raw?.serviceId ||
+            raw?.id ||
+            ""
+          ).trim();
+
+        if (!serviceId) {
+          continue;
+        }
+
+        requestedServiceMap.set(
+          serviceId,
+          {
+            serviceId,
+
+            direction:
+              String(
+                raw?.direction ||
+                ""
+              ).trim(),
+          }
+        );
+      }
+
+      const requestedServiceIds =
         Array.from(
-          new Set(
-            (
-              Array.isArray(
-                body.services
-              )
-                ? body.services
-                : []
-            )
-              .map(
-                (item) =>
-                  String(
-                    item || ""
-                  )
-                    .trim()
-                    .slice(
-                      0,
-                      160
-                    )
-              )
-              .filter(
-                Boolean
-              )
-          )
+          requestedServiceMap.keys()
         ).slice(
           0,
           100
         );
+
+      let serviceCatalogRows = [];
+
 
       if (!name) {
         return res.status(400).json({
@@ -26050,7 +26070,7 @@ app.post(
       }
 
       if (
-        !directions.length
+        directions.length !== 1
       ) {
         return res.status(400).json({
           ok: false,
@@ -26059,8 +26079,135 @@ app.post(
             "BUSINESS_LISTING_DIRECTION_REQUIRED",
 
           message:
-            "Выберите направление бизнеса.",
+            "Выберите одно направление бизнеса.",
         });
+      }
+
+      const primaryDirection =
+        directions[0];
+
+
+      if (
+        requestedServiceIds.length
+      ) {
+        const {
+          data: catalog,
+          error: catalogError,
+        } = await supabase
+          .from("services")
+          .select(
+            [
+              "id",
+              "title",
+              "category",
+            ].join(",")
+          )
+          .in(
+            "id",
+            requestedServiceIds
+          );
+
+        if (catalogError) {
+          console.error(
+            "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_SERVICE_CATALOG_ERROR]",
+            {
+              userId:
+                user.id,
+
+              code:
+                catalogError.code ||
+                null,
+
+              message:
+                catalogError.message ||
+                null,
+            }
+          );
+
+          return res.status(500).json({
+            ok: false,
+
+            error:
+              "SERVICE_CATALOG_LOOKUP_FAILED",
+          });
+        }
+
+        serviceCatalogRows =
+          Array.isArray(
+            catalog
+          )
+            ? catalog
+            : [];
+
+        const validIds =
+          new Set(
+            serviceCatalogRows.map(
+              (item) =>
+                String(
+                  item?.id ||
+                  ""
+                )
+            )
+          );
+
+        const invalidIds =
+          requestedServiceIds.filter(
+            (serviceId) =>
+              !validIds.has(
+                serviceId
+              )
+          );
+
+        if (
+          invalidIds.length
+        ) {
+          return res.status(400).json({
+            ok: false,
+
+            error:
+              "UNKNOWN_SERVICE",
+
+            invalidServiceIds:
+              invalidIds,
+          });
+        }
+
+        const invalidDirections =
+          requestedServiceIds.filter(
+            (serviceId) => {
+              const requested =
+                requestedServiceMap.get(
+                  serviceId
+                );
+
+              const requestedDirection =
+                String(
+                  requested
+                    ?.direction ||
+                    ""
+                ).trim();
+
+              return (
+                requestedDirection &&
+                requestedDirection !==
+                  primaryDirection
+              );
+            }
+          );
+
+        if (
+          invalidDirections.length
+        ) {
+          return res.status(400).json({
+            ok: false,
+
+            error:
+              "BUSINESS_SERVICE_DIRECTION_MISMATCH",
+
+            invalidServiceIds:
+              invalidDirections,
+          });
+        }
       }
 
 
@@ -26147,6 +26294,37 @@ app.post(
        * Do not pass arbitrary client fields into stations.
        * Keep the staff creation surface intentionally small.
        */
+      const stationServiceTemplates =
+        serviceCatalogRows.map(
+          (catalogItem) => {
+            const serviceId =
+              String(
+                catalogItem?.id ||
+                ""
+              );
+
+            return {
+              serviceId,
+
+              title:
+                String(
+                  catalogItem?.title ||
+                  "Услуга"
+                ).trim(),
+
+              direction:
+                primaryDirection,
+            };
+          }
+        );
+
+      const services =
+        stationServiceTemplates.map(
+          (item) =>
+            item.title
+        );
+
+
       const stationPayload = {
         owner_id: null,
         name,
@@ -26244,6 +26422,106 @@ app.post(
             "BUSINESS_LISTING_CREATE_FAILED",
         });
       }
+
+      if (
+        stationServiceTemplates.length
+      ) {
+        const stationServiceRows =
+          stationServiceTemplates.map(
+            (item) => ({
+              id:
+                `${station.id}_${item.serviceId}`,
+
+              station_id:
+                station.id,
+
+              service_id:
+                item.serviceId,
+
+              title:
+                item.title,
+
+              direction:
+                item.direction,
+            })
+          );
+
+        const {
+          error:
+            servicesSaveError,
+        } = await supabase
+          .from(
+            "station_services"
+          )
+          .upsert(
+            stationServiceRows
+          );
+
+        if (
+          servicesSaveError
+        ) {
+          console.error(
+            "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_SERVICES_SAVE_ERROR]",
+            {
+              stationId:
+                station.id,
+
+              userId:
+                user.id,
+
+              code:
+                servicesSaveError
+                  .code ||
+                null,
+
+              message:
+                servicesSaveError
+                  .message ||
+                null,
+            }
+          );
+
+          const {
+            error:
+              cleanupError,
+          } = await supabase
+            .from("stations")
+            .delete()
+            .eq(
+              "id",
+              station.id
+            )
+            .is(
+              "owner_id",
+              null
+            )
+            .eq(
+              "created_source",
+              "autodear_staff"
+            )
+            .eq(
+              "ownership_status",
+              "unclaimed"
+            );
+
+          if (
+            cleanupError
+          ) {
+            console.error(
+              "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_SERVICES_CLEANUP_ERROR]",
+              cleanupError
+            );
+          }
+
+          return res.status(500).json({
+            ok: false,
+
+            error:
+              "BUSINESS_SERVICES_SAVE_FAILED",
+          });
+        }
+      }
+
 
       const claimCode =
         createBusinessListingClaimCode();
