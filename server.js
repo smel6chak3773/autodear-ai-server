@@ -25976,9 +25976,12 @@ app.post(
       Date.now();
 
     /*
-     * STAFF_CREATE_DIAGNOSTICS_V2
+     * STAFF_CREATE_DIAGNOSTICS_V3
      *
      * finish = Express successfully completed the HTTP response.
+     * Preserve the last business stage before response_finished,
+     * otherwise the useful failure stage is lost.
+     *
      * close without finish = connection ended before response completed.
      */
     let diagnosticResponseFinished =
@@ -25990,6 +25993,13 @@ app.post(
         diagnosticResponseFinished =
           true;
 
+        const previousDiagnostic =
+          latestStaffBusinessListingCreateDiagnostic
+            ?.requestId ===
+          diagnosticRequestId
+            ? latestStaffBusinessListingCreateDiagnostic
+            : null;
+
         markStaffBusinessListingCreateDiagnostic(
           diagnosticRequestId,
           diagnosticStartedAt,
@@ -25997,6 +26007,21 @@ app.post(
           {
             httpStatus:
               res.statusCode,
+
+            previousStage:
+              previousDiagnostic
+                ?.stage ||
+              null,
+
+            previousHasError:
+              previousDiagnostic
+                ?.hasError ===
+              true,
+
+            previousStationCreated:
+              previousDiagnostic
+                ?.stationCreated ===
+              true,
           }
         );
       }
