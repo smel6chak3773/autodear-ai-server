@@ -25975,6 +25975,54 @@ app.post(
     const diagnosticStartedAt =
       Date.now();
 
+    /*
+     * STAFF_CREATE_DIAGNOSTICS_V2
+     *
+     * finish = Express successfully completed the HTTP response.
+     * close without finish = connection ended before response completed.
+     */
+    let diagnosticResponseFinished =
+      false;
+
+    res.on(
+      "finish",
+      () => {
+        diagnosticResponseFinished =
+          true;
+
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "response_finished",
+          {
+            httpStatus:
+              res.statusCode,
+          }
+        );
+      }
+    );
+
+    res.on(
+      "close",
+      () => {
+        if (
+          diagnosticResponseFinished
+        ) {
+          return;
+        }
+
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "response_closed_before_finish",
+          {
+            httpStatus:
+              res.statusCode,
+          }
+        );
+      }
+    );
+
     markStaffBusinessListingCreateDiagnostic(
       diagnosticRequestId,
       diagnosticStartedAt,
@@ -26467,6 +26515,16 @@ app.post(
         if (
           invalidIds.length
         ) {
+          markStaffBusinessListingCreateDiagnostic(
+            diagnosticRequestId,
+            diagnosticStartedAt,
+            "rejected_unknown_service",
+            {
+              invalidCount:
+                invalidIds.length,
+            }
+          );
+
           return res.status(400).json({
             ok: false,
 
@@ -26504,6 +26562,16 @@ app.post(
         if (
           invalidDirections.length
         ) {
+          markStaffBusinessListingCreateDiagnostic(
+            diagnosticRequestId,
+            diagnosticStartedAt,
+            "rejected_direction_mismatch",
+            {
+              invalidCount:
+                invalidDirections.length,
+            }
+          );
+
           return res.status(400).json({
             ok: false,
 
@@ -26517,6 +26585,30 @@ app.post(
       }
 
 
+      markStaffBusinessListingCreateDiagnostic(
+        diagnosticRequestId,
+        diagnosticStartedAt,
+        "post_catalog_validation",
+        {
+          hasLatitude:
+            latitude != null,
+
+          hasLongitude:
+            longitude != null,
+
+          hasPhotoUrl:
+            Boolean(
+              photoUrl
+            ),
+
+          directionCount:
+            directions.length,
+
+          serviceCount:
+            requestedServiceIds.length,
+        }
+      );
+
       if (
         latitude == null ||
         longitude == null ||
@@ -26525,6 +26617,19 @@ app.post(
         longitude < -180 ||
         longitude > 180
       ) {
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "rejected_geo_required",
+          {
+            hasLatitude:
+              latitude != null,
+
+            hasLongitude:
+              longitude != null,
+          }
+        );
+
         return res.status(400).json({
           ok: false,
           error:
@@ -26539,6 +26644,12 @@ app.post(
         rawPhotoUrl &&
         !photoUrl
       ) {
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "rejected_photo_invalid"
+        );
+
         return res.status(400).json({
           ok: false,
           error:
@@ -26594,6 +26705,16 @@ app.post(
         blockingDuplicates.length &&
         !allowDuplicate
       ) {
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "rejected_duplicate",
+          {
+            duplicateCount:
+              blockingDuplicates.length,
+          }
+        );
+
         return res.status(409).json({
           ok: false,
 
