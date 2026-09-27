@@ -25528,9 +25528,12 @@ function scoreBusinessListingCandidate(
     phone:
       row?.phone || null,
 
+    /*
+     * STATIONS_PHOTO_URL_CANONICAL_V1
+     * Remote stations schema uses photo_url.
+     */
     photoUrl:
       row?.photo_url ||
-      row?.image_url ||
       null,
 
     businessType:
@@ -25577,7 +25580,6 @@ async function findBusinessListingDuplicateCandidates(
           "city",
           "phone",
           "photo_url",
-          "image_url",
           "business_type",
           "ownership_status",
           "created_source",
@@ -26573,12 +26575,6 @@ app.post(
 
         ...(photoUrl
           ? {
-              image:
-                photoUrl,
-
-              photo:
-                photoUrl,
-
               photo_url:
                 photoUrl,
             }
