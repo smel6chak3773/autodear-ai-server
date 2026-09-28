@@ -27202,6 +27202,21 @@ app.post(
         claimed_at:
           null,
 
+        /*
+         * STAFF_PUBLIC_UNCLAIMED_V1
+         *
+         * Карточка, созданная сотрудником AUTODEAR,
+         * сразу видна в публичном каталоге.
+         * Владение при этом НЕ передаётся:
+         * owner_id остаётся null,
+         * ownership_status остаётся unclaimed.
+         */
+        status:
+          "active",
+
+        is_active:
+          true,
+
         is_verified:
           false,
       };
