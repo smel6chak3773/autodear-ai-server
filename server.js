@@ -25779,6 +25779,347 @@ function markStaffBusinessListingCreateDiagnostic(
 }
 
 
+
+/*
+ * STAFF_BUSINESS_PHOTO_PROXY_V1
+ *
+ * Staff mobile clients must not upload directly to Supabase Storage.
+ * The authenticated AUTODEAR backend receives the image and performs
+ * the Storage operation server-side.
+ */
+app.post(
+  "/api/business-directory/staff/listings/photo",
+  businessCardPhotoUpload.single("image"),
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const file =
+        req.file;
+
+      if (!file?.buffer?.length) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_REQUIRED",
+          message:
+            "Добавьте фотографию сервиса.",
+        });
+      }
+
+      const mimeType =
+        String(
+          file.mimetype || ""
+        ).toLowerCase();
+
+      const extensionByMime = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+      };
+
+      const extension =
+        extensionByMime[
+          mimeType
+        ];
+
+      if (!extension) {
+        return res.status(415).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_TYPE_UNSUPPORTED",
+          message:
+            "Поддерживаются фотографии JPG, PNG и WEBP.",
+        });
+      }
+
+      const safeUserId =
+        userId.replace(
+          /[^a-zA-Z0-9_-]/g,
+          "_"
+        );
+
+      const storagePath =
+        `${safeUserId}/staff_directory_${Date.now()}_${crypto
+          .randomBytes(4)
+          .toString("hex")}.${extension}`;
+
+      const {
+        error:
+          uploadError,
+      } =
+        await supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .upload(
+            storagePath,
+            file.buffer,
+            {
+              contentType:
+                mimeType,
+              upsert:
+                false,
+            }
+          );
+
+      if (uploadError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_PHOTO_UPLOAD_ERROR]",
+          JSON.stringify({
+            code:
+              uploadError.code ||
+              null,
+            message:
+              uploadError.message ||
+              null,
+          })
+        );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_UPLOAD_FAILED",
+          message:
+            "Не удалось загрузить фотографию сервиса.",
+        });
+      }
+
+      const {
+        data:
+          publicData,
+      } =
+        supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .getPublicUrl(
+            storagePath
+          );
+
+      const photoUrl =
+        String(
+          publicData
+            ?.publicUrl ||
+          ""
+        ).trim();
+
+      if (!photoUrl) {
+        await supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .remove([
+            storagePath,
+          ])
+          .catch(
+            () => null
+          );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_URL_FAILED",
+          message:
+            "Не удалось получить ссылку на фотографию.",
+        });
+      }
+
+      return res.status(201).json({
+        ok: true,
+        photoUrl,
+        storagePath,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_PHOTO_FATAL]",
+        JSON.stringify({
+          status,
+          message:
+            error?.message ||
+            String(error),
+        })
+      );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "STAFF_BUSINESS_PHOTO_FAILED",
+        });
+    }
+  }
+);
+
+
+app.delete(
+  "/api/business-directory/staff/listings/photo",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const safeUserId =
+        userId.replace(
+          /[^a-zA-Z0-9_-]/g,
+          "_"
+        );
+
+      const storagePath =
+        String(
+          req.body
+            ?.storagePath ||
+          ""
+        )
+          .trim()
+          .replace(
+            /^\/+/,
+            ""
+          );
+
+      const requiredPrefix =
+        `${safeUserId}/staff_directory_`;
+
+      if (
+        !storagePath ||
+        !storagePath.startsWith(
+          requiredPrefix
+        ) ||
+        storagePath.includes(
+          ".."
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_PATH_INVALID",
+        });
+      }
+
+      const {
+        error:
+          removeError,
+      } =
+        await supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .remove([
+            storagePath,
+          ]);
+
+      if (removeError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_PHOTO_DELETE_ERROR]",
+          JSON.stringify({
+            code:
+              removeError.code ||
+              null,
+            message:
+              removeError.message ||
+              null,
+          })
+        );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_DELETE_FAILED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      return res
+        .status(
+          status
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "STAFF_BUSINESS_PHOTO_DELETE_FAILED",
+        });
+    }
+  }
+);
+
+
 /*
  * Dry-run duplicate check for AUTODEAR staff.
  *
