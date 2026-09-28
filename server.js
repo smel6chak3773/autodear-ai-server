@@ -29547,6 +29547,471 @@ app.get(
 );
 
 
+
+/*
+ * BUSINESS_CLAIM_STAFF_REVIEW_V1
+ *
+ * Staff review of private ownership documents.
+ * Files remain PRIVATE in Storage.
+ */
+
+
+/*
+ * Staff-only document list.
+ * Every file URL is temporary.
+ */
+app.get(
+  "/api/business-directory/staff/claim-requests/:claimId/documents",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      await requireBusinessDirectoryStaffUser(
+        req
+      );
+
+      const claimId =
+        String(
+          req.params?.claimId ||
+          ""
+        ).trim();
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .select(
+          [
+            "id",
+            "station_id",
+            "requesting_auth_user_id",
+            "status",
+            "method",
+            "submitted_at",
+          ].join(",")
+        )
+        .eq(
+          "id",
+          claimId
+        )
+        .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      const {
+        data: rows,
+        error: documentsError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claim_documents"
+        )
+        .select(
+          [
+            "id",
+            "claim_id",
+            "storage_bucket",
+            "storage_path",
+            "original_name",
+            "mime_type",
+            "size_bytes",
+            "status",
+            "created_at",
+          ].join(",")
+        )
+        .eq(
+          "claim_id",
+          claimId
+        )
+        .eq(
+          "status",
+          "active"
+        )
+        .order(
+          "created_at",
+          {
+            ascending:
+              true,
+          }
+        );
+
+      if (documentsError) {
+        throw documentsError;
+      }
+
+      const documents = [];
+
+      for (
+        const row of
+        Array.isArray(rows)
+          ? rows
+          : []
+      ) {
+        const bucket =
+          String(
+            row?.storage_bucket ||
+            "business-claim-documents"
+          ).trim();
+
+        const storagePath =
+          String(
+            row?.storage_path ||
+            ""
+          ).trim();
+
+        if (!storagePath) {
+          continue;
+        }
+
+        const {
+          data: signed,
+          error: signedError,
+        } = await supabaseServiceRole
+          .storage
+          .from(bucket)
+          .createSignedUrl(
+            storagePath,
+            10 * 60
+          );
+
+        if (
+          signedError ||
+          !signed?.signedUrl
+        ) {
+          console.warn(
+            "[AUTODEAR][BUSINESS_CLAIM][STAFF_DOCUMENT_SIGN_FAILED]",
+            {
+              claimId,
+              documentId:
+                row?.id ||
+                null,
+              message:
+                signedError?.message ||
+                null,
+            }
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              "BUSINESS_CLAIM_DOCUMENT_SIGN_FAILED",
+          });
+        }
+
+        documents.push({
+          id:
+            row.id,
+
+          claimId:
+            row.claim_id,
+
+          originalName:
+            row.original_name ||
+            null,
+
+          mimeType:
+            row.mime_type ||
+            null,
+
+          sizeBytes:
+            row.size_bytes ??
+            null,
+
+          createdAt:
+            row.created_at ||
+            null,
+
+          url:
+            signed.signedUrl,
+
+          expiresInSeconds:
+            10 * 60,
+        });
+      }
+
+      return res.json({
+        ok: true,
+
+        claim: {
+          id:
+            claim.id,
+
+          stationId:
+            claim.station_id,
+
+          status:
+            claim.status,
+
+          submittedAt:
+            claim.submitted_at ||
+            null,
+        },
+
+        documents,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][STAFF_DOCUMENTS_FATAL]",
+        error
+      );
+
+      return res
+        .status(status)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_CLAIM_STAFF_DOCUMENTS_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Staff asks the applicant for more information.
+ */
+app.post(
+  "/api/business-directory/staff/claim-requests/:claimId/request-info",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const staff =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const claimId =
+        String(
+          req.params?.claimId ||
+          ""
+        ).trim();
+
+      const note =
+        String(
+          req.body?.note ||
+          ""
+        )
+          .trim()
+          .slice(
+            0,
+            2000
+          );
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      if (!note) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_STAFF_NOTE_REQUIRED",
+          message:
+            "Укажите, какие сведения или документы нужно предоставить.",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .select(
+          [
+            "id",
+            "station_id",
+            "status",
+            "review_started_at",
+          ].join(",")
+        )
+        .eq(
+          "id",
+          claimId
+        )
+        .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      if (
+        String(
+          claim.status ||
+          ""
+        ) !==
+        "under_review"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_REQUEST_INFO_NOT_ALLOWED",
+          status:
+            claim.status ||
+            null,
+        });
+      }
+
+      const nowIso =
+        new Date()
+          .toISOString();
+
+      const {
+        data: updatedClaim,
+        error: updateError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .update({
+          status:
+            "needs_information",
+
+          staff_note:
+            note,
+
+          review_started_at:
+            claim.review_started_at ||
+            nowIso,
+
+          needs_information_at:
+            nowIso,
+
+          last_staff_action_at:
+            nowIso,
+
+          updated_at:
+            nowIso,
+        })
+        .eq(
+          "id",
+          claimId
+        )
+        .eq(
+          "status",
+          "under_review"
+        )
+        .select(
+          [
+            "id",
+            "station_id",
+            "status",
+            "staff_note",
+            "review_started_at",
+            "needs_information_at",
+            "last_staff_action_at",
+            "updated_at",
+          ].join(",")
+        )
+        .maybeSingle();
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      if (!updatedClaim) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_REQUEST_INFO_STATE_CHANGED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        claim:
+          updatedClaim,
+
+        requestedByUserId:
+          staff?.user?.id ||
+          null,
+      });
+
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][REQUEST_INFO_FATAL]",
+        error
+      );
+
+      return res
+        .status(status)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "BUSINESS_CLAIM_REQUEST_INFO_FATAL",
+        });
+    }
+  }
+);
+
+
 app.post(
   "/api/business-directory/staff/claim-requests/:claimId/approve",
   async (req, res) => {
