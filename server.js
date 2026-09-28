@@ -35,6 +35,22 @@ const businessCardPhotoUpload = multer({
   },
 });
 
+
+/*
+ * BUSINESS_CLAIM_DOCUMENT_UPLOAD_V1
+ *
+ * Ownership proof documents are accepted only through
+ * authenticated AUTODEAR backend routes.
+ *
+ * Storage bucket itself remains PRIVATE.
+ */
+const businessClaimDocumentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 15 * 1024 * 1024,
+  },
+});
+
 const vehicleCheckCache = new Map();
 const geocodeCache = new Map();
 const routeDistanceCache = new Map();
@@ -28544,6 +28560,791 @@ app.post(
   }
 );
 
+
+
+
+/*
+ * BUSINESS_CLAIM_DOCUMENT_UPLOAD_V1
+ *
+ * Applicant document routes.
+ *
+ * Files live only in the private
+ * business-claim-documents Storage bucket.
+ */
+
+
+/*
+ * List documents already attached to applicant's own claim.
+ */
+app.get(
+  "/api/business-directory/claim/requests/:claimId/documents",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const userId =
+        String(
+          authResult?.user?.id ||
+          ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const claimId =
+        String(
+          req.params?.claimId ||
+          ""
+        ).trim();
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .select(
+          "id,station_id,requesting_auth_user_id,status,method"
+        )
+        .eq(
+          "id",
+          claimId
+        )
+        .eq(
+          "requesting_auth_user_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      const {
+        data: documents,
+        error: documentsError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claim_documents"
+        )
+        .select(
+          [
+            "id",
+            "claim_id",
+            "original_name",
+            "mime_type",
+            "size_bytes",
+            "status",
+            "created_at",
+          ].join(",")
+        )
+        .eq(
+          "claim_id",
+          claimId
+        )
+        .eq(
+          "status",
+          "active"
+        )
+        .order(
+          "created_at",
+          {
+            ascending:
+              true,
+          }
+        );
+
+      if (documentsError) {
+        throw documentsError;
+      }
+
+      return res.json({
+        ok: true,
+        claim: {
+          id:
+            claim.id,
+          stationId:
+            claim.station_id,
+          status:
+            claim.status,
+          method:
+            claim.method,
+        },
+        documents:
+          Array.isArray(documents)
+            ? documents
+            : [],
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][DOCUMENTS_LIST_FATAL]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CLAIM_DOCUMENTS_LIST_FAILED",
+      });
+    }
+  }
+);
+
+
+/*
+ * Upload one ownership proof document.
+ */
+app.post(
+  "/api/business-directory/claim/requests/:claimId/documents",
+  businessClaimDocumentUpload.single(
+    "file"
+  ),
+  async (req, res) => {
+    let uploadedStoragePath =
+      null;
+
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const userId =
+        String(
+          authResult?.user?.id ||
+          ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const claimId =
+        String(
+          req.params?.claimId ||
+          ""
+        ).trim();
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      const file =
+        req.file ||
+        null;
+
+      if (
+        !file ||
+        !file.buffer ||
+        !file.size
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_DOCUMENT_REQUIRED",
+          message:
+            "Выберите документ или фотографию.",
+        });
+      }
+
+      const mimeType =
+        String(
+          file.mimetype ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      const allowedTypes =
+        new Set([
+          "application/pdf",
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+        ]);
+
+      if (
+        !allowedTypes.has(
+          mimeType
+        )
+      ) {
+        return res.status(415).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_DOCUMENT_TYPE_NOT_ALLOWED",
+          message:
+            "Можно загрузить PDF, JPEG, PNG или WebP.",
+        });
+      }
+
+      if (
+        Number(file.size) >
+        15 * 1024 * 1024
+      ) {
+        return res.status(413).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_DOCUMENT_TOO_LARGE",
+          message:
+            "Размер одного файла не должен превышать 15 МБ.",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .select(
+          "id,station_id,requesting_auth_user_id,status,method"
+        )
+        .eq(
+          "id",
+          claimId
+        )
+        .eq(
+          "requesting_auth_user_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      if (
+        ![
+          "draft_documents",
+          "needs_information",
+        ].includes(
+          String(
+            claim.status ||
+            ""
+          )
+        )
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_DOCUMENT_UPLOAD_NOT_ALLOWED",
+        });
+      }
+
+      const extensionByMime = {
+        "application/pdf":
+          "pdf",
+        "image/jpeg":
+          "jpg",
+        "image/png":
+          "png",
+        "image/webp":
+          "webp",
+      };
+
+      const extension =
+        extensionByMime[
+          mimeType
+        ];
+
+      const documentId =
+        crypto.randomUUID();
+
+      const storagePath =
+        [
+          claimId,
+          userId,
+          `${documentId}.${extension}`,
+        ].join("/");
+
+      uploadedStoragePath =
+        storagePath;
+
+      const {
+        error: uploadError,
+      } = await supabaseServiceRole
+        .storage
+        .from(
+          "business-claim-documents"
+        )
+        .upload(
+          storagePath,
+          file.buffer,
+          {
+            contentType:
+              mimeType,
+            upsert:
+              false,
+          }
+        );
+
+      if (uploadError) {
+        throw uploadError;
+      }
+
+      const originalName =
+        String(
+          file.originalname ||
+          "Документ"
+        )
+          .trim()
+          .slice(
+            0,
+            300
+          ) ||
+        "Документ";
+
+      const {
+        data: document,
+        error: insertError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claim_documents"
+        )
+        .insert({
+          id:
+            documentId,
+
+          claim_id:
+            claimId,
+
+          uploaded_by_user_id:
+            userId,
+
+          storage_bucket:
+            "business-claim-documents",
+
+          storage_path:
+            storagePath,
+
+          original_name:
+            originalName,
+
+          mime_type:
+            mimeType,
+
+          size_bytes:
+            Number(
+              file.size
+            ),
+
+          status:
+            "active",
+        })
+        .select(
+          [
+            "id",
+            "claim_id",
+            "original_name",
+            "mime_type",
+            "size_bytes",
+            "status",
+            "created_at",
+          ].join(",")
+        )
+        .single();
+
+      if (insertError) {
+        await supabaseServiceRole
+          .storage
+          .from(
+            "business-claim-documents"
+          )
+          .remove([
+            storagePath,
+          ]);
+
+        uploadedStoragePath =
+          null;
+
+        throw insertError;
+      }
+
+      const nowIso =
+        new Date()
+          .toISOString();
+
+      await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .update({
+          last_applicant_action_at:
+            nowIso,
+
+          updated_at:
+            nowIso,
+        })
+        .eq(
+          "id",
+          claimId
+        )
+        .eq(
+          "requesting_auth_user_id",
+          userId
+        );
+
+      uploadedStoragePath =
+        null;
+
+      return res.status(201).json({
+        ok: true,
+        document,
+      });
+
+    } catch (error) {
+      if (
+        uploadedStoragePath &&
+        supabaseServiceRole
+      ) {
+        try {
+          await supabaseServiceRole
+            .storage
+            .from(
+              "business-claim-documents"
+            )
+            .remove([
+              uploadedStoragePath,
+            ]);
+        } catch {}
+      }
+
+      if (
+        error?.code ===
+        "LIMIT_FILE_SIZE"
+      ) {
+        return res.status(413).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_DOCUMENT_TOO_LARGE",
+        });
+      }
+
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][DOCUMENT_UPLOAD_FATAL]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CLAIM_DOCUMENT_UPLOAD_FAILED",
+      });
+    }
+  }
+);
+
+
+/*
+ * Submit claim for AUTODEAR staff review.
+ *
+ * At least one active proof document is mandatory.
+ */
+app.post(
+  "/api/business-directory/claim/requests/:claimId/submit",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const authResult =
+        await resolveAuthenticatedUser(
+          req
+        );
+
+      const userId =
+        String(
+          authResult?.user?.id ||
+          ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            authResult?.error ||
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const claimId =
+        String(
+          req.params?.claimId ||
+          ""
+        ).trim();
+
+      if (!claimId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_ID_REQUIRED",
+        });
+      }
+
+      const {
+        data: claim,
+        error: claimError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .select(
+          "id,station_id,requesting_auth_user_id,status,method"
+        )
+        .eq(
+          "id",
+          claimId
+        )
+        .eq(
+          "requesting_auth_user_id",
+          userId
+        )
+        .maybeSingle();
+
+      if (claimError) {
+        throw claimError;
+      }
+
+      if (!claim) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+      if (
+        ![
+          "draft_documents",
+          "needs_information",
+        ].includes(
+          String(
+            claim.status ||
+            ""
+          )
+        )
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_SUBMIT_NOT_ALLOWED",
+          status:
+            claim.status ||
+            null,
+        });
+      }
+
+      const {
+        count: documentCount,
+        error: documentCountError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claim_documents"
+        )
+        .select(
+          "id",
+          {
+            count:
+              "exact",
+            head:
+              true,
+          }
+        )
+        .eq(
+          "claim_id",
+          claimId
+        )
+        .eq(
+          "status",
+          "active"
+        );
+
+      if (documentCountError) {
+        throw documentCountError;
+      }
+
+      if (
+        !Number(
+          documentCount ||
+          0
+        )
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_DOCUMENT_REQUIRED",
+          message:
+            "Перед отправкой приложите документ, подтверждающий право использования помещения по указанному адресу.",
+        });
+      }
+
+      const nowIso =
+        new Date()
+          .toISOString();
+
+      const {
+        data: submittedClaim,
+        error: submitError,
+      } = await supabaseServiceRole
+        .from(
+          "business_listing_claims"
+        )
+        .update({
+          status:
+            "under_review",
+
+          submitted_at:
+            nowIso,
+
+          needs_information_at:
+            null,
+
+          last_applicant_action_at:
+            nowIso,
+
+          updated_at:
+            nowIso,
+        })
+        .eq(
+          "id",
+          claimId
+        )
+        .eq(
+          "requesting_auth_user_id",
+          userId
+        )
+        .in(
+          "status",
+          [
+            "draft_documents",
+            "needs_information",
+          ]
+        )
+        .select(
+          [
+            "id",
+            "station_id",
+            "status",
+            "method",
+            "chat_id",
+            "submitted_at",
+            "updated_at",
+          ].join(",")
+        )
+        .maybeSingle();
+
+      if (submitError) {
+        throw submitError;
+      }
+
+      if (!submittedClaim) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_SUBMIT_STATE_CHANGED",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        claim:
+          submittedClaim,
+        documentCount:
+          Number(
+            documentCount ||
+            0
+          ),
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_CLAIM][SUBMIT_FATAL]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_CLAIM_SUBMIT_FAILED",
+      });
+    }
+  }
+);
 
 
 /*
