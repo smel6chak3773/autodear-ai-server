@@ -28314,6 +28314,12 @@ app.post(
        * Resume the same unfinished ownership request.
        * The DB claim row is the source of truth.
        */
+      /*
+       * BUSINESS_CLAIM_APPLICANT_REVIEW_MESSAGE_V2
+       *
+       * When applicant resumes an unfinished claim,
+       * return the current AUTODEAR review message too.
+       */
       const openClaimStatuses = [
         "requested",
         "draft_documents",
@@ -28336,7 +28342,9 @@ app.post(
             "status",
             "method",
             "chat_id",
+            "staff_note",
             "submitted_at",
+            "needs_information_at",
             "created_at",
             "updated_at",
           ].join(",")
@@ -28456,7 +28464,9 @@ app.post(
             "status",
             "method",
             "chat_id",
+            "staff_note",
             "submitted_at",
+            "needs_information_at",
             "created_at",
             "updated_at",
           ].join(",")
@@ -28487,7 +28497,9 @@ app.post(
                 "status",
                 "method",
                 "chat_id",
+                "staff_note",
                 "submitted_at",
+                "needs_information_at",
                 "created_at",
                 "updated_at",
               ].join(",")
@@ -28633,7 +28645,16 @@ app.get(
           "business_listing_claims"
         )
         .select(
-          "id,station_id,requesting_auth_user_id,status,method"
+          [
+            "id",
+            "station_id",
+            "requesting_auth_user_id",
+            "status",
+            "method",
+            "staff_note",
+            "submitted_at",
+            "needs_information_at",
+          ].join(",")
         )
         .eq(
           "id",
@@ -28706,6 +28727,18 @@ app.get(
             claim.status,
           method:
             claim.method,
+
+          staffNote:
+            claim.staff_note ||
+            null,
+
+          submittedAt:
+            claim.submitted_at ||
+            null,
+
+          needsInformationAt:
+            claim.needs_information_at ||
+            null,
         },
         documents:
           Array.isArray(documents)
