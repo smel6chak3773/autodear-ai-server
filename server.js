@@ -26304,8 +26304,11 @@ app.post(
 
 
 /*
- * Staff creates an ownerless business listing and receives
- * a one-time paper confirmation code.
+ * Staff creates a public ownerless business listing.
+ *
+ * Ownership is NOT assigned here.
+ * A business user starts confirmation later through
+ * the persistent ownership-claim workflow.
  */
 app.post(
   "/api/business-directory/staff/listings",
@@ -27419,149 +27422,15 @@ app.post(
       }
 
 
-      const claimCode =
-        createBusinessListingClaimCode();
-
-      const codeDigest =
-        digestBusinessListingClaimCode(
-          claimCode
-        );
-
-      const codeHint =
-        getBusinessListingClaimCodeHint(
-          claimCode
-        );
-
       /*
-       * Revoke any unexpected active code before inserting
-       * the current one. Normally a brand-new station has none.
+       * STAFF_CREATE_NO_CLAIM_CODE_V1
+       *
+       * Staff-created business cards are published ownerless.
+       * Ownership confirmation starts only when a business user
+       * explicitly opens "Это мой бизнес" and creates a claim request.
+       *
+       * No confirmation code is generated at card creation time.
        */
-      markStaffBusinessListingCreateDiagnostic(
-        diagnosticRequestId,
-        diagnosticStartedAt,
-        "claim_revoke_start"
-      );
-
-      await supabase
-        .from(
-          "business_listing_claim_codes"
-        )
-        .update({
-          status: "revoked",
-          revoked_at:
-            new Date().toISOString(),
-          updated_at:
-            new Date().toISOString(),
-        })
-        .eq(
-          "station_id",
-          station.id
-        )
-        .eq(
-          "status",
-          "active"
-        );
-
-      markStaffBusinessListingCreateDiagnostic(
-        diagnosticRequestId,
-        diagnosticStartedAt,
-        "claim_revoke_done"
-      );
-
-      markStaffBusinessListingCreateDiagnostic(
-        diagnosticRequestId,
-        diagnosticStartedAt,
-        "claim_code_insert_start"
-      );
-
-      const {
-        error: codeError,
-      } = await supabase
-        .from(
-          "business_listing_claim_codes"
-        )
-        .insert({
-          station_id:
-            station.id,
-
-          code_digest:
-            codeDigest,
-
-          code_hint:
-            codeHint,
-
-          status:
-            "active",
-
-          issued_by_user_id:
-            user.id,
-        });
-
-      markStaffBusinessListingCreateDiagnostic(
-        diagnosticRequestId,
-        diagnosticStartedAt,
-        "claim_code_insert_done",
-        {
-          hasError:
-            Boolean(
-              codeError
-            ),
-        }
-      );
-
-      if (codeError) {
-        /*
-         * Do not leave a public claimable listing without
-         * its confirmation credential.
-         */
-        const {
-          error: cleanupError,
-        } = await supabase
-          .from("stations")
-          .delete()
-          .eq(
-            "id",
-            station.id
-          )
-          .is(
-            "owner_id",
-            null
-          )
-          .eq(
-            "created_source",
-            "autodear_staff"
-          )
-          .eq(
-            "ownership_status",
-            "unclaimed"
-          );
-
-        if (cleanupError) {
-          console.error(
-            "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_CLEANUP_ERROR]",
-            cleanupError
-          );
-        }
-
-        console.error(
-          "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_CODE_ERROR]",
-          {
-            code:
-              codeError.code ||
-              null,
-            message:
-              codeError.message ||
-              null,
-          }
-        );
-
-        return res.status(500).json({
-          ok: false,
-          error:
-            "BUSINESS_LISTING_CODE_CREATE_FAILED",
-        });
-      }
-
       markStaffBusinessListingCreateDiagnostic(
         diagnosticRequestId,
         diagnosticStartedAt,
@@ -27616,19 +27485,6 @@ app.post(
             station.created_at,
         },
 
-        /*
-         * Plaintext is returned exactly at issuance time.
-         * It is never persisted in the database.
-         */
-        confirmationCode:
-          claimCode,
-
-        claimCode,
-
-        codeHint,
-
-        claimCodeHint:
-          codeHint,
       });
     } catch (error) {
       markStaffBusinessListingCreateDiagnostic(
