@@ -27135,6 +27135,15 @@ app.post(
 
 
       const stationPayload = {
+        /*
+         * STAFF_STATION_EXPLICIT_ID_V1
+         *
+         * stations.id is NOT NULL and has no database default.
+         * Staff-created cards therefore receive a UUID here.
+         */
+        id:
+          crypto.randomUUID(),
+
         owner_id: null,
         name,
         address,
