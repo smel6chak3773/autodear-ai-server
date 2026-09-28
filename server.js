@@ -26909,14 +26909,20 @@ app.post(
       if (stationError) {
         console.error(
           "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_STATION_ERROR]",
-          {
+          JSON.stringify({
             code:
               stationError.code ||
               null,
             message:
               stationError.message ||
               null,
-          }
+            details:
+              stationError.details ||
+              null,
+            hint:
+              stationError.hint ||
+              null,
+          })
         );
 
         return res.status(500).json({
