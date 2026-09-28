@@ -28251,7 +28251,7 @@ app.post(
       } = await supabase
         .from("profiles")
         .select(
-          "id,email,phone"
+          "id,auth_user_id,email,phone,role"
         )
         .or(
           `auth_user_id.eq.${userId},id.eq.${userId}`
@@ -28267,6 +28267,122 @@ app.post(
         });
       }
 
+      /*
+       * BUSINESS_CLAIM_DOCUMENT_DRAFT_V5
+       *
+       * Claiming an existing AUTODEAR business card must be
+       * started from the authenticated business account.
+       */
+      const profileRole =
+        String(
+          profile?.role ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        profileRole !==
+        "business"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCOUNT_REQUIRED",
+          message:
+            "Для подтверждения бизнеса сначала создайте или войдите в бизнес-аккаунт AUTODEAR.",
+        });
+      }
+
+      /*
+       * Resume the same unfinished ownership request.
+       * The DB claim row is the source of truth.
+       */
+      const openClaimStatuses = [
+        "requested",
+        "draft_documents",
+        "under_review",
+        "needs_information",
+        "approved",
+      ];
+
+      const {
+        data: existingClaim,
+        error: existingClaimError,
+      } = await supabase
+        .from(
+          "business_listing_claims"
+        )
+        .select(
+          [
+            "id",
+            "station_id",
+            "status",
+            "method",
+            "chat_id",
+            "submitted_at",
+            "created_at",
+            "updated_at",
+          ].join(",")
+        )
+        .eq(
+          "station_id",
+          stationId
+        )
+        .eq(
+          "requesting_auth_user_id",
+          userId
+        )
+        .in(
+          "status",
+          openClaimStatuses
+        )
+        .order(
+          "created_at",
+          {
+            ascending:
+              false,
+          }
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (existingClaimError) {
+        console.error(
+          "[AUTODEAR][BUSINESS_CLAIM][EXISTING_LOOKUP_ERROR]",
+          {
+            userId,
+            stationId,
+            code:
+              existingClaimError.code ||
+              null,
+            message:
+              existingClaimError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_EXISTING_LOOKUP_FAILED",
+        });
+      }
+
+      if (existingClaim) {
+        return res.json({
+          ok: true,
+          resumed: true,
+          duplicate: true,
+          claim:
+            existingClaim,
+        });
+      }
+
+      const nowIso =
+        new Date()
+          .toISOString();
+
       const payload = {
         station_id:
           stationId,
@@ -28279,10 +28395,13 @@ app.post(
           null,
 
         method:
-          "manual",
+          "documents",
 
         status:
-          "requested",
+          "draft_documents",
+
+        last_applicant_action_at:
+          nowIso,
 
         applicant_phone:
           profile?.phone ||
@@ -28315,7 +28434,16 @@ app.post(
         )
         .insert(payload)
         .select(
-          "id,station_id,status,method,created_at"
+          [
+            "id",
+            "station_id",
+            "status",
+            "method",
+            "chat_id",
+            "submitted_at",
+            "created_at",
+            "updated_at",
+          ].join(",")
         )
         .single();
 
@@ -28337,7 +28465,16 @@ app.post(
               "business_listing_claims"
             )
             .select(
-              "id,station_id,status,method,created_at"
+              [
+                "id",
+                "station_id",
+                "status",
+                "method",
+                "chat_id",
+                "submitted_at",
+                "created_at",
+                "updated_at",
+              ].join(",")
             )
             .eq(
               "station_id",
@@ -28351,7 +28488,9 @@ app.post(
               "status",
               [
                 "requested",
+                "draft_documents",
                 "under_review",
+                "needs_information",
                 "approved",
               ]
             )
@@ -28431,6 +28570,7 @@ app.get(
         new Set([
           "requested",
           "under_review",
+          "needs_information",
           "approved",
           "rejected",
           "claimed",
@@ -28473,6 +28613,24 @@ app.get(
           query.eq(
             "status",
             requestedStatus
+          );
+      } else {
+        /*
+         * draft_documents is private to the applicant.
+         * Staff sees a claim only after submission.
+         */
+        query =
+          query.in(
+            "status",
+            [
+              "requested",
+              "under_review",
+              "needs_information",
+              "approved",
+              "rejected",
+              "claimed",
+              "cancelled",
+            ]
           );
       }
 
