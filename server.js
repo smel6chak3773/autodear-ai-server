@@ -29164,7 +29164,15 @@ app.post(
           "business_listing_claims"
         )
         .select(
-          "id,station_id,requesting_auth_user_id,status,method"
+          [
+            "id",
+            "station_id",
+            "requesting_auth_user_id",
+            "status",
+            "method",
+            "needs_information_at",
+            "last_applicant_action_at",
+          ].join(",")
         )
         .eq(
           "id",
@@ -29207,6 +29215,57 @@ app.post(
             claim.status ||
             null,
         });
+      }
+
+      /*
+       * BUSINESS_CLAIM_TRANSFER_GUARDS_V1
+       *
+       * After AUTODEAR requests more information,
+       * applicant must perform a new action first.
+       * Uploading a new document updates
+       * last_applicant_action_at.
+       */
+      if (
+        String(
+          claim.status ||
+          ""
+        ) ===
+        "needs_information"
+      ) {
+        const requestedAt =
+          Date.parse(
+            String(
+              claim.needs_information_at ||
+              ""
+            )
+          );
+
+        const applicantActionAt =
+          Date.parse(
+            String(
+              claim.last_applicant_action_at ||
+              ""
+            )
+          );
+
+        if (
+          !Number.isFinite(
+            requestedAt
+          ) ||
+          !Number.isFinite(
+            applicantActionAt
+          ) ||
+          applicantActionAt <=
+            requestedAt
+        ) {
+          return res.status(409).json({
+            ok: false,
+            error:
+              "BUSINESS_CLAIM_ADDITIONAL_INFORMATION_REQUIRED",
+            message:
+              "Добавьте запрошенный документ или сведения перед повторной отправкой.",
+          });
+        }
       }
 
       const {
@@ -30058,6 +30117,31 @@ app.post(
         return res.status(404).json({
           ok: false,
           error: "BUSINESS_CLAIM_NOT_FOUND",
+        });
+      }
+
+
+      /*
+       * BUSINESS_CLAIM_TRANSFER_GUARDS_V1
+       *
+       * Final ownership transfer is possible only after
+       * applicant documents have been submitted and the
+       * claim is actively under AUTODEAR review.
+       */
+      if (
+        String(
+          claim.status ||
+          ""
+        ) !==
+        "under_review"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_TRANSFER_NOT_ALLOWED",
+          status:
+            claim.status ||
+            null,
         });
       }
 
