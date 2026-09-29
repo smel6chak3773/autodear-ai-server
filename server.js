@@ -326,6 +326,46 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "12mb" }));
 
 /*
+ * PHONE_NORMALIZED_BACKEND_GUARD_V1
+ *
+ * Формат должен совпадать с
+ * public.autodear_normalize_ru_phone(...)
+ * в PostgreSQL.
+ */
+function normalizeRuPhone(value) {
+  let digits =
+    String(value || "")
+      .replace(/\D/g, "");
+
+  if (!digits) {
+    return null;
+  }
+
+  if (
+    digits.length === 11 &&
+    digits.startsWith("8")
+  ) {
+    digits =
+      `7${digits.slice(1)}`;
+  }
+
+  if (digits.length === 10) {
+    digits =
+      `7${digits}`;
+  }
+
+  if (
+    digits.length !== 11 ||
+    !digits.startsWith("7")
+  ) {
+    return null;
+  }
+
+  return `+${digits}`;
+}
+
+
+/*
  * AUTODEAR Auth registration proxy.
  *
  * На реальном iPhone прямой POST к Supabase /auth/v1/signup
@@ -356,6 +396,9 @@ app.post("/api/auth/register", async (req, res) => {
 
   const phone =
     String(req.body?.phone || "").trim();
+
+  const phoneNormalized =
+    normalizeRuPhone(phone);
 
   const role =
     String(req.body?.role || "user").trim();
@@ -392,6 +435,21 @@ app.post("/api/auth/register", async (req, res) => {
   }
 
   if (
+    phone &&
+    !phoneNormalized
+  ) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "AUTH_REGISTER_PHONE_INVALID",
+      conflictField:
+        "phone",
+      message:
+        "Укажите корректный номер телефона в формате +7.",
+    });
+  }
+
+  if (
     role !== "user" &&
     role !== "business"
   ) {
@@ -400,6 +458,129 @@ app.post("/api/auth/register", async (req, res) => {
       error: "AUTH_REGISTER_ROLE_INVALID",
       message:
         "Недопустимый тип аккаунта.",
+    });
+  }
+
+  /*
+   * AUTH_REGISTER_EXISTING_ACCOUNT_GUARD_V1
+   *
+   * Регистрация никогда не должна превращаться
+   * во вход в уже существующий аккаунт.
+   *
+   * До Auth signUp проверяем AUTODEAR profile
+   * по email и телефону.
+   */
+  if (!supabase) {
+    return res.status(503).json({
+      ok: false,
+      error: "AUTH_PROFILE_SERVICE_NOT_CONFIGURED",
+      message:
+        "Сервис профилей временно недоступен.",
+    });
+  }
+
+  try {
+    const {
+      data: existingByEmail,
+      error: existingEmailError,
+    } = await supabase
+      .from("profiles")
+      .select(
+        "id,auth_user_id,email,phone,role"
+      )
+      .eq(
+        "email",
+        email
+      )
+      .limit(1)
+      .maybeSingle();
+
+    if (existingEmailError) {
+      throw existingEmailError;
+    }
+
+    let existingByPhone = null;
+
+    if (phoneNormalized) {
+      const {
+        data: phoneProfile,
+        error: existingPhoneError,
+      } = await supabase
+        .from("profiles")
+        .select(
+          "id,auth_user_id,email,phone,phone_normalized,role"
+        )
+        .eq(
+          "phone_normalized",
+          phoneNormalized
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (existingPhoneError) {
+        throw existingPhoneError;
+      }
+
+      existingByPhone =
+        phoneProfile || null;
+    }
+
+    const emailExists =
+      Boolean(existingByEmail);
+
+    const phoneExists =
+      Boolean(existingByPhone);
+
+    if (
+      emailExists ||
+      phoneExists
+    ) {
+      const conflictField =
+        emailExists &&
+        phoneExists
+          ? "email_phone"
+          : emailExists
+            ? "email"
+            : "phone";
+
+      console.warn(
+        "[AUTODEAR][AUTH_REGISTER][ACCOUNT_EXISTS]",
+        {
+          email,
+          conflictField,
+        }
+      );
+
+      return res.status(409).json({
+        ok: false,
+        error:
+          "AUTH_ACCOUNT_EXISTS",
+        conflictField,
+        message:
+          conflictField === "email"
+            ? "К указанному email уже привязан аккаунт AUTODEAR."
+            : conflictField === "phone"
+              ? "К указанному номеру телефона уже привязан аккаунт AUTODEAR."
+              : "К указанным email и номеру телефона уже привязан аккаунт AUTODEAR.",
+      });
+    }
+  } catch (lookupError) {
+    console.error(
+      "[AUTODEAR][AUTH_REGISTER][EXISTING_LOOKUP_ERROR]",
+      {
+        email,
+        message:
+          lookupError?.message ||
+          String(lookupError),
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "AUTH_REGISTER_EXISTING_LOOKUP_FAILED",
+      message:
+        "Не удалось проверить данные аккаунта. Попробуйте ещё раз.",
     });
   }
 
@@ -420,6 +601,39 @@ app.post("/api/auth/register", async (req, res) => {
     });
 
     if (error) {
+      const authErrorText =
+        String(
+          error.message || ""
+        )
+          .trim()
+          .toLowerCase();
+
+      const accountAlreadyExists =
+        authErrorText.includes(
+          "user already registered"
+        ) ||
+        authErrorText.includes(
+          "already been registered"
+        ) ||
+        authErrorText.includes(
+          "already registered"
+        ) ||
+        authErrorText.includes(
+          "email already"
+        );
+
+      if (accountAlreadyExists) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "AUTH_ACCOUNT_EXISTS",
+          conflictField:
+            "email",
+          message:
+            "К указанному email уже привязан аккаунт AUTODEAR.",
+        });
+      }
+
       console.warn(
         "[AUTODEAR][AUTH_REGISTER][SUPABASE_ERROR]",
         {
@@ -518,6 +732,92 @@ app.post("/api/auth/register", async (req, res) => {
       );
 
     if (profileError) {
+
+      const profileErrorText =
+        [
+          profileError?.message,
+          profileError?.details,
+          profileError?.hint,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+      const phoneConflict =
+        profileError?.code ===
+          "23505" &&
+        /phone_normalized|profiles_phone_normalized_unique_idx/i.test(
+          profileErrorText
+        );
+
+      if (phoneConflict) {
+        console.warn(
+          "[AUTODEAR][AUTH_REGISTER][PHONE_CONFLICT_RACE]",
+          {
+            email,
+            userId:
+              user.id,
+            phoneNormalized,
+          }
+        );
+
+        try {
+          const {
+            error:
+              rollbackError,
+          } =
+            await supabase
+              .auth
+              .admin
+              .deleteUser(
+                user.id
+              );
+
+          if (rollbackError) {
+            console.error(
+              "[AUTODEAR][AUTH_REGISTER][PHONE_CONFLICT_ROLLBACK_ERROR]",
+              {
+                email,
+                userId:
+                  user.id,
+                message:
+                  rollbackError
+                    ?.message ||
+                  String(
+                    rollbackError
+                  ),
+              }
+            );
+          }
+        } catch (
+          rollbackException
+        ) {
+          console.error(
+            "[AUTODEAR][AUTH_REGISTER][PHONE_CONFLICT_ROLLBACK_EXCEPTION]",
+            {
+              email,
+              userId:
+                user.id,
+              message:
+                rollbackException
+                  ?.message ||
+                String(
+                  rollbackException
+                ),
+            }
+          );
+        }
+
+        return res.status(409).json({
+          ok: false,
+          error:
+            "AUTH_ACCOUNT_EXISTS",
+          conflictField:
+            "phone",
+          message:
+            "К указанному номеру телефона уже привязан аккаунт AUTODEAR.",
+        });
+      }
+
       console.error(
         "[AUTODEAR][AUTH_REGISTER][PROFILE_ERROR]",
         {
@@ -1216,6 +1516,9 @@ async function sendAdminListingModerationPush({
     body,
 
     data: {
+      recipient_role:
+        "user",
+
       type:
         "listing_moderation",
 
@@ -11102,6 +11405,693 @@ app.patch("/api/business/bookings/:id", async (req, res) => {
 
 
 
+
+/*
+ * ONE_AUTH_SECOND_WORKSPACE_V1
+ *
+ * Один Supabase Auth user может иметь:
+ * - личный profile;
+ * - business_account.
+ *
+ * Создание второго workspace НЕ создаёт
+ * второго Supabase Auth пользователя.
+ */
+
+app.post(
+  "/api/account/business-account",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const authUserId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    if (!authUserId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+        message:
+          "Необходимо войти в аккаунт.",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+        message:
+          "Сервис временно недоступен.",
+      });
+    }
+
+    const businessType =
+      String(
+        req.body?.businessType ||
+        "self"
+      )
+        .trim()
+        .toLowerCase();
+
+    const businessName =
+      String(
+        req.body?.businessName ||
+        ""
+      ).trim();
+
+    const legalName =
+      String(
+        req.body?.legalName ||
+        businessName
+      ).trim();
+
+    const phone =
+      String(
+        req.body?.phone ||
+        ""
+      ).trim();
+
+    const email =
+      String(
+        req.body?.email ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const city =
+      String(
+        req.body?.city ||
+        ""
+      ).trim();
+
+    if (
+      ![
+        "self",
+        "ip",
+        "ooo",
+      ].includes(
+        businessType
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "BUSINESS_TYPE_INVALID",
+        message:
+          "Некорректный тип бизнеса.",
+      });
+    }
+
+    if (!businessName) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "BUSINESS_NAME_REQUIRED",
+        message:
+          "Укажите название бизнеса.",
+      });
+    }
+
+    const selectFields = [
+      "id",
+      "auth_user_id",
+      "business_type",
+      "business_name",
+      "legal_name",
+      "inn",
+      "ogrn",
+      "phone",
+      "email",
+      "city",
+      "avatar_url",
+      "status",
+      "created_at",
+      "updated_at",
+    ].join(",");
+
+    try {
+      /*
+       * Endpoint идемпотентный.
+       *
+       * Это также позволяет безопасно повторить
+       * запрос после сетевого обрыва.
+       */
+      const {
+        data: existing,
+        error: existingError,
+      } = await supabase
+        .from("business_accounts")
+        .select(selectFields)
+        .eq(
+          "auth_user_id",
+          authUserId
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (existingError) {
+        throw existingError;
+      }
+
+      const toResponse =
+        (row) => ({
+          id:
+            row?.id || null,
+
+          ownerId:
+            row?.auth_user_id ||
+            authUserId,
+
+          businessType:
+            row?.business_type ||
+            null,
+
+          businessName:
+            row?.business_name ||
+            null,
+
+          legalName:
+            row?.legal_name ||
+            null,
+
+          phone:
+            row?.phone ||
+            null,
+
+          email:
+            row?.email ||
+            null,
+
+          city:
+            row?.city ||
+            null,
+
+          avatarUrl:
+            row?.avatar_url ||
+            null,
+
+          status:
+            row?.status ||
+            null,
+        });
+
+      if (existing?.id) {
+        return res.status(200).json({
+          ok: true,
+          alreadyExists: true,
+          businessAccount:
+            toResponse(existing),
+        });
+      }
+
+      const {
+        data: created,
+        error: createError,
+      } = await supabase
+        .from("business_accounts")
+        .insert({
+          auth_user_id:
+            authUserId,
+
+          business_type:
+            businessType,
+
+          business_name:
+            businessName,
+
+          legal_name:
+            legalName || null,
+
+          phone:
+            phone || null,
+
+          email:
+            email || null,
+
+          city:
+            city || null,
+
+          status:
+            "active",
+
+          updated_at:
+            new Date().toISOString(),
+        })
+        .select(selectFields)
+        .single();
+
+      if (createError) {
+        throw createError;
+      }
+
+      return res.status(201).json({
+        ok: true,
+        alreadyExists: false,
+        businessAccount:
+          toResponse(created),
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][ACCOUNT][CREATE_BUSINESS_ACCOUNT_ERROR]",
+        {
+          authUserId,
+          code:
+            error?.code ||
+            null,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "BUSINESS_ACCOUNT_CREATE_FAILED",
+        message:
+          "Не удалось создать бизнес-аккаунт.",
+      });
+    }
+  }
+);
+
+
+app.post(
+  "/api/account/personal-profile",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const authUserId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    if (!authUserId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+        message:
+          "Необходимо войти в аккаунт.",
+      });
+    }
+
+    if (!supabase) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+        message:
+          "Сервис временно недоступен.",
+      });
+    }
+
+    const name =
+      String(
+        req.body?.name ||
+        ""
+      ).trim();
+
+    const phone =
+      String(
+        req.body?.phone ||
+        ""
+      ).trim();
+
+    /*
+     * PERSONAL_PHONE_NORMALIZED_DECLARATION_V1
+     */
+    const phoneNormalized =
+      normalizeRuPhone(phone);
+
+    const email =
+      String(
+        req.body?.email ||
+        ""
+      )
+        .trim()
+        .toLowerCase();
+
+    const city =
+      String(
+        req.body?.city ||
+        ""
+      ).trim();
+
+    if (!name) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "PERSONAL_NAME_REQUIRED",
+        message:
+          "Укажите имя.",
+      });
+    }
+
+    if (!phone) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "PERSONAL_PHONE_REQUIRED",
+        message:
+          "Укажите телефон.",
+      });
+    }
+
+    if (!phoneNormalized) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "PERSONAL_PHONE_INVALID",
+        conflictField:
+          "phone",
+        message:
+          "Укажите корректный номер телефона в формате +7.",
+      });
+    }
+
+    if (!email) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "PERSONAL_EMAIL_REQUIRED",
+        message:
+          "Укажите email.",
+      });
+    }
+
+    const profileFields = [
+      "id",
+      "auth_user_id",
+      "name",
+      "phone",
+      "email",
+      "role",
+      "city",
+      "avatar_url",
+      "avatar_key",
+      "created_at",
+      "updated_at",
+    ].join(",");
+
+    try {
+      let existingProfile =
+        null;
+
+      const {
+        data: byAuth,
+        error: byAuthError,
+      } = await supabase
+        .from("profiles")
+        .select(profileFields)
+        .eq(
+          "auth_user_id",
+          authUserId
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (byAuthError) {
+        throw byAuthError;
+      }
+
+      existingProfile =
+        byAuth || null;
+
+      /*
+       * Legacy compatibility:
+       * старые profiles могли иметь Auth UUID
+       * непосредственно в profiles.id.
+       */
+      if (!existingProfile) {
+        const {
+          data: byId,
+          error: byIdError,
+        } = await supabase
+          .from("profiles")
+          .select(profileFields)
+          .eq(
+            "id",
+            authUserId
+          )
+          .limit(1)
+          .maybeSingle();
+
+        if (byIdError) {
+          throw byIdError;
+        }
+
+        existingProfile =
+          byId || null;
+      }
+
+      /*
+       * PERSONAL_PHONE_NORMALIZED_GUARD_V1
+       *
+       * Проверяем канонический телефон до записи,
+       * чтобы вернуть клиенту понятный 409.
+       */
+      const {
+        data:
+          phoneProfile,
+        error:
+          phoneLookupError,
+      } = await supabase
+        .from("profiles")
+        .select(
+          "id,auth_user_id,email,phone,phone_normalized"
+        )
+        .eq(
+          "phone_normalized",
+          phoneNormalized
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (phoneLookupError) {
+        throw phoneLookupError;
+      }
+
+      const phoneBelongsToCurrentAuth =
+        Boolean(
+          phoneProfile &&
+          (
+            phoneProfile.id ===
+              existingProfile?.id ||
+            phoneProfile.id ===
+              authUserId ||
+            phoneProfile.auth_user_id ===
+              authUserId
+          )
+        );
+
+      if (
+        phoneProfile &&
+        !phoneBelongsToCurrentAuth
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "AUTH_ACCOUNT_EXISTS",
+          conflictField:
+            "phone",
+          message:
+            "К указанному номеру телефона уже привязан аккаунт AUTODEAR.",
+        });
+      }
+
+      let savedProfile =
+        null;
+
+      if (existingProfile?.id) {
+        const {
+          data,
+          error,
+        } = await supabase
+          .from("profiles")
+          .update({
+            auth_user_id:
+              authUserId,
+
+            name,
+
+            phone,
+
+            email,
+
+            role:
+              "user",
+
+            city,
+
+            updated_at:
+              new Date().toISOString(),
+          })
+          .eq(
+            "id",
+            existingProfile.id
+          )
+          .select(profileFields)
+          .single();
+
+        if (error) {
+          throw error;
+        }
+
+        savedProfile =
+          data;
+      } else {
+        const {
+          data,
+          error,
+        } = await supabase
+          .from("profiles")
+          .insert({
+            id:
+              authUserId,
+
+            auth_user_id:
+              authUserId,
+
+            name,
+
+            phone,
+
+            email,
+
+            role:
+              "user",
+
+            city,
+
+            updated_at:
+              new Date().toISOString(),
+          })
+          .select(profileFields)
+          .single();
+
+        if (error) {
+          throw error;
+        }
+
+        savedProfile =
+          data;
+      }
+
+      return res.status(200).json({
+        ok: true,
+
+        profile: {
+          id:
+            savedProfile?.id ||
+            authUserId,
+
+          authUserId:
+            savedProfile
+              ?.auth_user_id ||
+            authUserId,
+
+          name:
+            savedProfile?.name ||
+            name,
+
+          phone:
+            savedProfile?.phone ||
+            phone,
+
+          email:
+            savedProfile?.email ||
+            email,
+
+          city:
+            savedProfile?.city ||
+            city,
+
+          role:
+            "user",
+
+          avatarUrl:
+            savedProfile
+              ?.avatar_url ||
+            null,
+        },
+      });
+    } catch (error) {
+
+      const errorText =
+        [
+          error?.message,
+          error?.details,
+          error?.hint,
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+      const phoneConflict =
+        error?.code ===
+          "23505" &&
+        /phone_normalized|profiles_phone_normalized_unique_idx/i.test(
+          errorText
+        );
+
+      if (phoneConflict) {
+        console.warn(
+          "[AUTODEAR][ACCOUNT][PERSONAL_PHONE_CONFLICT_RACE]",
+          {
+            authUserId,
+            phoneNormalized,
+          }
+        );
+
+        return res.status(409).json({
+          ok: false,
+          error:
+            "AUTH_ACCOUNT_EXISTS",
+          conflictField:
+            "phone",
+          message:
+            "К указанному номеру телефона уже привязан аккаунт AUTODEAR.",
+        });
+      }
+
+      console.error(
+        "[AUTODEAR][ACCOUNT][CREATE_PERSONAL_PROFILE_ERROR]",
+        {
+          authUserId,
+          code:
+            error?.code ||
+            null,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "PERSONAL_PROFILE_CREATE_FAILED",
+        message:
+          "Не удалось создать личный профиль.",
+      });
+    }
+  }
+);
+
+
 app.post("/api/account/link-existing", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
@@ -11589,429 +12579,19 @@ app.get("/api/account/workspaces", async (req, res) => {
 
   try {
     /*
-     * AUTO-LINK:
+     * ACCOUNT_CONTACT_AUTO_LINK_DISABLED_V1
      *
-     * If personal and business auth accounts have
-     * the same normalized email AND phone, AUTODEAR
-     * can safely connect them automatically.
+     * AUTODEAR больше не связывает Auth-аккаунты
+     * автоматически только по совпадению email + phone.
      *
-     * One matching field alone is NOT enough.
+     * Новый источник истины:
+     * - прямое authenticated ownership бизнеса;
+     * - либо явное подтверждённое account link.
+     *
+     * Контактные данные сами по себе не дают право
+     * подключить чужой business workspace.
      */
 
-    const normalizeAccountEmail =
-      (value) =>
-        String(value || "")
-          .trim()
-          .toLowerCase();
-
-    const normalizeAccountPhone =
-      (value) => {
-        let digits =
-          String(value || "")
-            .replace(/\D/g, "");
-
-        if (
-          digits.length === 11 &&
-          digits.startsWith("8")
-        ) {
-          digits =
-            `7${digits.slice(1)}`;
-        }
-
-        if (
-          digits.length === 10
-        ) {
-          digits =
-            `7${digits}`;
-        }
-
-        return digits;
-      };
-
-
-    const currentEmail =
-      normalizeAccountEmail(
-        authUser?.email ||
-        authUser?.user_metadata?.email ||
-        ""
-      );
-
-    const currentPhone =
-      normalizeAccountPhone(
-        authUser?.phone ||
-        authUser?.user_metadata?.phone ||
-        ""
-      );
-
-
-    /*
-     * We only attempt automatic discovery when
-     * BOTH confirmed contact identifiers exist.
-     */
-    if (
-      currentEmail &&
-      currentPhone
-    ) {
-      const {
-        data: matchingProfiles,
-        error: matchingProfilesError,
-      } = await supabase
-        .from("profiles")
-        .select(
-          [
-            "id",
-            "auth_user_id",
-            "name",
-            "email",
-            "phone",
-            "role",
-          ].join(",")
-        )
-        .neq(
-          "auth_user_id",
-          authUserId
-        );
-
-      if (matchingProfilesError) {
-        console.warn(
-          "[AUTODEAR][ACCOUNT_AUTO_LINK][PROFILE_SCAN_ERROR]",
-          {
-            authUserId,
-            message:
-              matchingProfilesError.message ||
-              null,
-          }
-        );
-      } else {
-        const exactMatches =
-          (
-            Array.isArray(
-              matchingProfiles
-            )
-              ? matchingProfiles
-              : []
-          ).filter(
-            (profile) => {
-              const profileAuthId =
-                String(
-                  profile?.auth_user_id ||
-                  profile?.id ||
-                  ""
-                ).trim();
-
-              if (!profileAuthId) {
-                return false;
-              }
-
-              const profileEmail =
-                normalizeAccountEmail(
-                  profile?.email
-                );
-
-              const profilePhone =
-                normalizeAccountPhone(
-                  profile?.phone
-                );
-
-              return (
-                profileEmail ===
-                  currentEmail &&
-                profilePhone ===
-                  currentPhone
-              );
-            }
-          );
-
-
-        for (
-          const matchedProfile of
-          exactMatches
-        ) {
-          const matchedAuthUserId =
-            String(
-              matchedProfile
-                ?.auth_user_id ||
-              matchedProfile?.id ||
-              ""
-            ).trim();
-
-          if (
-            !matchedAuthUserId ||
-            matchedAuthUserId ===
-              authUserId
-          ) {
-            continue;
-          }
-
-
-          const currentProfileRole =
-            String(
-              authUser?.user_metadata
-                ?.role ||
-              ""
-            )
-              .trim()
-              .toLowerCase();
-
-          const matchedRole =
-            String(
-              matchedProfile?.role ||
-              ""
-            )
-              .trim()
-              .toLowerCase();
-
-
-          /*
-           * Only opposite personal/business sides
-           * are eligible for automatic linking.
-           *
-           * Legacy data may have inaccurate role,
-           * therefore actual station ownership is
-           * also checked below.
-           */
-          const {
-            data: matchedStations,
-            error: matchedStationsError,
-          } = await supabase
-            .from("stations")
-            .select(
-              [
-                "id",
-                "owner_id",
-                "name",
-                "legal_name",
-              ].join(",")
-            )
-            .eq(
-              "owner_id",
-              matchedAuthUserId
-            );
-
-          if (matchedStationsError) {
-            console.warn(
-              "[AUTODEAR][ACCOUNT_AUTO_LINK][STATIONS_ERROR]",
-              {
-                authUserId,
-                matchedAuthUserId,
-                message:
-                  matchedStationsError
-                    .message ||
-                  null,
-              }
-            );
-
-            continue;
-          }
-
-
-          const matchedBusinesses =
-            Array.isArray(
-              matchedStations
-            )
-              ? matchedStations
-              : [];
-
-
-          /*
-           * Determine which auth id should be the
-           * canonical personal owner of the link.
-           *
-           * If current auth user is personal, it
-           * remains owner.
-           *
-           * If current auth user is business and
-           * matched profile is personal, matched
-           * auth user becomes owner.
-           */
-          let ownerAuthUserId =
-            authUserId;
-
-          let linkedAuthUserId =
-            matchedAuthUserId;
-
-
-          if (
-            currentProfileRole ===
-              "business" &&
-            matchedRole ===
-              "user"
-          ) {
-            ownerAuthUserId =
-              matchedAuthUserId;
-
-            linkedAuthUserId =
-              authUserId;
-          }
-
-
-          /*
-           * Auto-link only when one side clearly
-           * represents business ownership.
-           */
-          const businessSideExists =
-            matchedBusinesses.length > 0 ||
-            matchedRole ===
-              "business" ||
-            currentProfileRole ===
-              "business";
-
-          if (!businessSideExists) {
-            continue;
-          }
-
-
-          if (
-            matchedBusinesses.length
-          ) {
-            for (
-              const business of
-              matchedBusinesses
-            ) {
-              const businessId =
-                String(
-                  business?.id || ""
-                ).trim();
-
-              if (!businessId) {
-                continue;
-              }
-
-              const {
-                data: existingLink,
-                error: existingLinkError,
-              } = await supabase
-                .from("account_links")
-                .select("id")
-                .eq(
-                  "owner_auth_user_id",
-                  ownerAuthUserId
-                )
-                .eq(
-                  "linked_auth_user_id",
-                  linkedAuthUserId
-                )
-                .eq(
-                  "business_id",
-                  businessId
-                )
-                .limit(1)
-                .maybeSingle();
-
-              if (existingLinkError) {
-                console.warn(
-                  "[AUTODEAR][ACCOUNT_AUTO_LINK][EXISTING_LINK_ERROR]",
-                  {
-                    ownerAuthUserId,
-                    linkedAuthUserId,
-                    businessId,
-                    message:
-                      existingLinkError
-                        .message ||
-                      null,
-                  }
-                );
-
-                continue;
-              }
-
-              if (existingLink) {
-                continue;
-              }
-
-              const {
-                error: insertError,
-              } = await supabase
-                .from("account_links")
-                .insert({
-                  owner_auth_user_id:
-                    ownerAuthUserId,
-
-                  linked_auth_user_id:
-                    linkedAuthUserId,
-
-                  business_id:
-                    businessId,
-
-                  link_type:
-                    "business",
-
-                  owner_email:
-                    ownerAuthUserId ===
-                    authUserId
-                      ? currentEmail
-                      : normalizeAccountEmail(
-                          matchedProfile
-                            ?.email
-                        ),
-
-                  owner_phone:
-                    ownerAuthUserId ===
-                    authUserId
-                      ? currentPhone
-                      : normalizeAccountPhone(
-                          matchedProfile
-                            ?.phone
-                        ),
-
-                  linked_email:
-                    linkedAuthUserId ===
-                    authUserId
-                      ? currentEmail
-                      : normalizeAccountEmail(
-                          matchedProfile
-                            ?.email
-                        ),
-
-                  linked_phone:
-                    linkedAuthUserId ===
-                    authUserId
-                      ? currentPhone
-                      : normalizeAccountPhone(
-                          matchedProfile
-                            ?.phone
-                        ),
-
-                  verified_at:
-                    new Date()
-                      .toISOString(),
-
-                  updated_at:
-                    new Date()
-                      .toISOString(),
-                });
-
-              if (insertError) {
-                console.warn(
-                  "[AUTODEAR][ACCOUNT_AUTO_LINK][INSERT_ERROR]",
-                  {
-                    ownerAuthUserId,
-                    linkedAuthUserId,
-                    businessId,
-                    message:
-                      insertError.message ||
-                      null,
-                  }
-                );
-
-                continue;
-              }
-
-              console.log(
-                "[AUTODEAR][ACCOUNT_AUTO_LINK][CREATED]",
-                {
-                  ownerAuthUserId,
-                  linkedAuthUserId,
-                  businessId,
-                  reason:
-                    "email_and_phone_match",
-                }
-              );
-            }
-          }
-        }
-      }
-    }
 
     /*
      * 1. Current profile.
@@ -12274,113 +12854,55 @@ app.get("/api/account/workspaces", async (req, res) => {
 
 
     /*
-     * 7. Businesses owned by any confirmed auth owner.
+     * BUSINESS_ACCOUNT_WORKSPACE_SOURCE_V1
+     *
+     * Source of truth:
+     *
+     * business_accounts = business account
+     * stations = business listings / locations
+     *
+     * A business account may exist with zero stations.
      */
-    const {
-      data: stations,
-      error: stationsError,
-    } = await supabase
-      .from("stations")
-      .select(
-        [
-          "id",
-          "owner_id",
-          "name",
-          "legal_name",
-          "business_type",
-          "phone",
-          "email",
-          "city",
-          "photo_url",
-          "status",
-          "is_active",
-          "is_verified",
-        ].join(",")
-      )
-      .in(
-        "owner_id",
-        authIdList
-      )
-      .order(
-        "created_at",
-        {
-          ascending: true,
-        }
-      );
+    let businessAccounts = [];
 
-    if (stationsError) {
-      console.error(
-        "[AUTODEAR][ACCOUNT_WORKSPACES][STATIONS_ERROR]",
-        {
-          authUserId,
-          code:
-            stationsError.code ||
-            null,
-          message:
-            stationsError.message ||
-            null,
-        }
-      );
-
-      return res.status(500).json({
-        ok: false,
-        error:
-          "ACCOUNT_BUSINESSES_LOOKUP_FAILED",
-      });
-    }
-
-
-    /*
-     * 8. Businesses explicitly linked through account_links.
-     */
-    const linkedBusinessIds =
-      Array.from(
-        new Set(
-          groupLinks
-            .map(
-              (link) =>
-                String(
-                  link?.business_id ||
-                  ""
-                ).trim()
-            )
-            .filter(Boolean)
-        )
-      );
-
-
-    let explicitlyLinkedStations = [];
-
-    if (linkedBusinessIds.length) {
+    if (authIdList.length) {
       const {
         data,
         error,
       } = await supabase
-        .from("stations")
+        .from("business_accounts")
         .select(
           [
             "id",
-            "owner_id",
-            "name",
-            "legal_name",
+            "auth_user_id",
             "business_type",
+            "business_name",
+            "legal_name",
+            "inn",
+            "ogrn",
             "phone",
             "email",
             "city",
-            "photo_url",
+            "avatar_url",
             "status",
-            "is_active",
-            "is_verified",
+            "created_at",
+            "updated_at",
           ].join(",")
         )
         .in(
-          "id",
-          linkedBusinessIds
+          "auth_user_id",
+          authIdList
+        )
+        .order(
+          "created_at",
+          {
+            ascending: true,
+          }
         );
 
       if (error) {
         console.error(
-          "[AUTODEAR][ACCOUNT_WORKSPACES][LINKED_STATIONS_ERROR]",
+          "[AUTODEAR][ACCOUNT_WORKSPACES][BUSINESS_ACCOUNTS_ERROR]",
           {
             authUserId,
             code:
@@ -12395,101 +12917,318 @@ app.get("/api/account/workspaces", async (req, res) => {
         return res.status(500).json({
           ok: false,
           error:
-            "ACCOUNT_LINKED_BUSINESSES_FAILED",
+            "ACCOUNT_BUSINESS_ACCOUNTS_LOOKUP_FAILED",
         });
       }
 
-      explicitlyLinkedStations =
+      businessAccounts =
         Array.isArray(data)
           ? data
           : [];
     }
 
 
-    const stationMap =
+    /*
+     * LEGACY_STATION_OWNER_MAP_V1
+     *
+     * stations.owner_id is text.
+     *
+     * Historically it can contain either:
+     * - profiles.auth_user_id
+     * - profiles.id
+     *
+     * Map both representations to the canonical
+     * authenticated Supabase user id.
+     */
+    const stationOwnerToAuthId =
       new Map();
 
-    [
-      ...(
-        Array.isArray(stations)
-          ? stations
-          : []
-      ),
-      ...explicitlyLinkedStations,
-    ].forEach(
-      (station) => {
+    authIdList.forEach(
+      (value) => {
         const id =
           String(
-            station?.id || ""
+            value || ""
           ).trim();
 
         if (id) {
-          stationMap.set(
+          stationOwnerToAuthId.set(
             id,
-            station
+            id
+          );
+        }
+      }
+    );
+
+    profiles.forEach(
+      (profile) => {
+        const authId =
+          String(
+            profile?.auth_user_id ||
+            profile?.id ||
+            ""
+          ).trim();
+
+        const profileId =
+          String(
+            profile?.id ||
+            ""
+          ).trim();
+
+        if (authId) {
+          stationOwnerToAuthId.set(
+            authId,
+            authId
+          );
+        }
+
+        if (
+          profileId &&
+          authId
+        ) {
+          stationOwnerToAuthId.set(
+            profileId,
+            authId
           );
         }
       }
     );
 
 
-    const businessWorkspaces =
+    const stationOwnerIds =
       Array.from(
-        stationMap.values()
-      ).map(
-        (station) => ({
-          type:
-            "business",
+        stationOwnerToAuthId.keys()
+      );
 
-          id:
-            station.id,
 
-          ownerId:
-            station.owner_id,
+    /*
+     * Stations are loaded only to attach
+     * station identity to a business account.
+     *
+     * They no longer create a business workspace.
+     */
+    let accountStations = [];
 
-          name:
-            station.name ||
-            station.legal_name ||
-            "Бизнес AUTODEAR",
+    if (stationOwnerIds.length) {
+      const {
+        data,
+        error,
+      } = await supabase
+        .from("stations")
+        .select(
+          [
+            "id",
+            "owner_id",
+            "is_active",
+            "is_verified",
+            "created_at",
+          ].join(",")
+        )
+        .in(
+          "owner_id",
+          stationOwnerIds
+        )
+        .order(
+          "created_at",
+          {
+            ascending: true,
+          }
+        );
 
-          legalName:
-            station.legal_name ||
-            null,
+      if (error) {
+        console.error(
+          "[AUTODEAR][ACCOUNT_WORKSPACES][STATIONS_ERROR]",
+          {
+            authUserId,
+            code:
+              error.code ||
+              null,
+            message:
+              error.message ||
+              null,
+          }
+        );
 
-          businessType:
-            station.business_type ||
-            null,
+        return res.status(500).json({
+          ok: false,
+          error:
+            "ACCOUNT_BUSINESS_STATIONS_LOOKUP_FAILED",
+        });
+      }
 
-          phone:
-            station.phone ||
-            null,
+      accountStations =
+        Array.isArray(data)
+          ? data
+          : [];
+    }
 
-          email:
-            station.email ||
-            null,
 
-          city:
-            station.city ||
-            null,
+    const stationsByAuthUser =
+      new Map();
 
-          avatarUrl:
-            station.photo_url ||
-            null,
+    accountStations.forEach(
+      (station) => {
+        const rawOwnerId =
+          String(
+            station?.owner_id ||
+            ""
+          ).trim();
 
-          status:
-            station.status ||
-            null,
+        const canonicalAuthId =
+          stationOwnerToAuthId.get(
+            rawOwnerId
+          );
 
-          isActive:
-            Boolean(
-              station.is_active
-            ),
+        if (!canonicalAuthId) {
+          return;
+        }
 
-          isVerified:
-            Boolean(
-              station.is_verified
-            ),
-        })
+        const current =
+          stationsByAuthUser.get(
+            canonicalAuthId
+          ) ||
+          [];
+
+        current.push(
+          station
+        );
+
+        stationsByAuthUser.set(
+          canonicalAuthId,
+          current
+        );
+      }
+    );
+
+
+    const businessWorkspaces =
+      businessAccounts.map(
+        (businessAccount) => {
+          const ownerAuthUserId =
+            String(
+              businessAccount
+                ?.auth_user_id ||
+              ""
+            ).trim();
+
+          const ownedStations =
+            stationsByAuthUser.get(
+              ownerAuthUserId
+            ) ||
+            [];
+
+          const stationIds =
+            ownedStations
+              .map(
+                (station) =>
+                  String(
+                    station?.id ||
+                    ""
+                  ).trim()
+              )
+              .filter(Boolean);
+
+          const primaryStation =
+            ownedStations[0] ||
+            null;
+
+          const normalizedStatus =
+            String(
+              businessAccount?.status ||
+              "active"
+            )
+              .trim()
+              .toLowerCase();
+
+          const isActive =
+            ![
+              "blocked",
+              "disabled",
+              "deleted",
+            ].includes(
+              normalizedStatus
+            );
+
+          return {
+            type:
+              "business",
+
+            /*
+             * Business account identity.
+             */
+            id:
+              businessAccount.id,
+
+            businessAccountId:
+              businessAccount.id,
+
+            ownerId:
+              ownerAuthUserId,
+
+            name:
+              businessAccount.business_name ||
+              businessAccount.legal_name ||
+              "Бизнес AUTODEAR",
+
+            legalName:
+              businessAccount.legal_name ||
+              null,
+
+            businessType:
+              businessAccount.business_type ||
+              null,
+
+            inn:
+              businessAccount.inn ||
+              null,
+
+            ogrn:
+              businessAccount.ogrn ||
+              null,
+
+            phone:
+              businessAccount.phone ||
+              null,
+
+            email:
+              businessAccount.email ||
+              null,
+
+            city:
+              businessAccount.city ||
+              null,
+
+            avatarUrl:
+              businessAccount.avatar_url ||
+              null,
+
+            status:
+              businessAccount.status ||
+              null,
+
+            isActive,
+
+            isVerified:
+              ownedStations.some(
+                (station) =>
+                  Boolean(
+                    station?.is_verified
+                  )
+              ),
+
+            /*
+             * Station identity is separate.
+             *
+             * New business account may have:
+             * primaryStationId = null
+             * stationIds = []
+             */
+            primaryStationId:
+              primaryStation?.id ||
+              null,
+
+            stationIds,
+          };
+        }
       );
 
 
@@ -19044,6 +19783,9 @@ app.post("/api/bonuses/award-completed-deal", async (req, res) => {
         ).trim();
 
       const bonusPushData = {
+        recipient_role:
+          "user",
+
         type: "bonus_earned",
         eventType: "bonus_earned",
         category: "bonus",
@@ -19984,6 +20726,9 @@ async function notifyAutodearListingPriceReduced({
           notificationBody,
 
         data: {
+          recipient_role:
+            "user",
+
           type:
             "listing_price_reduced",
 
@@ -33609,6 +34354,14 @@ function autodearBookingTime(value) {
   )}:${match[2]}`;
 }
 
+/*
+ * PUSH_RECIPIENT_ROLE_V2
+ *
+ * Push data содержит recipient_role.
+ * Клиент AUTODEAR использует это поле,
+ * чтобы до навигации открыть правильный
+ * рабочий контур пользователя.
+ */
 async function sendAutodearExpoPush({
   tokens,
   title,
@@ -34330,6 +35083,9 @@ async function autodearProcessBusinessTomorrowReminder(
         reminder.body,
 
       data: {
+        recipient_role:
+          "business",
+
         type:
           AUTODEAR_BUSINESS_REMINDER_TYPE,
 
@@ -35047,6 +35803,9 @@ async function runCustomerBookingReminders() {
          * изменения scheduler.
          */
         const pushData = {
+          recipient_role:
+            "user",
+
           type:
             rule.eventType,
           eventType:
