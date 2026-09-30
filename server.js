@@ -475,6 +475,17 @@ app.post("/api/auth/register", async (req, res) => {
   }
 
   /*
+   * AUTH_REGISTER_REFERRAL_RECOVERY_V4
+   *
+   * Trusted pending marker allows only an interrupted
+   * registration created by this endpoint to resume.
+   *
+   * Ordinary existing AUTODEAR accounts still return 409.
+   */
+  let registrationRecoveryUser =
+    null;
+
+  /*
    * AUTH_REGISTER_EXISTING_ACCOUNT_GUARD_V1
    *
    * Регистрация никогда не должна превращаться
@@ -556,26 +567,171 @@ app.post("/api/auth/register", async (req, res) => {
             ? "email"
             : "phone";
 
-      console.warn(
-        "[AUTODEAR][AUTH_REGISTER][ACCOUNT_EXISTS]",
-        {
-          email,
-          conflictField,
-        }
-      );
+      const emailProfileId =
+        String(
+          existingByEmail?.id ||
+          ""
+        ).trim();
 
-      return res.status(409).json({
-        ok: false,
-        error:
-          "AUTH_ACCOUNT_EXISTS",
-        conflictField,
-        message:
-          conflictField === "email"
-            ? "К указанному email уже привязан аккаунт AUTODEAR."
-            : conflictField === "phone"
-              ? "К указанному номеру телефона уже привязан аккаунт AUTODEAR."
-              : "К указанным email и номеру телефона уже привязан аккаунт AUTODEAR.",
-      });
+      const phoneProfileId =
+        String(
+          existingByPhone?.id ||
+          ""
+        ).trim();
+
+      const sameExistingProfile =
+        !emailExists ||
+        !phoneExists ||
+        (
+          emailProfileId &&
+          emailProfileId ===
+            phoneProfileId
+        );
+
+      const recoveryProfile =
+        sameExistingProfile
+          ? (
+              existingByEmail ||
+              existingByPhone ||
+              null
+            )
+          : null;
+
+      const recoveryAuthUserId =
+        String(
+          recoveryProfile
+            ?.auth_user_id ||
+          recoveryProfile?.id ||
+          ""
+        ).trim();
+
+      if (recoveryAuthUserId) {
+        const {
+          data:
+            recoveryAuthData,
+          error:
+            recoveryAuthError,
+        } =
+          await supabase
+            .auth
+            .admin
+            .getUserById(
+              recoveryAuthUserId
+            );
+
+        if (
+          !recoveryAuthError &&
+          recoveryAuthData
+            ?.user
+            ?.id
+        ) {
+          const candidate =
+            recoveryAuthData.user;
+
+          const appMetadata =
+            candidate
+              .app_metadata ||
+            {};
+
+          const recoveryState =
+            String(
+              appMetadata
+                .autodear_registration_state ||
+              ""
+            ).trim();
+
+          const storedInviteCode =
+            String(
+              appMetadata
+                .autodear_registration_invite_code ||
+              ""
+            )
+              .trim()
+              .toUpperCase();
+
+          const storedRole =
+            String(
+              appMetadata
+                .autodear_registration_role ||
+              ""
+            ).trim();
+
+          const authEmail =
+            String(
+              candidate.email ||
+              ""
+            )
+              .trim()
+              .toLowerCase();
+
+          if (
+            recoveryState ===
+              "pending" &&
+            storedInviteCode ===
+              inviteCode &&
+            storedRole === role &&
+            authEmail === email
+          ) {
+            registrationRecoveryUser =
+              candidate;
+
+            console.warn(
+              "[AUTODEAR][AUTH_REGISTER][RECOVERY_RESUME]",
+              {
+                email,
+                userId:
+                  candidate.id,
+                inviteCodeUsed:
+                  Boolean(
+                    inviteCode
+                  ),
+              }
+            );
+          }
+        } else if (
+          recoveryAuthError
+        ) {
+          console.warn(
+            "[AUTODEAR][AUTH_REGISTER][RECOVERY_LOOKUP_FAILED]",
+            {
+              email,
+              userId:
+                recoveryAuthUserId,
+              message:
+                recoveryAuthError
+                  ?.message ||
+                String(
+                  recoveryAuthError
+                ),
+            }
+          );
+        }
+      }
+
+      if (
+        !registrationRecoveryUser
+      ) {
+        console.warn(
+          "[AUTODEAR][AUTH_REGISTER][ACCOUNT_EXISTS]",
+          {
+            email,
+            conflictField,
+          }
+        );
+
+        return res.status(409).json({
+          ok: false,
+          error:
+            "AUTH_ACCOUNT_EXISTS",
+          conflictField,
+          message:
+            conflictField === "email"
+              ? "К указанному email уже привязан аккаунт AUTODEAR."
+              : conflictField === "phone"
+                ? "К указанному номеру телефона уже привязан аккаунт AUTODEAR."
+                : "К указанным email и номеру телефона уже привязан аккаунт AUTODEAR.",
+        });
+      }
     }
   } catch (lookupError) {
     console.error(
@@ -994,20 +1150,37 @@ app.post("/api/auth/register", async (req, res) => {
     };
 
   try {
-    const {
-      data,
-      error,
-    } = await supabaseAuth.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          name,
-          phone,
-          role,
-        },
-      },
-    });
+    let data = null;
+    let error = null;
+
+    if (
+      registrationRecoveryUser
+    ) {
+      data = {
+        user:
+          registrationRecoveryUser,
+        session: null,
+      };
+    } else {
+      const signUpResult =
+        await supabaseAuth.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              name,
+              phone,
+              role,
+            },
+          },
+        });
+
+      data =
+        signUpResult.data;
+
+      error =
+        signUpResult.error;
+    }
 
     if (error) {
       const authErrorText =
@@ -1094,6 +1267,127 @@ app.post("/api/auth/register", async (req, res) => {
           "Supabase не вернул созданного пользователя.",
       });
     }
+
+    const isRegistrationRecovery =
+      Boolean(
+        registrationRecoveryUser
+          ?.id
+      );
+
+    if (
+      !isRegistrationRecovery
+    ) {
+      const {
+        error:
+          pendingStateError,
+      } =
+        await supabase
+          .auth
+          .admin
+          .updateUserById(
+            user.id,
+            {
+              app_metadata: {
+                ...(
+                  user
+                    .app_metadata ||
+                  {}
+                ),
+
+                autodear_registration_state:
+                  "pending",
+
+                autodear_registration_invite_code:
+                  inviteCode,
+
+                autodear_registration_role:
+                  role,
+              },
+            }
+          );
+
+      if (pendingStateError) {
+        console.error(
+          "[AUTODEAR][AUTH_REGISTER][RECOVERY_STATE_PENDING_FAILED]",
+          {
+            email,
+            userId:
+              user.id,
+            message:
+              pendingStateError
+                ?.message ||
+              String(
+                pendingStateError
+              ),
+          }
+        );
+
+        /*
+         * No AUTODEAR profile/referral/bonus state
+         * has been created yet.
+         */
+        try {
+          const {
+            error:
+              rollbackError,
+          } =
+            await supabase
+              .auth
+              .admin
+              .deleteUser(
+                user.id
+              );
+
+          if (rollbackError) {
+            console.error(
+              "[AUTODEAR][AUTH_REGISTER][RECOVERY_STATE_ROLLBACK_FAILED]",
+              {
+                email,
+                userId:
+                  user.id,
+                message:
+                  rollbackError
+                    ?.message ||
+                  String(
+                    rollbackError
+                  ),
+              }
+            );
+          }
+        } catch (
+          rollbackException
+        ) {
+          console.error(
+            "[AUTODEAR][AUTH_REGISTER][RECOVERY_STATE_ROLLBACK_EXCEPTION]",
+            {
+              email,
+              userId:
+                user.id,
+              message:
+                rollbackException
+                  ?.message ||
+                String(
+                  rollbackException
+                ),
+            }
+          );
+        }
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "AUTH_REGISTER_RECOVERY_STATE_FAILED",
+            message:
+              "Не удалось подготовить регистрацию. Попробуйте ещё раз.",
+          });
+      }
+    }
+
+    if (
+      !isRegistrationRecovery
+    ) {
 
     /*
      * Профиль создаём на backend после успешного
@@ -1247,6 +1541,8 @@ app.post("/api/auth/register", async (req, res) => {
         message:
           "Аккаунт создан, но не удалось создать профиль.",
       });
+    }
+
     }
 
     /*
@@ -1411,6 +1707,45 @@ app.post("/api/auth/register", async (req, res) => {
           sourceId:
             String(user.id),
         });
+    }
+
+    const {
+      error:
+        completionStateError,
+    } =
+      await supabase
+        .auth
+        .admin
+        .updateUserById(
+          user.id,
+          {
+            app_metadata: {
+              ...(
+                registrationRecoveryUser
+                  ?.app_metadata ||
+                user
+                  .app_metadata ||
+                {}
+              ),
+
+              autodear_registration_state:
+                "complete",
+
+              autodear_registration_invite_code:
+                inviteCode,
+
+              autodear_registration_role:
+                role,
+            },
+          }
+        );
+
+    if (completionStateError) {
+      throw new Error(
+        completionStateError
+          ?.message ||
+        "AUTH_REGISTER_RECOVERY_COMPLETE_FAILED"
+      );
     }
 
     console.log(
