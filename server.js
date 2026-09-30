@@ -972,6 +972,198 @@ async function resolveAuthenticatedUser(req) {
   }
 }
 
+
+// REFERRAL_CODE_ENDPOINT_ONE_AUTH_V1
+//
+// Auth UUID is NOT assumed to be the same as profiles.id.
+// Resolve the canonical AUTODEAR personal profile first,
+// then create/read its permanent server-owned referral code.
+//
+app.get(
+  "/api/referrals/me/code",
+  async (req, res) => {
+    const authResult =
+      await resolveAuthenticatedUser(req);
+
+    const authUser =
+      authResult?.user || null;
+
+    const authUserId =
+      String(
+        authUser?.id || ""
+      ).trim();
+
+    if (!authUserId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          authResult?.error ||
+          "AUTH_REQUIRED",
+      });
+    }
+
+    /*
+     * Referral code creation is privileged:
+     * the RPC is executable only by service_role.
+     */
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          "REFERRAL_SERVICE_NOT_CONFIGURED",
+        message:
+          "Код приглашения временно недоступен.",
+      });
+    }
+
+    try {
+      const {
+        data: profile,
+        error: profileError,
+      } =
+        await supabaseServiceRole
+          .from("profiles")
+          .select(
+            "id,auth_user_id"
+          )
+          .or(
+            `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+          )
+          .limit(1)
+          .maybeSingle();
+
+      if (profileError) {
+        console.error(
+          "[AUTODEAR][REFERRAL_CODE][PROFILE_LOOKUP_FAILED]",
+          {
+            authUserId,
+            code:
+              profileError.code ||
+              null,
+            message:
+              profileError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "REFERRAL_PROFILE_LOOKUP_FAILED",
+          message:
+            "Не удалось загрузить код приглашения.",
+        });
+      }
+
+      const profileId =
+        String(
+          profile?.id || ""
+        ).trim();
+
+      if (!profileId) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "REFERRAL_PROFILE_NOT_FOUND",
+          message:
+            "Личный профиль AUTODEAR не найден.",
+        });
+      }
+
+      const {
+        data: referralCode,
+        error: referralCodeError,
+      } =
+        await supabaseServiceRole
+          .rpc(
+            "autodear_ensure_referral_code",
+            {
+              p_profile_id:
+                profileId,
+            }
+          );
+
+      if (referralCodeError) {
+        console.error(
+          "[AUTODEAR][REFERRAL_CODE][ENSURE_FAILED]",
+          {
+            authUserId,
+            profileId,
+            code:
+              referralCodeError.code ||
+              null,
+            message:
+              referralCodeError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "REFERRAL_CODE_CREATE_FAILED",
+          message:
+            "Не удалось получить код приглашения.",
+        });
+      }
+
+      const code =
+        String(
+          referralCode || ""
+        )
+          .trim()
+          .toUpperCase();
+
+      if (
+        !/^AD-[A-Z0-9]{8,32}$/.test(
+          code
+        )
+      ) {
+        console.error(
+          "[AUTODEAR][REFERRAL_CODE][INVALID_RESULT]",
+          {
+            authUserId,
+            profileId,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "REFERRAL_CODE_INVALID_RESULT",
+          message:
+            "Код приглашения временно недоступен.",
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        code,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][REFERRAL_CODE][UNEXPECTED]",
+        {
+          authUserId,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "REFERRAL_CODE_FAILED",
+        message:
+          "Не удалось загрузить код приглашения.",
+      });
+    }
+  }
+);
+
+
 // ADMIN_STAFF_AUTH_V1
 //
 // Все опасные административные операции AUTODEAR
