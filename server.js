@@ -406,6 +406,19 @@ app.post("/api/auth/register", async (req, res) => {
   const city =
     String(req.body?.city || "").trim();
 
+  /*
+   * AUTH_REGISTER_REFERRAL_SERVER_V3
+   *
+   * Invite code is interpreted only by the trusted backend.
+   */
+  const inviteCode =
+    String(
+      req.body?.inviteCode ||
+        ""
+    )
+      .trim()
+      .toUpperCase();
+
   console.log(
     "[AUTODEAR][AUTH_REGISTER][BEGIN]",
     {
@@ -583,6 +596,402 @@ app.post("/api/auth/register", async (req, res) => {
         "Не удалось проверить данные аккаунта. Попробуйте ещё раз.",
     });
   }
+
+  /*
+   * Referral and registration bonuses are server-owned
+   * financial state. Validate dependencies BEFORE signUp.
+   */
+  if (!supabaseServiceRole) {
+    return res.status(503).json({
+      ok: false,
+      error:
+        "REFERRAL_SERVICE_NOT_CONFIGURED",
+      message:
+        "Регистрация временно недоступна. Попробуйте позже.",
+    });
+  }
+
+  const {
+    error:
+      referralCodesSchemaError,
+  } =
+    await supabaseServiceRole
+      .from(
+        "user_referral_codes"
+      )
+      .select(
+        "profile_id"
+      )
+      .limit(1);
+
+  if (referralCodesSchemaError) {
+    console.error(
+      "[AUTODEAR][AUTH_REGISTER][REFERRAL_CODES_SCHEMA]",
+      {
+        code:
+          referralCodesSchemaError
+            .code ||
+          null,
+        message:
+          referralCodesSchemaError
+            .message ||
+          null,
+      }
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error:
+        "REFERRAL_SCHEMA_NOT_READY",
+      message:
+        "Регистрация временно недоступна. Попробуйте позже.",
+    });
+  }
+
+  const {
+    error:
+      referralRelationsSchemaError,
+  } =
+    await supabaseServiceRole
+      .from(
+        "user_referrals"
+      )
+      .select(
+        "invited_profile_id"
+      )
+      .limit(1);
+
+  if (referralRelationsSchemaError) {
+    console.error(
+      "[AUTODEAR][AUTH_REGISTER][REFERRAL_RELATIONS_SCHEMA]",
+      {
+        code:
+          referralRelationsSchemaError
+            .code ||
+          null,
+        message:
+          referralRelationsSchemaError
+            .message ||
+          null,
+      }
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error:
+        "REFERRAL_SCHEMA_NOT_READY",
+      message:
+        "Регистрация временно недоступна. Попробуйте позже.",
+    });
+  }
+
+  const {
+    data:
+      registrationBonusSettings,
+    error:
+      registrationBonusSettingsError,
+  } =
+    await supabaseServiceRole
+      .from(
+        "director_bonus_settings"
+      )
+      .select(
+        [
+          "registration_bonus",
+          "referral_bonus",
+          "bonus_lifetime_days",
+        ].join(",")
+      )
+      .eq(
+        "id",
+        "global"
+      )
+      .maybeSingle();
+
+  if (
+    registrationBonusSettingsError ||
+    !registrationBonusSettings
+  ) {
+    console.error(
+      "[AUTODEAR][AUTH_REGISTER][BONUS_SETTINGS]",
+      {
+        code:
+          registrationBonusSettingsError
+            ?.code ||
+          null,
+        message:
+          registrationBonusSettingsError
+            ?.message ||
+          (
+            !registrationBonusSettings
+              ? "SETTINGS_NOT_FOUND"
+              : null
+          ),
+      }
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error:
+        "BONUS_SETTINGS_NOT_READY",
+      message:
+        "Регистрация временно недоступна. Попробуйте позже.",
+    });
+  }
+
+  const registrationBonusAmount =
+    Math.max(
+      0,
+      Math.floor(
+        Number(
+          registrationBonusSettings
+            .registration_bonus
+        ) ||
+        0
+      )
+    );
+
+  const referralBonusAmount =
+    Math.max(
+      0,
+      Math.floor(
+        Number(
+          registrationBonusSettings
+            .referral_bonus
+        ) ||
+        0
+      )
+    );
+
+  const registrationBonusLifetimeDays =
+    Math.max(
+      1,
+      Math.floor(
+        Number(
+          registrationBonusSettings
+            .bonus_lifetime_days
+        ) ||
+        365
+      )
+    );
+
+  let referrerProfileId =
+    "";
+
+  if (inviteCode) {
+    if (
+      !/^AD-[A-Z0-9]{8,32}$/.test(
+        inviteCode
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "REFERRAL_CODE_INVALID",
+        message:
+          "Некорректный код приглашения.",
+      });
+    }
+
+    const {
+      data:
+        referralCodeRow,
+      error:
+        referralCodeError,
+    } =
+      await supabaseServiceRole
+        .from(
+          "user_referral_codes"
+        )
+        .select(
+          "profile_id,code"
+        )
+        .eq(
+          "code",
+          inviteCode
+        )
+        .maybeSingle();
+
+    if (referralCodeError) {
+      console.error(
+        "[AUTODEAR][AUTH_REGISTER][REFERRAL_LOOKUP]",
+        {
+          code:
+            referralCodeError
+              .code ||
+            null,
+          message:
+            referralCodeError
+              .message ||
+            null,
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error:
+          "REFERRAL_LOOKUP_FAILED",
+        message:
+          "Не удалось проверить код приглашения. Попробуйте позже.",
+      });
+    }
+
+    referrerProfileId =
+      String(
+        referralCodeRow
+          ?.profile_id ||
+        ""
+      ).trim();
+
+    if (!referrerProfileId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "REFERRAL_CODE_NOT_FOUND",
+        message:
+          "Код приглашения не найден.",
+      });
+    }
+  }
+
+  const awardRegistrationReferralBonusOnce =
+    async ({
+      profileId,
+      title,
+      amount,
+      sourceType,
+      sourceId,
+    }) => {
+      const safeAmount =
+        Math.max(
+          0,
+          Math.floor(
+            Number(amount) ||
+            0
+          )
+        );
+
+      if (safeAmount <= 0) {
+        return {
+          awarded: false,
+          duplicate: false,
+        };
+      }
+
+      const {
+        data:
+          existingBonus,
+        error:
+          existingBonusError,
+      } =
+        await supabaseServiceRole
+          .from("bonuses")
+          .select("id")
+          .eq(
+            "user_id",
+            profileId
+          )
+          .eq(
+            "source_type",
+            sourceType
+          )
+          .eq(
+            "source_id",
+            sourceId
+          )
+          .eq(
+            "type",
+            "income"
+          )
+          .maybeSingle();
+
+      if (existingBonusError) {
+        throw new Error(
+          existingBonusError
+            .message ||
+            "BONUS_LOOKUP_FAILED"
+        );
+      }
+
+      if (existingBonus) {
+        return {
+          awarded: false,
+          duplicate: true,
+        };
+      }
+
+      const createdAt =
+        new Date();
+
+      const expiresAt =
+        new Date(
+          createdAt.getTime() +
+          registrationBonusLifetimeDays *
+            24 *
+            60 *
+            60 *
+            1000
+        );
+
+      const {
+        error:
+          bonusInsertError,
+      } =
+        await supabaseServiceRole
+          .from("bonuses")
+          .insert({
+            user_id:
+              profileId,
+
+            title,
+
+            amount:
+              safeAmount,
+
+            type:
+              "income",
+
+            expires_at:
+              expiresAt
+                .toISOString(),
+
+            source_type:
+              sourceType,
+
+            source_id:
+              sourceId,
+
+            created_at:
+              createdAt
+                .toISOString(),
+          });
+
+      if (bonusInsertError) {
+        if (
+          String(
+            bonusInsertError
+              .code ||
+            ""
+          ) === "23505"
+        ) {
+          return {
+            awarded: false,
+            duplicate: true,
+          };
+        }
+
+        throw new Error(
+          bonusInsertError
+            .message ||
+            "BONUS_INSERT_FAILED"
+        );
+      }
+
+      return {
+        awarded: true,
+        duplicate: false,
+      };
+    };
 
   try {
     const {
@@ -839,6 +1248,213 @@ app.post("/api/auth/register", async (req, res) => {
           "Аккаунт создан, но не удалось создать профиль.",
       });
     }
+
+    /*
+     * Referral finalization starts only after the
+     * canonical AUTODEAR profile exists.
+     */
+    const {
+      data:
+        ownReferralCode,
+      error:
+        ownReferralCodeError,
+    } =
+      await supabaseServiceRole
+        .rpc(
+          "autodear_ensure_referral_code",
+          {
+            p_profile_id:
+              user.id,
+          }
+        );
+
+    if (ownReferralCodeError) {
+      throw new Error(
+        ownReferralCodeError
+          .message ||
+        "REFERRAL_CODE_CREATE_FAILED"
+      );
+    }
+
+    let referralLinked =
+      false;
+
+    if (referrerProfileId) {
+      if (
+        referrerProfileId ===
+        user.id
+      ) {
+        throw new Error(
+          "REFERRAL_SELF_NOT_ALLOWED"
+        );
+      }
+
+      const {
+        error:
+          relationError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "user_referrals"
+          )
+          .insert({
+            invited_profile_id:
+              user.id,
+
+            referrer_profile_id:
+              referrerProfileId,
+
+            referral_code:
+              inviteCode,
+          });
+
+      if (relationError) {
+        if (
+          String(
+            relationError
+              .code ||
+            ""
+          ) === "23505"
+        ) {
+          const {
+            data:
+              existingRelation,
+            error:
+              existingRelationError,
+          } =
+            await supabaseServiceRole
+              .from(
+                "user_referrals"
+              )
+              .select(
+                [
+                  "referrer_profile_id",
+                  "referral_code",
+                ].join(",")
+              )
+              .eq(
+                "invited_profile_id",
+                user.id
+              )
+              .maybeSingle();
+
+          if (
+            existingRelationError ||
+            String(
+              existingRelation
+                ?.referrer_profile_id ||
+              ""
+            ) !==
+              referrerProfileId ||
+            String(
+              existingRelation
+                ?.referral_code ||
+              ""
+            ) !==
+              inviteCode
+          ) {
+            throw new Error(
+              "REFERRAL_RELATION_CONFLICT"
+            );
+          }
+        } else {
+          throw new Error(
+            relationError
+              .message ||
+            "REFERRAL_RELATION_CREATE_FAILED"
+          );
+        }
+      }
+
+      referralLinked =
+        true;
+    }
+
+    const registrationAward =
+      await awardRegistrationReferralBonusOnce({
+        profileId:
+          user.id,
+
+        title:
+          "Бонус за регистрацию",
+
+        amount:
+          registrationBonusAmount,
+
+        sourceType:
+          "registration",
+
+        sourceId:
+          String(user.id),
+      });
+
+    let referralAward = {
+      awarded: false,
+      duplicate: false,
+    };
+
+    if (referrerProfileId) {
+      referralAward =
+        await awardRegistrationReferralBonusOnce({
+          profileId:
+            referrerProfileId,
+
+          title:
+            "Бонус за приглашение друга",
+
+          amount:
+            referralBonusAmount,
+
+          sourceType:
+            "referral_registration",
+
+          sourceId:
+            String(user.id),
+        });
+    }
+
+    console.log(
+      "[AUTODEAR][AUTH_REGISTER][REFERRAL_FINALIZED]",
+      {
+        userId:
+          user.id,
+
+        inviteCodeUsed:
+          Boolean(inviteCode),
+
+        referralLinked,
+
+        ownReferralCode:
+          String(
+            ownReferralCode ||
+            ""
+          ),
+
+        registrationBonusAwarded:
+          Boolean(
+            registrationAward
+              ?.awarded
+          ),
+
+        registrationBonusDuplicate:
+          Boolean(
+            registrationAward
+              ?.duplicate
+          ),
+
+        referralBonusAwarded:
+          Boolean(
+            referralAward
+              ?.awarded
+          ),
+
+        referralBonusDuplicate:
+          Boolean(
+            referralAward
+              ?.duplicate
+          ),
+      }
+    );
 
     console.log(
       "[AUTODEAR][AUTH_REGISTER][OK]",
