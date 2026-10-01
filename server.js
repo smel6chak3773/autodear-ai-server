@@ -2377,6 +2377,815 @@ app.get(
   }
 );
 
+// DIRECTOR_FINANCE_SERVER_V1
+
+function directorFinanceStart(period) {
+  const now = new Date();
+
+  if (period === "today") {
+    return new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    );
+  }
+
+  if (period === "month") {
+    return new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      1
+    );
+  }
+
+  if (period === "year") {
+    return new Date(
+      now.getFullYear(),
+      0,
+      1
+    );
+  }
+
+  return null;
+}
+
+function buildDirectorFinanceSummary(
+  events,
+  period
+) {
+  const start =
+    directorFinanceStart(period);
+
+  const rows =
+    events.filter(
+      (event) =>
+        !start ||
+        new Date(event.createdAt) >= start
+    );
+
+  const sourceTotals = {
+    listings: 0,
+    promotion: 0,
+    subscriptions: 0,
+    commissions: 0,
+    vehicleReports: 0,
+    ads: 0,
+  };
+
+  let refunds = 0;
+
+  for (const event of rows) {
+    if (event.source === "refunds") {
+      refunds += event.amountRub;
+    } else if (
+      Object.prototype.hasOwnProperty.call(
+        sourceTotals,
+        event.source
+      )
+    ) {
+      sourceTotals[event.source] +=
+        event.amountRub;
+    }
+  }
+
+  const grossRevenue =
+    Object.values(sourceTotals).reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    );
+
+  return {
+    grossRevenue,
+    refunds,
+    netRevenue:
+      grossRevenue - refunds,
+    sourceTotals,
+
+    businessRevenue:
+      rows.reduce(
+        (sum, event) =>
+          event.walletType ===
+          "business"
+            ? sum +
+              (
+                event.source ===
+                "refunds"
+                  ? -event.amountRub
+                  : event.amountRub
+              )
+            : sum,
+        0
+      ),
+
+    eventCount:
+      rows.length,
+  };
+}
+
+app.get(
+  "/api/director/finance",
+  async (req, res) => {
+    try {
+      await requireBusinessListingBillingDirectorUser(
+        req
+      );
+
+      if (!supabase) {
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "SUPABASE_NOT_CONFIGURED",
+          });
+      }
+
+      const [
+        walletResult,
+        adsResult,
+        vehicleResult,
+        ckassaResult,
+      ] =
+        await Promise.all([
+          supabase
+            .from(
+              "wallet_transactions"
+            )
+            .select(
+              "id,owner_id,type,title,amount,created_at,wallet_type"
+            )
+            .order(
+              "created_at",
+              {
+                ascending: false,
+              }
+            )
+            .limit(5000),
+
+          supabase
+            .from(
+              "ads_wallet_transactions"
+            )
+            .select(
+              "id,owner_id,type,status,amount_kopecks,description,created_at"
+            )
+            .order(
+              "created_at",
+              {
+                ascending: false,
+              }
+            )
+            .limit(5000),
+
+          supabase
+            .from(
+              "vehicle_report_orders"
+            )
+            .select(
+              "id,user_id,report_type,total_price_kopecks,status,created_at,paid_at,credited_at"
+            )
+            .order(
+              "created_at",
+              {
+                ascending: false,
+              }
+            )
+            .limit(5000),
+
+          supabase
+            .from(
+              "ckassa_payments"
+            )
+            .select(
+              "id,purpose,target_id,wallet_type,amount_kopecks,status,provider_state,created_at,paid_at"
+            )
+            .order(
+              "created_at",
+              {
+                ascending: false,
+              }
+            )
+            .limit(5000),
+        ]);
+
+      const queryError =
+        walletResult.error ||
+        adsResult.error ||
+        vehicleResult.error ||
+        ckassaResult.error;
+
+      if (queryError) {
+        console.error(
+          "[AUTODEAR][DIRECTOR][FINANCE_QUERY_ERROR]",
+          {
+            code:
+              queryError.code ||
+              null,
+            message:
+              queryError.message ||
+              null,
+          }
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "DIRECTOR_FINANCE_QUERY_FAILED",
+          });
+      }
+
+      const walletRows =
+        walletResult.data || [];
+
+      const adsRows =
+        adsResult.data || [];
+
+      const vehicleRows =
+        vehicleResult.data || [];
+
+      const ckassaRows =
+        ckassaResult.data || [];
+
+      const revenueTypes =
+        new Set([
+          "listing_payment",
+          "promotion_payment",
+          "subscription_payment",
+          "commission_payment",
+        ]);
+
+      const events = [];
+
+      for (const row of walletRows) {
+        const type =
+          String(
+            row?.type || ""
+          ).trim();
+
+        if (
+          revenueTypes.has(type) &&
+          Number(row?.amount) < 0
+        ) {
+          events.push({
+            id:
+              `wallet:${row.id}`,
+
+            source:
+              type ===
+              "listing_payment"
+                ? "listings"
+                : type ===
+                    "promotion_payment"
+                  ? "promotion"
+                  : type ===
+                      "subscription_payment"
+                    ? "subscriptions"
+                    : "commissions",
+
+            type,
+
+            amountRub:
+              Math.abs(
+                Number(
+                  row.amount
+                )
+              ),
+
+            createdAt:
+              row.created_at,
+
+            ownerId:
+              row.owner_id ||
+              null,
+
+            walletType:
+              row.wallet_type ||
+              null,
+
+            title:
+              row.title ||
+              type,
+          });
+        }
+
+        if (
+          type === "refund" &&
+          Number(row?.amount) > 0
+        ) {
+          events.push({
+            id:
+              `refund:${row.id}`,
+
+            source:
+              "refunds",
+
+            type,
+
+            amountRub:
+              Number(
+                row.amount
+              ),
+
+            createdAt:
+              row.created_at,
+
+            ownerId:
+              row.owner_id ||
+              null,
+
+            walletType:
+              row.wallet_type ||
+              null,
+
+            title:
+              row.title ||
+              "Возврат",
+          });
+        }
+      }
+
+      /*
+       * ads payment = пополнение
+       * рекламного кошелька.
+       *
+       * Оно НЕ является доходом AUTODEAR.
+       *
+       * Доход появляется только при
+       * фактическом подтверждённом
+       * списании рекламных средств.
+       */
+      for (const row of adsRows) {
+        const type =
+          String(
+            row?.type || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        const status =
+          String(
+            row?.status || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        const amount =
+          Number(
+            row?.amount_kopecks
+          );
+
+        if (
+          status ===
+            "confirmed" &&
+          type !== "payment" &&
+          Number.isFinite(
+            amount
+          ) &&
+          amount < 0
+        ) {
+          events.push({
+            id:
+              `ads:${row.id}`,
+
+            source:
+              "ads",
+
+            type,
+
+            amountRub:
+              Math.abs(
+                amount
+              ) / 100,
+
+            createdAt:
+              row.created_at,
+
+            ownerId:
+              row.owner_id ||
+              null,
+
+            walletType:
+              "ads",
+
+            title:
+              row.description ||
+              "Реклама",
+          });
+        }
+      }
+
+      /*
+       * Проверка автомобиля
+       * считается доходом только
+       * после фактического зачисления.
+       */
+      for (
+        const row of vehicleRows
+      ) {
+        const status =
+          String(
+            row?.status || ""
+          )
+            .trim()
+            .toLowerCase();
+
+        const amount =
+          Number(
+            row?.total_price_kopecks
+          );
+
+        const credited =
+          Boolean(
+            row?.credited_at
+          ) ||
+          status ===
+            "credited" ||
+          status ===
+            "completed";
+
+        if (
+          !credited ||
+          !Number.isFinite(
+            amount
+          ) ||
+          amount <= 0
+        ) {
+          continue;
+        }
+
+        events.push({
+          id:
+            `vehicle-report:${row.id}`,
+
+          source:
+            "vehicleReports",
+
+          type:
+            "vehicle_report_package",
+
+          amountRub:
+            amount / 100,
+
+          createdAt:
+            row.credited_at ||
+            row.paid_at ||
+            row.created_at,
+
+          ownerId:
+            row.user_id ||
+            null,
+
+          walletType:
+            "vehicle_report",
+
+          title:
+            `Проверка автомобиля — ${
+              row.report_type ||
+              "отчёт"
+            }`,
+        });
+      }
+
+      const monthly =
+        new Map();
+
+      for (
+        const event of events
+      ) {
+        if (
+          event.source ===
+          "refunds"
+        ) {
+          continue;
+        }
+
+        const date =
+          new Date(
+            event.createdAt
+          );
+
+        if (
+          Number.isNaN(
+            date.getTime()
+          )
+        ) {
+          continue;
+        }
+
+        const key =
+          `${date.getFullYear()}-${String(
+            date.getMonth() + 1
+          ).padStart(2, "0")}`;
+
+        monthly.set(
+          key,
+          (monthly.get(key) ||
+            0) +
+            event.amountRub
+        );
+      }
+
+      const monthlyDynamics =
+        Array.from(
+          monthly.entries()
+        )
+          .sort(
+            (a, b) =>
+              a[0].localeCompare(
+                b[0]
+              )
+          )
+          .slice(-12)
+          .map(
+            ([
+              month,
+              amountRub,
+            ]) => ({
+              month,
+              amountRub,
+            })
+          );
+
+      const recentEvents =
+        [...events]
+          .sort(
+            (a, b) =>
+              new Date(
+                b.createdAt
+              ).getTime() -
+              new Date(
+                a.createdAt
+              ).getTime()
+          )
+          .slice(0, 30);
+
+      const walletTopupsRub =
+        walletRows
+          .filter(
+            (row) =>
+              String(
+                row?.type || ""
+              )
+                .trim()
+                .toLowerCase() ===
+              "topup"
+          )
+          .reduce(
+            (sum, row) =>
+              sum +
+              Math.max(
+                0,
+                Number(
+                  row?.amount ||
+                    0
+                )
+              ),
+            0
+          );
+
+      const adsWalletTopupsRub =
+        adsRows
+          .filter(
+            (row) =>
+              String(
+                row?.type || ""
+              )
+                .trim()
+                .toLowerCase() ===
+              "payment" &&
+              String(
+                row?.status || ""
+              )
+                .trim()
+                .toLowerCase() ===
+              "confirmed"
+          )
+          .reduce(
+            (sum, row) =>
+              sum +
+              Math.max(
+                0,
+                Number(
+                  row?.amount_kopecks ||
+                    0
+                )
+              ) /
+                100,
+            0
+          );
+
+      const pendingVehicleRows =
+        vehicleRows.filter(
+          (row) => {
+            const status =
+              String(
+                row?.status ||
+                  ""
+              )
+                .trim()
+                .toLowerCase();
+
+            return !(
+              Boolean(
+                row?.credited_at
+              ) ||
+              status ===
+                "credited" ||
+              status ===
+                "completed"
+            );
+          }
+        );
+
+      const pendingPayments =
+        ckassaRows
+          .filter(
+            (row) =>
+              String(
+                row?.status ||
+                  ""
+              )
+                .trim()
+                .toLowerCase() ===
+              "pending"
+          )
+          .map(
+            (row) => ({
+              id:
+                row.id,
+
+              purpose:
+                row.purpose ||
+                null,
+
+              targetId:
+                row.target_id ||
+                null,
+
+              walletType:
+                row.wallet_type ||
+                null,
+
+              amountRub:
+                Number(
+                  row.amount_kopecks ||
+                    0
+                ) / 100,
+
+              status:
+                row.status ||
+                null,
+
+              providerState:
+                row.provider_state ||
+                null,
+
+              createdAt:
+                row.created_at ||
+                null,
+
+              paidAt:
+                row.paid_at ||
+                null,
+            })
+          );
+
+      return res.json({
+        ok: true,
+
+        policy: {
+          walletTopupsAreNotRevenue:
+            true,
+
+          adsWalletTopupsAreNotRevenue:
+            true,
+
+          pendingPaymentsAreNotRevenue:
+            true,
+
+          refundsAreNegativeAdjustments:
+            true,
+
+          vehicleReportsCountAfterCredit:
+            true,
+        },
+
+        periods: {
+          today:
+            buildDirectorFinanceSummary(
+              events,
+              "today"
+            ),
+
+          month:
+            buildDirectorFinanceSummary(
+              events,
+              "month"
+            ),
+
+          year:
+            buildDirectorFinanceSummary(
+              events,
+              "year"
+            ),
+
+          allTime:
+            buildDirectorFinanceSummary(
+              events,
+              "all"
+            ),
+        },
+
+        exclusions: {
+          walletTopupsRub,
+
+          adsWalletTopupsRub,
+
+          pendingVehicleReports: {
+            count:
+              pendingVehicleRows.length,
+
+            totalRub:
+              pendingVehicleRows.reduce(
+                (
+                  sum,
+                  row
+                ) =>
+                  sum +
+                  Math.max(
+                    0,
+                    Number(
+                      row?.total_price_kopecks ||
+                        0
+                    )
+                  ) /
+                    100,
+                0
+              ),
+          },
+
+          pendingCkassaPayments:
+            pendingPayments,
+        },
+
+        monthlyDynamics,
+
+        recentEvents,
+
+        meta: {
+          generatedAt:
+            new Date().toISOString(),
+
+          walletRows:
+            walletRows.length,
+
+          adsWalletRows:
+            adsRows.length,
+
+          vehicleOrderRows:
+            vehicleRows.length,
+
+          ckassaRows:
+            ckassaRows.length,
+        },
+      });
+    } catch (error) {
+      const statusCode =
+        Number(
+          error?.statusCode
+        ) >= 400
+          ? Number(
+              error.statusCode
+            )
+          : 500;
+
+      console.error(
+        "[AUTODEAR][DIRECTOR][FINANCE_ERROR]",
+        {
+          statusCode,
+
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res
+        .status(statusCode)
+        .json({
+          ok: false,
+
+          error:
+            error?.message ||
+            "DIRECTOR_FINANCE_FAILED",
+        });
+    }
+  }
+);
+
 // ADMIN_LISTING_MODERATION_V1
 
 const ADMIN_LISTING_ACTIONS = {
