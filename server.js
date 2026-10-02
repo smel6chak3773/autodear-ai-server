@@ -33458,6 +33458,75 @@ app.post(
           });
       }
 
+        /*
+         * CLAIM_ENABLE_ONLINE_BOOKING_V6
+         *
+         * После успешного подтверждения владельца
+         * включаем онлайн-запись для этой карточки.
+         *
+         * Сам claim уже успешно выполнен,
+         * поэтому ошибка включения записи
+         * только логируется и не отменяет claim.
+         */
+        const claimedStationId =
+          String(
+            result.stationId ||
+            stationId
+          ).trim();
+
+        const claimedOwnerId =
+          String(
+            result.ownerId ||
+            userId
+          ).trim();
+
+        const {
+          data: bookingEnabledStation,
+          error: bookingEnableError,
+        } = await supabase
+          .from("stations")
+          .update({
+            online_booking_enabled:
+              true,
+          })
+          .eq(
+            "id",
+            claimedStationId
+          )
+          .eq(
+            "owner_id",
+            claimedOwnerId
+          )
+          .eq(
+            "ownership_status",
+            "claimed"
+          )
+          .select(
+            "id,online_booking_enabled"
+          )
+          .maybeSingle();
+
+        if (
+          bookingEnableError ||
+          !bookingEnabledStation ||
+          bookingEnabledStation.online_booking_enabled !== true
+        ) {
+          console.error(
+            "[AUTODEAR][BUSINESS_DIRECTORY][CLAIM_ENABLE_ONLINE_BOOKING_ERROR]",
+            {
+              stationId:
+                claimedStationId,
+              ownerId:
+                claimedOwnerId,
+              code:
+                bookingEnableError?.code ||
+                null,
+              message:
+                bookingEnableError?.message ||
+                null,
+            }
+          );
+        }
       return res.json({
         ok: true,
 
