@@ -28495,6 +28495,136 @@ function markStaffBusinessListingCreateDiagnostic(
 
 
 /*
+ * PHOTO_BINARY_DEBUG_TEMP_V1
+ *
+ * ВРЕМЕННЫЙ диагностический endpoint.
+ *
+ * Никакого Supabase Auth.
+ * Никакого Storage.
+ * Никакого создания объявления.
+ *
+ * Только проверяем:
+ * Android/HTTP -> Express -> binary body.
+ *
+ * После успешного теста endpoint удалить.
+ */
+app.post(
+  "/api/debug/photo-binary",
+  express.raw({
+    type: [
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "application/octet-stream",
+    ],
+    limit: "8mb",
+  }),
+  async (req, res) => {
+    const startedAt =
+      Date.now();
+
+    try {
+      const diagnosticHeader =
+        String(
+          req.headers?.[
+            "x-autodear-diagnostic"
+          ] || ""
+        ).trim();
+
+      if (
+        diagnosticHeader !==
+        "PHOTO-BINARY-TEST-20261009"
+      ) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "NOT_FOUND",
+        });
+      }
+
+      const body =
+        Buffer.isBuffer(
+          req.body
+        )
+          ? req.body
+          : null;
+
+      const bytes =
+        body?.length || 0;
+
+      console.log(
+        "[AUTODEAR][PHOTO_BINARY_DEBUG][BEGIN]",
+        JSON.stringify({
+          contentType:
+            req.headers?.[
+              "content-type"
+            ] || null,
+
+          contentLength:
+            req.headers?.[
+              "content-length"
+            ] || null,
+
+          bytes,
+        })
+      );
+
+      console.log(
+        "[AUTODEAR][PHOTO_BINARY_DEBUG][RESULT]",
+        JSON.stringify({
+          ok:
+            bytes > 0,
+
+          bytes,
+
+          contentType:
+            req.headers?.[
+              "content-type"
+            ] || null,
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      return res.status(200).json({
+        ok:
+          bytes > 0,
+
+        bytes,
+
+        contentType:
+          req.headers?.[
+            "content-type"
+          ] || null,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][PHOTO_BINARY_DEBUG][FATAL]",
+        JSON.stringify({
+          message:
+            error?.message ||
+            String(error),
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "PHOTO_BINARY_DEBUG_FAILED",
+      });
+    }
+  }
+);
+
+
+/*
  * STAFF_BUSINESS_PHOTO_BINARY_V1
  *
  * Android обход multipart/FormData.
@@ -28822,9 +28952,158 @@ app.post(
  */
 app.post(
   "/api/business-directory/staff/listings/photo",
-  businessCardPhotoUpload.single("image"),
+
+  /*
+   * STAFF_PHOTO REQUEST DIAGNOSTICS
+   *
+   * Этот middleware находится ДО multer.
+   * Поэтому мы увидим даже ситуацию,
+   * когда multipart-загрузка не доходит
+   * до основного route handler.
+   */
+  (req, res, next) => {
+    const startedAt =
+      Date.now();
+
+    console.log(
+      "[AUTODEAR][STAFF_PHOTO][REQUEST_BEGIN]",
+      JSON.stringify({
+        method:
+          req.method,
+
+        url:
+          req.originalUrl,
+
+        contentType:
+          req.headers?.["content-type"] ||
+          null,
+
+        contentLength:
+          req.headers?.["content-length"] ||
+          null,
+      })
+    );
+
+    req.on(
+      "aborted",
+      () => {
+        console.warn(
+          "[AUTODEAR][STAFF_PHOTO][REQUEST_ABORTED]",
+          JSON.stringify({
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+      }
+    );
+
+    req.on(
+      "error",
+      (error) => {
+        console.warn(
+          "[AUTODEAR][STAFF_PHOTO][REQUEST_ERROR]",
+          JSON.stringify({
+            elapsedMs:
+              Date.now() -
+              startedAt,
+
+            message:
+              error?.message ||
+              String(error),
+          })
+        );
+      }
+    );
+
+    next();
+  },
+
+  /*
+   * Оборачиваем существующий multer
+   * только для диагностики.
+   *
+   * Сам businessCardPhotoUpload
+   * и его настройки НЕ меняются.
+   */
+  (req, res, next) => {
+    const uploadStartedAt =
+      Date.now();
+
+    const uploadMiddleware =
+      businessCardPhotoUpload.single(
+        "image"
+      );
+
+    uploadMiddleware(
+      req,
+      res,
+      (error) => {
+        if (error) {
+          console.error(
+            "[AUTODEAR][STAFF_PHOTO][MULTIPART_ERROR]",
+            JSON.stringify({
+              elapsedMs:
+                Date.now() -
+                uploadStartedAt,
+
+              name:
+                error?.name ||
+                null,
+
+              code:
+                error?.code ||
+                null,
+
+              message:
+                error?.message ||
+                String(error),
+            })
+          );
+
+          next(error);
+          return;
+        }
+
+        console.log(
+          "[AUTODEAR][STAFF_PHOTO][MULTIPART_END]",
+          JSON.stringify({
+            elapsedMs:
+              Date.now() -
+              uploadStartedAt,
+
+            hasFile:
+              Boolean(
+                req.file
+              ),
+
+            size:
+              req.file?.size ||
+              0,
+
+            mimetype:
+              req.file?.mimetype ||
+              null,
+
+            originalname:
+              req.file?.originalname ||
+              null,
+          })
+        );
+
+        next();
+      }
+    );
+  },
   async (req, res) => {
     try {
+      const routeStartedAt =
+        Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][ROUTE_BEGIN]"
+      );
+
       if (!supabase) {
         return res.status(500).json({
           ok: false,
@@ -28832,6 +29111,13 @@ app.post(
             "SUPABASE_NOT_CONFIGURED",
         });
       }
+
+      const authStartedAt =
+        Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][AUTH_BEGIN]"
+      );
 
       const {
         user,
@@ -28845,6 +29131,20 @@ app.post(
           user?.id || ""
         ).trim();
 
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][AUTH_END]",
+        JSON.stringify({
+          elapsedMs:
+            Date.now() -
+            authStartedAt,
+
+          ok:
+            Boolean(
+              userId
+            ),
+        })
+      );
+
       if (!userId) {
         return res.status(401).json({
           ok: false,
@@ -28855,6 +29155,27 @@ app.post(
 
       const file =
         req.file;
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][FILE_READY]",
+        JSON.stringify({
+          hasFile:
+            Boolean(file),
+
+          size:
+            file?.size ||
+            file?.buffer?.length ||
+            0,
+
+          mimetype:
+            file?.mimetype ||
+            null,
+
+          originalname:
+            file?.originalname ||
+            null,
+        })
+      );
 
       if (!file?.buffer?.length) {
         return res.status(400).json({
@@ -28903,6 +29224,22 @@ app.post(
           .randomBytes(4)
           .toString("hex")}.${extension}`;
 
+      const storageStartedAt =
+        Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][STORAGE_BEGIN]",
+        JSON.stringify({
+          storagePath,
+          size:
+            file?.size ||
+            file?.buffer?.length ||
+            0,
+
+          mimeType,
+        })
+      );
+
       const {
         error:
           uploadError,
@@ -28922,6 +29259,26 @@ app.post(
                 false,
             }
           );
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][STORAGE_END]",
+        JSON.stringify({
+          elapsedMs:
+            Date.now() -
+            storageStartedAt,
+
+          ok:
+            !uploadError,
+
+          code:
+            uploadError?.code ||
+            null,
+
+          message:
+            uploadError?.message ||
+            null,
+        })
+      );
 
       if (uploadError) {
         console.error(
@@ -28986,6 +29343,17 @@ app.post(
             "Не удалось получить ссылку на фотографию.",
         });
       }
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO][ROUTE_SUCCESS]",
+        JSON.stringify({
+          elapsedMs:
+            Date.now() -
+            routeStartedAt,
+
+          storagePath,
+        })
+      );
 
       return res.status(201).json({
         ok: true,
