@@ -323,6 +323,112 @@ app.use((req, res, next) => {
   next();
 });
 
+
+/*
+ * POST_BODY_ARRIVAL_DIAGNOSTIC_V1
+ *
+ * Только диагностика.
+ * Не читает и не изменяет req.body.
+ * Проверяем, доходит ли непустой POST
+ * до Node/Render и какие транспортные
+ * заголовки реально приходят.
+ */
+app.use((req, res, next) => {
+  if (
+    req.method === "POST" &&
+    req.originalUrl?.startsWith(
+      "/api/debug/photo-binary"
+    )
+  ) {
+    const startedAt = Date.now();
+
+    console.log(
+      "[AUTODEAR][POST_BODY_ARRIVAL][REQUEST]",
+      JSON.stringify({
+        url:
+          req.originalUrl,
+
+        contentType:
+          req.headers?.["content-type"] ||
+          null,
+
+        contentLength:
+          req.headers?.["content-length"] ||
+          null,
+
+        transferEncoding:
+          req.headers?.["transfer-encoding"] ||
+          null,
+
+        expect:
+          req.headers?.["expect"] ||
+          null,
+
+        userAgent:
+          req.headers?.["user-agent"] ||
+          null,
+      })
+    );
+
+    req.once(
+      "end",
+      () => {
+        console.log(
+          "[AUTODEAR][POST_BODY_ARRIVAL][END]",
+          JSON.stringify({
+            url:
+              req.originalUrl,
+
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+      }
+    );
+
+    req.once(
+      "aborted",
+      () => {
+        console.warn(
+          "[AUTODEAR][POST_BODY_ARRIVAL][ABORTED]",
+          JSON.stringify({
+            url:
+              req.originalUrl,
+
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+      }
+    );
+
+    req.once(
+      "error",
+      (error) => {
+        console.error(
+          "[AUTODEAR][POST_BODY_ARRIVAL][ERROR]",
+          JSON.stringify({
+            url:
+              req.originalUrl,
+
+            message:
+              error?.message ||
+              String(error),
+
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+      }
+    );
+  }
+
+  next();
+});
+
 app.use(express.json({ limit: "12mb" }));
 
 /*
