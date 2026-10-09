@@ -28624,6 +28624,147 @@ app.post(
 );
 
 
+
+/*
+ * PHOTO_BASE64_DEBUG_TEMP_V1
+ *
+ * ВРЕМЕННЫЙ диагностический endpoint.
+ *
+ * Никакого Supabase Auth.
+ * Никакого Storage.
+ * Никакого создания объявления.
+ *
+ * Проверяем только:
+ * Android -> обычный JSON -> Express -> Base64 -> Buffer.
+ *
+ * После успешного теста endpoint удалить.
+ */
+app.post(
+  "/api/debug/photo-base64",
+  async (req, res) => {
+    const startedAt =
+      Date.now();
+
+    try {
+      const diagnosticHeader =
+        String(
+          req.headers?.[
+            "x-autodear-diagnostic"
+          ] || ""
+        ).trim();
+
+      if (
+        diagnosticHeader !==
+        "PHOTO-BASE64-TEST-20261009"
+      ) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "NOT_FOUND",
+        });
+      }
+
+      const base64 =
+        String(
+          req.body?.base64 || ""
+        ).trim();
+
+      const contentType =
+        String(
+          req.body?.contentType ||
+            ""
+        ).trim();
+
+      if (!base64) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BASE64_REQUIRED",
+        });
+      }
+
+      const buffer =
+        Buffer.from(
+          base64,
+          "base64"
+        );
+
+      const bytes =
+        buffer.length;
+
+      console.log(
+        "[AUTODEAR][PHOTO_BASE64_DEBUG][BEGIN]",
+        JSON.stringify({
+          contentType:
+            contentType ||
+            null,
+
+          base64Length:
+            base64.length,
+
+          bytes,
+        })
+      );
+
+      console.log(
+        "[AUTODEAR][PHOTO_BASE64_DEBUG][RESULT]",
+        JSON.stringify({
+          ok:
+            bytes > 0,
+
+          contentType:
+            contentType ||
+            null,
+
+          base64Length:
+            base64.length,
+
+          bytes,
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      return res.status(200).json({
+        ok:
+          bytes > 0,
+
+        bytes,
+
+        contentType:
+          contentType ||
+          null,
+
+        base64Length:
+          base64.length,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][PHOTO_BASE64_DEBUG][FATAL]",
+        JSON.stringify({
+          message:
+            error?.message ||
+            String(error),
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          "PHOTO_BASE64_DEBUG_FAILED",
+      });
+    }
+  }
+);
+
+
 /*
  * STAFF_BUSINESS_PHOTO_BINARY_V1
  *
