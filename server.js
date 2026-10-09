@@ -28493,6 +28493,326 @@ function markStaffBusinessListingCreateDiagnostic(
 
 
 
+
+/*
+ * STAFF_BUSINESS_PHOTO_BINARY_V1
+ *
+ * Android обход multipart/FormData.
+ *
+ * Клиент отправляет уже готовые байты JPEG/PNG/WEBP
+ * напрямую в HTTP body.
+ *
+ * Старый multipart endpoint ниже НЕ изменяется.
+ * DELETE endpoint НЕ изменяется.
+ */
+app.post(
+  "/api/business-directory/staff/listings/photo-binary",
+  express.raw({
+    type: [
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "application/octet-stream",
+    ],
+    limit: "8mb",
+  }),
+  async (req, res) => {
+    const startedAt =
+      Date.now();
+
+    try {
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][BEGIN]",
+        JSON.stringify({
+          contentType:
+            req.headers?.["content-type"] ||
+            null,
+
+          contentLength:
+            req.headers?.["content-length"] ||
+            null,
+        })
+      );
+
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const {
+        user,
+      } =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const userId =
+        String(
+          user?.id || ""
+        ).trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            "AUTH_REQUIRED",
+        });
+      }
+
+      const fileBuffer =
+        Buffer.isBuffer(
+          req.body
+        )
+          ? req.body
+          : null;
+
+      if (
+        !fileBuffer ||
+        !fileBuffer.length
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_REQUIRED",
+          message:
+            "Добавьте фотографию сервиса.",
+        });
+      }
+
+      const rawContentType =
+        String(
+          req.headers?.["content-type"] ||
+            ""
+        )
+          .split(";")[0]
+          .trim()
+          .toLowerCase();
+
+      const mimeType =
+        [
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+        ].includes(
+          rawContentType
+        )
+          ? rawContentType
+          : "image/jpeg";
+
+      const extensionByMime = {
+        "image/jpeg":
+          "jpg",
+        "image/png":
+          "png",
+        "image/webp":
+          "webp",
+      };
+
+      const extension =
+        extensionByMime[
+          mimeType
+        ];
+
+      if (!extension) {
+        return res.status(415).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_TYPE_UNSUPPORTED",
+          message:
+            "Поддерживаются фотографии JPG, PNG и WEBP.",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][FILE_READY]",
+        JSON.stringify({
+          bytes:
+            fileBuffer.length,
+
+          mimeType,
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      const safeUserId =
+        userId.replace(
+          /[^a-zA-Z0-9_-]/g,
+          "_"
+        );
+
+      const storagePath =
+        `${safeUserId}/staff_directory_${Date.now()}_${crypto
+          .randomBytes(4)
+          .toString("hex")}.${extension}`;
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][STORAGE_BEGIN]",
+        JSON.stringify({
+          storagePath,
+          bytes:
+            fileBuffer.length,
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      const {
+        error:
+          uploadError,
+      } =
+        await supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .upload(
+            storagePath,
+            fileBuffer,
+            {
+              contentType:
+                mimeType,
+
+              upsert:
+                false,
+            }
+          );
+
+      if (uploadError) {
+        console.error(
+          "[AUTODEAR][STAFF_PHOTO_BINARY][STORAGE_ERROR]",
+          JSON.stringify({
+            code:
+              uploadError.code ||
+              null,
+
+            message:
+              uploadError.message ||
+              null,
+
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_UPLOAD_FAILED",
+          message:
+            "Не удалось загрузить фотографию сервиса.",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][STORAGE_END]",
+        JSON.stringify({
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      const {
+        data:
+          publicData,
+      } =
+        supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .getPublicUrl(
+            storagePath
+          );
+
+      const photoUrl =
+        String(
+          publicData
+            ?.publicUrl ||
+            ""
+        ).trim();
+
+      if (!photoUrl) {
+        await supabase
+          .storage
+          .from(
+            "business-photos"
+          )
+          .remove([
+            storagePath,
+          ])
+          .catch(
+            () => null
+          );
+
+        return res.status(502).json({
+          ok: false,
+          error:
+            "STAFF_BUSINESS_PHOTO_URL_FAILED",
+          message:
+            "Не удалось получить ссылку на фотографию.",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][SUCCESS]",
+        JSON.stringify({
+          bytes:
+            fileBuffer.length,
+
+          storagePath,
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      return res.status(201).json({
+        ok: true,
+        photoUrl,
+        storagePath,
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][FATAL]",
+        JSON.stringify({
+          message:
+            error?.message ||
+            String(error),
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        })
+      );
+
+      return res
+        .status(
+          Number(
+            error?.statusCode ||
+              500
+          )
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "STAFF_BUSINESS_PHOTO_BINARY_FAILED",
+        });
+    }
+  }
+);
+
 /*
  * STAFF_BUSINESS_PHOTO_PROXY_V1
  *
