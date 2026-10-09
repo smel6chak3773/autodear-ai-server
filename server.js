@@ -429,6 +429,111 @@ app.use((req, res, next) => {
   next();
 });
 
+
+/*
+ * PHOTO_BINARY_204_DIAGNOSTIC_V1
+ *
+ * Диагностика Android binary upload.
+ *
+ * Принимаем тело полностью, ничего не сохраняем
+ * и после req.end возвращаем HTTP 204 без тела ответа.
+ */
+app.post(
+  "/api/debug/photo-binary-204",
+  (req, res) => {
+    const startedAt =
+      Date.now();
+
+    let bytes = 0;
+
+    console.log(
+      "[AUTODEAR][PHOTO_204][REQUEST]",
+      JSON.stringify({
+        contentType:
+          req.headers?.["content-type"] ||
+          null,
+
+        contentLength:
+          req.headers?.["content-length"] ||
+          null,
+
+        transferEncoding:
+          req.headers?.["transfer-encoding"] ||
+          null,
+
+        userAgent:
+          req.headers?.["user-agent"] ||
+          null,
+      })
+    );
+
+    req.on(
+      "data",
+      (chunk) => {
+        bytes +=
+          Buffer.isBuffer(chunk)
+            ? chunk.length
+            : Buffer.byteLength(
+                String(chunk)
+              );
+      }
+    );
+
+    req.once(
+      "aborted",
+      () => {
+        console.warn(
+          "[AUTODEAR][PHOTO_204][ABORTED]",
+          JSON.stringify({
+            bytes,
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+      }
+    );
+
+    req.once(
+      "error",
+      (error) => {
+        console.error(
+          "[AUTODEAR][PHOTO_204][ERROR]",
+          JSON.stringify({
+            bytes,
+            message:
+              error?.message ||
+              String(error),
+
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+      }
+    );
+
+    req.once(
+      "end",
+      () => {
+        console.log(
+          "[AUTODEAR][PHOTO_204][END]",
+          JSON.stringify({
+            bytes,
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          })
+        );
+
+        res
+          .status(204)
+          .end();
+      }
+    );
+  }
+);
+
 app.use(express.json({ limit: "12mb" }));
 
 /*
