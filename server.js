@@ -28989,16 +28989,35 @@ app.post(
  */
 app.post(
   "/api/business-directory/staff/listings/photo-binary",
-  express.raw({
-    type: [
-      "image/jpeg",
-      "image/png",
-      "image/webp",
-      "application/octet-stream",
-    ],
-    limit: "8mb",
-  }),
-  async (req, res) => {
+    (req, res, next) => {
+      const contentType =
+        String(
+          req.headers?.["content-type"] || ""
+        )
+          .split(";")[0]
+          .trim()
+          .toLowerCase();
+
+      if (
+        contentType ===
+        "application/json"
+      ) {
+        return express.json({
+          limit: "12mb",
+        })(req, res, next);
+      }
+
+      return express.raw({
+        type: [
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+          "application/octet-stream",
+        ],
+        limit: "8mb",
+      })(req, res, next);
+    },
+    async (req, res) => {
     const startedAt =
       Date.now();
 
@@ -29044,47 +29063,117 @@ app.post(
         });
       }
 
-      const fileBuffer =
-        Buffer.isBuffer(
-          req.body
-        )
-          ? req.body
-          : null;
+      const jsonBody =
+          req.body &&
+          typeof req.body ===
+            "object" &&
+          !Buffer.isBuffer(
+            req.body
+          )
+            ? req.body
+            : null;
 
-      if (
-        !fileBuffer ||
-        !fileBuffer.length
-      ) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            "STAFF_BUSINESS_PHOTO_REQUIRED",
-          message:
-            "Добавьте фотографию сервиса.",
-        });
-      }
+        const base64 =
+          String(
+            jsonBody?.base64 ||
+              ""
+          ).trim();
 
-      const rawContentType =
-        String(
-          req.headers?.["content-type"] ||
-            ""
-        )
-          .split(";")[0]
-          .trim()
-          .toLowerCase();
+        let fileBuffer = null;
 
-      const mimeType =
-        [
-          "image/jpeg",
-          "image/png",
-          "image/webp",
-        ].includes(
-          rawContentType
-        )
-          ? rawContentType
-          : "image/jpeg";
+        if (
+          Buffer.isBuffer(
+            req.body
+          )
+        ) {
+          fileBuffer =
+            req.body;
+        } else if (
+          base64
+        ) {
+          try {
+            fileBuffer =
+              Buffer.from(
+                base64,
+                "base64"
+              );
+          } catch {
+            return res.status(400).json({
+              ok: false,
+              error:
+                "STAFF_BUSINESS_PHOTO_BASE64_INVALID",
+              message:
+                "Некорректные данные фотографии.",
+            });
+          }
+        }
 
-      const extensionByMime = {
+        if (
+          !fileBuffer ||
+          !fileBuffer.length
+        ) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              "STAFF_BUSINESS_PHOTO_REQUIRED",
+            message:
+              "Добавьте фотографию сервиса.",
+          });
+        }
+
+        const MAX_PHOTO_BYTES =
+          8 * 1024 * 1024;
+
+        if (
+          fileBuffer.length >
+          MAX_PHOTO_BYTES
+        ) {
+          return res.status(413).json({
+            ok: false,
+            error:
+              "STAFF_BUSINESS_PHOTO_TOO_LARGE",
+            message:
+              "Фотография слишком большая.",
+          });
+        }
+
+        const rawContentType =
+          String(
+            req.headers?.["content-type"] ||
+              ""
+          )
+            .split(";")[0]
+            .trim()
+            .toLowerCase();
+
+        const jsonContentType =
+          String(
+            jsonBody?.contentType ||
+              ""
+          )
+            .trim()
+            .toLowerCase();
+
+        const mimeType =
+          [
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+          ].includes(
+            rawContentType
+          )
+            ? rawContentType
+            : [
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+              ].includes(
+                jsonContentType
+              )
+              ? jsonContentType
+              : "image/jpeg";
+
+        const extensionByMime = {
         "image/jpeg":
           "jpg",
         "image/png":
@@ -31286,44 +31375,29 @@ app.post(
 /*
  * TEMPORARY STAFF CREATE DIAGNOSTIC.
  *
- * Protected by the same staff authorization as creation.
- * Remove after release blocker is diagnosed.
+ * IMPORTANT:
+ * This endpoint is intentionally unauthenticated and read-only.
+ *
+ * It exposes only technical stage/timing information needed
+ * to diagnose the staff listing creation timeout.
+ *
+ * Remove after the release blocker is diagnosed.
  */
 app.get(
   "/api/business-directory/staff/listings/diagnostics/latest",
-  async (req, res) => {
-    try {
-      await requireBusinessDirectoryStaffUser(
-        req
-      );
+  (req, res) => {
+    res.set(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate"
+    );
 
-      return res.json({
-        ok: true,
-
-        diagnostic:
-          latestStaffBusinessListingCreateDiagnostic,
-      });
-
-    } catch (error) {
-      const status =
-        Number(
-          error?.statusCode ||
-          500
-        );
-
-      return res
-        .status(status)
-        .json({
-          ok: false,
-
-          error:
-            error?.message ||
-            "STAFF_CREATE_DIAGNOSTIC_FAILED",
-        });
-    }
+    return res.json({
+      ok: true,
+      diagnostic:
+        latestStaffBusinessListingCreateDiagnostic,
+    });
   }
 );
-
 
 /*
  * Delete an AUTODEAR staff-created listing
