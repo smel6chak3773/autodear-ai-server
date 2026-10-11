@@ -30979,6 +30979,32 @@ app.post(
         );
 
 
+      /* STAFF_CREATE_GALLERY_V7 */
+      const incomingStaffGallery =
+        typeof body !== "undefined" &&
+        Array.isArray(body?.gallery)
+          ? body.gallery
+          : Array.isArray(req.body?.gallery)
+            ? req.body.gallery
+            : [];
+
+      const staffGallery =
+        Array.from(
+          new Set(
+            [
+              ...(photoUrl
+                ? [photoUrl]
+                : []),
+              ...incomingStaffGallery,
+            ]
+              .map(
+                (item) =>
+                  String(item || "").trim()
+              )
+              .filter(Boolean)
+          )
+        ).slice(0, 20);
+
       const stationPayload = {
         /*
          * STAFF_STATION_EXPLICIT_ID_V1
@@ -31025,6 +31051,14 @@ app.post(
 
         longitude,
 
+        gallery:
+          staffGallery,
+
+        photos:
+          staffGallery,
+
+        images:
+          staffGallery,
         ...(photoUrl
           ? {
               photo_url:
@@ -31091,6 +31125,9 @@ app.post(
             "directions",
             "services",
             "photo_url",
+            "gallery",
+            "photos",
+            "images",
             "created_source",
             "created_by_user_id",
             "ownership_status",
@@ -31320,6 +31357,12 @@ app.post(
             station.photo_url ||
             null,
 
+          gallery:
+            Array.isArray(
+              station.gallery
+            )
+              ? station.gallery
+              : [],
           ownershipStatus:
             station.ownership_status,
 
@@ -31798,6 +31841,1090 @@ app.delete(
     }
   }
 );
+
+
+/*
+ * STAFF_SERVICE_MANAGEMENT_V1
+ *
+ * Директорское управление всеми сервисными карточками.
+ *
+ * Возможности:
+ * - получить весь список stations;
+ * - искать владельцев бизнес-аккаунтов;
+ * - передать существующую карточку другому владельцу;
+ * - удалить сервис из публичного каталога без уничтожения
+ *   самой карточки и связанных исторических данных.
+ *
+ * ВАЖНО:
+ * существующий claim-flow НЕ изменяем.
+ * Передача директором — отдельная доверенная операция.
+ */
+
+function getStaffServiceManagementDb() {
+  if (!supabaseServiceRole) {
+    const error = new Error(
+      "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED"
+    );
+
+    error.statusCode = 503;
+
+    throw error;
+  }
+
+  return supabaseServiceRole;
+}
+
+
+/*
+ * STAFF_SERVICE_MANAGEMENT_LIST_V1
+ *
+ * Возвращает все stations, включая временно отключённые.
+ * Это принципиально: директор должен видеть и старые/закрытые
+ * сервисы, чтобы иметь возможность ими управлять.
+ */
+app.get(
+  "/api/business-directory/staff/services",
+  async (req, res) => {
+    try {
+      await requireBusinessDirectoryStaffUser(req);
+
+      const db =
+        getStaffServiceManagementDb();
+
+      const {
+        data: stations,
+        error: stationsError,
+      } = await db
+        .from("stations")
+        .select(
+          [
+            "id",
+            "owner_id",
+            "name",
+            "address",
+            "city",
+            "phone",
+            "photo_url",
+            "created_source",
+            "created_by_user_id",
+            "ownership_status",
+            "claimed_by_user_id",
+            "claimed_at",
+            "created_at",
+            "is_active",
+            "status",
+          ].join(",")
+        )
+        .order(
+          "name",
+          {
+            ascending: true,
+            nullsFirst: false,
+          }
+        )
+        .limit(1000);
+
+      if (stationsError) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_MANAGEMENT][LIST_ERROR]",
+          stationsError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICES_LIST_FAILED",
+        });
+      }
+
+      const rows =
+        Array.isArray(stations)
+          ? stations
+          : [];
+
+      const ownerIds =
+        [
+          ...new Set(
+            rows
+              .map(
+                (station) =>
+                  String(
+                    station?.owner_id ||
+                    ""
+                  ).trim()
+              )
+              .filter(Boolean)
+          ),
+        ];
+
+      const profilesByKey =
+        new Map();
+
+      /*
+       * owner_id в AUTODEAR — это auth user id.
+       * Для совместимости со старыми карточками
+       * проверяем также profiles.id.
+       */
+      if (ownerIds.length) {
+        const {
+          data: byAuthUserId,
+        } = await db
+          .from("profiles")
+          .select(
+            "id,auth_user_id,name,email,phone,role"
+          )
+          .in(
+            "auth_user_id",
+            ownerIds
+          );
+
+        for (
+          const profile of
+          Array.isArray(byAuthUserId)
+            ? byAuthUserId
+            : []
+        ) {
+          if (profile?.auth_user_id) {
+            profilesByKey.set(
+              String(
+                profile.auth_user_id
+              ),
+              profile
+            );
+          }
+
+          if (profile?.id) {
+            profilesByKey.set(
+              String(profile.id),
+              profile
+            );
+          }
+        }
+
+        const {
+          data: byProfileId,
+        } = await db
+          .from("profiles")
+          .select(
+            "id,auth_user_id,name,email,phone,role"
+          )
+          .in(
+            "id",
+            ownerIds
+          );
+
+        for (
+          const profile of
+          Array.isArray(byProfileId)
+            ? byProfileId
+            : []
+        ) {
+          if (profile?.id) {
+            profilesByKey.set(
+              String(profile.id),
+              profile
+            );
+          }
+
+          if (profile?.auth_user_id) {
+            profilesByKey.set(
+              String(
+                profile.auth_user_id
+              ),
+              profile
+            );
+          }
+        }
+      }
+
+      const result =
+        rows.map(
+          (station) => {
+            const ownerId =
+              String(
+                station?.owner_id ||
+                ""
+              ).trim();
+
+            const owner =
+              ownerId
+                ? (
+                    profilesByKey.get(
+                      ownerId
+                    ) ||
+                    null
+                  )
+                : null;
+
+            const staffCreated =
+              String(
+                station?.created_source ||
+                ""
+              ).trim() ===
+                "autodear_staff" ||
+              Boolean(
+                station?.created_by_user_id
+              );
+
+            return {
+              id:
+                station.id,
+
+              name:
+                station.name ||
+                "",
+
+              address:
+                station.address ||
+                "",
+
+              city:
+                station.city ||
+                "",
+
+              phone:
+                station.phone ||
+                "",
+
+              photoUrl:
+                station.photo_url ||
+                null,
+
+              ownerId:
+                ownerId ||
+                null,
+
+              owner:
+                owner
+                  ? {
+                      id:
+                        owner.id ||
+                        null,
+
+                      authUserId:
+                        owner.auth_user_id ||
+                        null,
+
+                      name:
+                        owner.name ||
+                        "",
+
+                      email:
+                        owner.email ||
+                        "",
+
+                      phone:
+                        owner.phone ||
+                        "",
+
+                      role:
+                        owner.role ||
+                        "",
+                    }
+                  : null,
+
+              createdSource:
+                station.created_source ||
+                null,
+
+              createdByUserId:
+                station.created_by_user_id ||
+                null,
+
+              ownershipStatus:
+                station.ownership_status ||
+                null,
+
+              claimedByUserId:
+                station.claimed_by_user_id ||
+                null,
+
+              claimedAt:
+                station.claimed_at ||
+                null,
+
+              createdAt:
+                station.created_at ||
+                null,
+
+              isActive:
+                station.is_active !== false,
+
+              status:
+                station.status ||
+                null,
+
+              source:
+                staffCreated
+                  ? "staff"
+                  : "owner",
+            };
+          }
+        );
+
+      return res.json({
+        ok: true,
+
+        services:
+          result,
+
+        count:
+          result.length,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][STAFF_SERVICE_MANAGEMENT][LIST_FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "STAFF_SERVICES_LIST_FATAL",
+      });
+    }
+  }
+);
+
+
+/*
+ * STAFF_SERVICE_OWNER_SEARCH_V1
+ *
+ * Только бизнес-аккаунты.
+ * Директор выбирает существующий аккаунт,
+ * а не вводит произвольный UUID.
+ */
+app.get(
+  "/api/business-directory/staff/service-owners",
+  async (req, res) => {
+    try {
+      await requireBusinessDirectoryStaffUser(req);
+
+      const db =
+        getStaffServiceManagementDb();
+
+      const query =
+        String(
+          req.query?.q ||
+          ""
+        )
+          .trim()
+          .slice(
+            0,
+            100
+          );
+
+      let request =
+        db
+          .from("profiles")
+          .select(
+            "id,auth_user_id,name,email,phone,role"
+          )
+          .eq(
+            "role",
+            "business"
+          )
+          .order(
+            "name",
+            {
+              ascending: true,
+              nullsFirst: false,
+            }
+          )
+          .limit(500);
+
+      /*
+       * Поиск выполняем по профилю.
+       * Убираем управляющие символы PostgREST
+       * из поисковой строки.
+       */
+      if (query) {
+        const safeQuery =
+          query
+            .replace(
+              /[%_(),]/g,
+              " "
+            )
+            .replace(
+              /\s+/g,
+              " "
+            )
+            .trim();
+
+        if (safeQuery) {
+          request =
+            request.or(
+              [
+                `name.ilike.%${safeQuery}%`,
+                `email.ilike.%${safeQuery}%`,
+                `phone.ilike.%${safeQuery}%`,
+              ].join(",")
+            );
+        }
+      }
+
+      const {
+        data,
+        error,
+      } = await request;
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_OWNER_SEARCH][ERROR]",
+          error
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_OWNER_SEARCH_FAILED",
+        });
+      }
+
+      const owners =
+        (
+          Array.isArray(data)
+            ? data
+            : []
+        ).map(
+          (profile) => ({
+            id:
+              profile.id ||
+              null,
+
+            authUserId:
+              profile.auth_user_id ||
+              null,
+
+            name:
+              profile.name ||
+              "",
+
+            email:
+              profile.email ||
+              "",
+
+            phone:
+              profile.phone ||
+              "",
+
+            role:
+              profile.role ||
+              "business",
+          })
+        );
+
+      return res.json({
+        ok: true,
+        owners,
+        count:
+          owners.length,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][STAFF_SERVICE_OWNER_SEARCH][FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "STAFF_SERVICE_OWNER_SEARCH_FATAL",
+      });
+    }
+  }
+);
+
+
+/*
+ * STAFF_SERVICE_TRANSFER_OWNER_V1
+ *
+ * Передача существующей карточки.
+ *
+ * НИЧЕГО не пересоздаём:
+ * station.id остаётся тем же.
+ *
+ * Сохраняются:
+ * - фотографии;
+ * - услуги;
+ * - график;
+ * - адрес;
+ * - отзывы;
+ * - рейтинг;
+ * - история;
+ * - остальные поля карточки.
+ *
+ * Меняются только ownership-поля.
+ */
+app.post(
+  "/api/business-directory/staff/services/:stationId/transfer",
+  async (req, res) => {
+    try {
+      const staffUser =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const db =
+        getStaffServiceManagementDb();
+
+      const stationId =
+        String(
+          req.params?.stationId ||
+          ""
+        ).trim();
+
+      const targetUserId =
+        String(
+          req.body?.targetUserId ||
+          req.body?.targetAuthUserId ||
+          ""
+        ).trim();
+
+      if (!stationId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ID_REQUIRED",
+          message:
+            "Не указан сервис.",
+        });
+      }
+
+      if (!targetUserId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TARGET_OWNER_REQUIRED",
+          message:
+            "Не выбран новый владелец.",
+        });
+      }
+
+      /*
+       * Защищаем запрос от подстановки
+       * произвольного идентификатора.
+       */
+      const uuidPattern =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+      if (!uuidPattern.test(targetUserId)) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TARGET_OWNER_INVALID",
+          message:
+            "Выбран некорректный аккаунт владельца.",
+        });
+      }
+
+      const {
+        data: station,
+        error: stationError,
+      } = await db
+        .from("stations")
+        .select(
+          [
+            "id",
+            "name",
+            "owner_id",
+            "ownership_status",
+            "claimed_by_user_id",
+            "is_active",
+          ].join(",")
+        )
+        .eq(
+          "id",
+          stationId
+        )
+        .maybeSingle();
+
+      if (stationError) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_TRANSFER][STATION_LOOKUP_ERROR]",
+          stationError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TRANSFER_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_NOT_FOUND",
+          message:
+            "Сервис не найден.",
+        });
+      }
+
+      if (
+        station.is_active ===
+        false
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TRANSFER_INACTIVE",
+          message:
+            "Удалённый из каталога сервис сначала нужно восстановить.",
+        });
+      }
+
+      /*
+       * Находим именно бизнес-аккаунт.
+       */
+      const {
+        data: targetProfile,
+        error: targetProfileError,
+      } = await db
+        .from("profiles")
+        .select(
+          "id,auth_user_id,name,email,phone,role"
+        )
+        .or(
+          `auth_user_id.eq.${targetUserId},id.eq.${targetUserId}`
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (targetProfileError) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_TRANSFER][TARGET_PROFILE_ERROR]",
+          targetProfileError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TARGET_OWNER_LOOKUP_FAILED",
+        });
+      }
+
+      if (
+        !targetProfile ||
+        String(
+          targetProfile.role ||
+          ""
+        )
+          .trim()
+          .toLowerCase() !==
+          "business"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TARGET_OWNER_NOT_BUSINESS",
+          message:
+            "Передать сервис можно только бизнес-аккаунту.",
+        });
+      }
+
+      const targetOwnerId =
+        String(
+          targetProfile.auth_user_id ||
+          targetProfile.id ||
+          ""
+        ).trim();
+
+      if (!targetOwnerId) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TARGET_OWNER_ID_MISSING",
+        });
+      }
+
+      const currentOwnerId =
+        String(
+          station.owner_id ||
+          ""
+        ).trim();
+
+      if (
+        currentOwnerId &&
+        currentOwnerId ===
+          targetOwnerId
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ALREADY_OWNED",
+          message:
+            "Этот аккаунт уже является владельцем сервиса.",
+        });
+      }
+
+      /*
+       * Одна UPDATE-операция.
+       *
+       * Карточка не пересоздаётся.
+       * Все остальные поля stations остаются нетронутыми.
+       */
+      const {
+        data: updatedStation,
+        error: updateError,
+      } = await db
+        .from("stations")
+        .update({
+          owner_id:
+            targetOwnerId,
+
+          ownership_status:
+            "claimed",
+
+          claimed_by_user_id:
+            targetOwnerId,
+
+          claimed_at:
+            new Date().toISOString(),
+
+          /*
+           * После явной передачи владельцу
+           * онлайн-запись должна быть доступна.
+           */
+          online_booking_enabled:
+            true,
+        })
+        .eq(
+          "id",
+          stationId
+        )
+        .select(
+          [
+            "id",
+            "owner_id",
+            "ownership_status",
+            "claimed_by_user_id",
+            "claimed_at",
+            "online_booking_enabled",
+          ].join(",")
+        )
+        .single();
+
+      if (updateError) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_TRANSFER][UPDATE_ERROR]",
+          {
+            stationId,
+            targetOwnerId,
+            code:
+              updateError.code ||
+              null,
+            message:
+              updateError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TRANSFER_FAILED",
+          message:
+            "Не удалось передать сервис.",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICE_TRANSFER][SUCCESS]",
+        {
+          stationId,
+          staffUserId:
+            staffUser?.id ||
+            null,
+          previousOwnerId:
+            currentOwnerId ||
+            null,
+          newOwnerId:
+            targetOwnerId,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        transferred:
+          true,
+
+        stationId,
+
+        previousOwnerId:
+          currentOwnerId ||
+          null,
+
+        owner: {
+          id:
+            targetProfile.id ||
+            null,
+
+          authUserId:
+            targetProfile.auth_user_id ||
+            targetOwnerId,
+
+          name:
+            targetProfile.name ||
+            "",
+
+          email:
+            targetProfile.email ||
+            "",
+
+          phone:
+            targetProfile.phone ||
+            "",
+        },
+
+        listing:
+          updatedStation ||
+          null,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][STAFF_SERVICE_TRANSFER][FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "STAFF_SERVICE_TRANSFER_FATAL",
+      });
+    }
+  }
+);
+
+
+/*
+ * STAFF_SERVICE_DELETE_V1
+ *
+ * "Удаление" сервиса директором означает
+ * убрать карточку из каталога, а не уничтожить
+ * историю посещений, отзывов и прочих связанных
+ * данных.
+ *
+ * Поэтому используем is_active=false.
+ *
+ * Карточка остаётся в базе и видна директору
+ * в разделе управления.
+ */
+app.delete(
+  "/api/business-directory/staff/services/:stationId",
+  async (req, res) => {
+    try {
+      const staffUser =
+        await requireBusinessDirectoryStaffUser(
+          req
+        );
+
+      const db =
+        getStaffServiceManagementDb();
+
+      const stationId =
+        String(
+          req.params?.stationId ||
+          ""
+        ).trim();
+
+      if (!stationId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ID_REQUIRED",
+          message:
+            "Не указан сервис.",
+        });
+      }
+
+      const {
+        data: station,
+        error: lookupError,
+      } = await db
+        .from("stations")
+        .select(
+          [
+            "id",
+            "name",
+            "owner_id",
+            "is_active",
+            "status",
+          ].join(",")
+        )
+        .eq(
+          "id",
+          stationId
+        )
+        .maybeSingle();
+
+      if (lookupError) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_DELETE][LOOKUP_ERROR]",
+          lookupError
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_DELETE_LOOKUP_FAILED",
+        });
+      }
+
+      if (!station) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_NOT_FOUND",
+          message:
+            "Сервис уже отсутствует.",
+        });
+      }
+
+      if (
+        station.is_active ===
+        false
+      ) {
+        return res.json({
+          ok: true,
+          deleted: true,
+          alreadyDeleted:
+            true,
+          stationId,
+        });
+      }
+
+      const {
+        data: deletedStation,
+        error: deleteError,
+      } = await db
+        .from("stations")
+        .update({
+          is_active:
+            false,
+        })
+        .eq(
+          "id",
+          stationId
+        )
+        .select(
+          "id,name,owner_id,is_active,status"
+        )
+        .single();
+
+      if (deleteError) {
+        console.error(
+          "[AUTODEAR][STAFF_SERVICE_DELETE][UPDATE_ERROR]",
+          {
+            stationId,
+            code:
+              deleteError.code ||
+              null,
+            message:
+              deleteError.message ||
+              null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_DELETE_FAILED",
+          message:
+            "Не удалось удалить сервис из каталога.",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICE_DELETE][SUCCESS]",
+        {
+          stationId,
+          staffUserId:
+            staffUser?.id ||
+            null,
+          ownerId:
+            station.owner_id ||
+            null,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        deleted:
+          true,
+
+        stationId,
+
+        service:
+          deletedStation ||
+          null,
+      });
+    } catch (error) {
+      const status =
+        Number(
+          error?.statusCode ||
+          500
+        );
+
+      console.error(
+        "[AUTODEAR][STAFF_SERVICE_DELETE][FATAL]",
+        {
+          status,
+          message:
+            error?.message ||
+            String(error),
+        }
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error:
+          error?.message ||
+          "STAFF_SERVICE_DELETE_FATAL",
+      });
+    }
+  }
+);
+
 
 
 
