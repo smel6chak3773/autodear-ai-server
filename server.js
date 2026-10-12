@@ -31891,38 +31891,218 @@ app.get(
       const db =
         getStaffServiceManagementDb();
 
+      const rawPage =
+        Number(
+          req.query?.page || 1
+        );
+
+      const rawLimit =
+        Number(
+          req.query?.limit || 50
+        );
+
+      const page =
+        Number.isFinite(rawPage)
+          ? Math.max(
+              1,
+              Math.min(
+                10000,
+                Math.floor(rawPage)
+              )
+            )
+          : 1;
+
+      const limit =
+        Number.isFinite(rawLimit)
+          ? Math.max(
+              1,
+              Math.min(
+                100,
+                Math.floor(rawLimit)
+              )
+            )
+          : 50;
+
+      const offset =
+        (page - 1) * limit;
+
+      const query =
+        String(
+          req.query?.q ||
+          ""
+        )
+          .trim()
+          .slice(
+            0,
+            100
+          );
+
+      /*
+       * Поисковая строка используется
+       * внутри PostgREST .or().
+       *
+       * Убираем управляющие символы
+       * и wildcard-символы, чтобы клиент
+       * не мог изменить структуру фильтра.
+       */
+      const safeQuery =
+        query
+          .replace(
+            /[\\%_,()]/g,
+            " "
+          )
+          .replace(
+            /\s+/g,
+            " "
+          )
+          .trim();
+
+      /*
+       * Если поиск идёт по владельцу,
+       * сначала находим бизнес-профили,
+       * затем добавляем их id в фильтр stations.
+       *
+       * Важно:
+       * поиск по названию/адресу/телефону
+       * продолжает работать независимо
+       * от наличия владельца.
+       */
+      let ownerSearchIds = [];
+
+      if (safeQuery) {
+        const {
+          data: matchedOwners,
+          error: ownerSearchError,
+        } = await db
+          .from("profiles")
+          .select(
+            "id,auth_user_id"
+          )
+          .eq(
+            "role",
+            "business"
+          )
+          .or(
+            [
+              `name.ilike.%${safeQuery}%`,
+              `email.ilike.%${safeQuery}%`,
+              `phone.ilike.%${safeQuery}%`,
+            ].join(",")
+          )
+          .limit(200);
+
+        if (ownerSearchError) {
+          console.error(
+            "[AUTODEAR][STAFF_SERVICE_MANAGEMENT][OWNER_SEARCH_ERROR]",
+            ownerSearchError
+          );
+
+          return res.status(500).json({
+            ok: false,
+            error:
+              "STAFF_SERVICES_OWNER_SEARCH_FAILED",
+          });
+        }
+
+        ownerSearchIds =
+          [
+            ...new Set(
+              (
+                Array.isArray(
+                  matchedOwners
+                )
+                  ? matchedOwners
+                  : []
+              )
+                .flatMap(
+                  (profile) => [
+                    profile?.auth_user_id,
+                    profile?.id,
+                  ]
+                )
+                .map(
+                  (value) =>
+                    String(
+                      value ||
+                      ""
+                    ).trim()
+                )
+                .filter(Boolean)
+            ),
+          ];
+      }
+
+      let request =
+        db
+          .from("stations")
+          .select(
+            [
+              "id",
+              "owner_id",
+              "name",
+              "address",
+              "city",
+              "phone",
+              "photo_url",
+              "created_source",
+              "created_by_user_id",
+              "ownership_status",
+              "claimed_by_user_id",
+              "claimed_at",
+              "created_at",
+              "is_active",
+              "status",
+            ].join(","),
+            {
+              count:
+                "exact",
+            }
+          )
+          .order(
+            "name",
+            {
+              ascending: true,
+              nullsFirst: false,
+            }
+          )
+          .order(
+            "id",
+            {
+              ascending: true,
+              nullsFirst: false,
+            }
+          );
+
+      if (safeQuery) {
+        const filters = [
+          `name.ilike.%${safeQuery}%`,
+          `address.ilike.%${safeQuery}%`,
+          `city.ilike.%${safeQuery}%`,
+          `phone.ilike.%${safeQuery}%`,
+        ];
+
+        if (
+          ownerSearchIds.length
+        ) {
+          filters.push(
+            `owner_id.in.(${ownerSearchIds.join(",")})`
+          );
+        }
+
+        request =
+          request.or(
+            filters.join(",")
+          );
+      }
+
       const {
         data: stations,
         error: stationsError,
-      } = await db
-        .from("stations")
-        .select(
-          [
-            "id",
-            "owner_id",
-            "name",
-            "address",
-            "city",
-            "phone",
-            "photo_url",
-            "created_source",
-            "created_by_user_id",
-            "ownership_status",
-            "claimed_by_user_id",
-            "claimed_at",
-            "created_at",
-            "is_active",
-            "status",
-          ].join(",")
-        )
-        .order(
-          "name",
-          {
-            ascending: true,
-            nullsFirst: false,
-          }
-        )
-        .limit(1000);
+        count: totalCount,
+      } = await request.range(
+        offset,
+        offset + limit - 1
+      );
 
       if (stationsError) {
         console.error(
@@ -31961,30 +32141,48 @@ app.get(
         new Map();
 
       /*
-       * owner_id в AUTODEAR — это auth user id.
-       * Для совместимости со старыми карточками
-       * проверяем также profiles.id.
+       * Только владельцы текущей страницы.
+       *
+       * Два варианта идентификатора
+       * запрашиваем параллельно.
        */
       if (ownerIds.length) {
-        const {
-          data: byAuthUserId,
-        } = await db
-          .from("profiles")
-          .select(
-            "id,auth_user_id,name,email,phone,role"
-          )
-          .in(
-            "auth_user_id",
-            ownerIds
-          );
+        const [
+          byAuthUserIdResult,
+          byProfileIdResult,
+        ] = await Promise.all([
+          db
+            .from("profiles")
+            .select(
+              "id,auth_user_id,name,email,phone,role"
+            )
+            .in(
+              "auth_user_id",
+              ownerIds
+            ),
+
+          db
+            .from("profiles")
+            .select(
+              "id,auth_user_id,name,email,phone,role"
+            )
+            .in(
+              "id",
+              ownerIds
+            ),
+        ]);
 
         for (
           const profile of
-          Array.isArray(byAuthUserId)
-            ? byAuthUserId
+          Array.isArray(
+            byAuthUserIdResult?.data
+          )
+            ? byAuthUserIdResult.data
             : []
         ) {
-          if (profile?.auth_user_id) {
+          if (
+            profile?.auth_user_id
+          ) {
             profilesByKey.set(
               String(
                 profile.auth_user_id
@@ -31995,38 +32193,34 @@ app.get(
 
           if (profile?.id) {
             profilesByKey.set(
-              String(profile.id),
+              String(
+                profile.id
+              ),
               profile
             );
           }
         }
 
-        const {
-          data: byProfileId,
-        } = await db
-          .from("profiles")
-          .select(
-            "id,auth_user_id,name,email,phone,role"
-          )
-          .in(
-            "id",
-            ownerIds
-          );
-
         for (
           const profile of
-          Array.isArray(byProfileId)
-            ? byProfileId
+          Array.isArray(
+            byProfileIdResult?.data
+          )
+            ? byProfileIdResult.data
             : []
         ) {
           if (profile?.id) {
             profilesByKey.set(
-              String(profile.id),
+              String(
+                profile.id
+              ),
               profile
             );
           }
 
-          if (profile?.auth_user_id) {
+          if (
+            profile?.auth_user_id
+          ) {
             profilesByKey.set(
               String(
                 profile.auth_user_id
@@ -32094,6 +32288,11 @@ app.get(
                 ownerId ||
                 null,
 
+              /*
+               * Оставляем старый
+               * вложенный owner для
+               * обратной совместимости.
+               */
               owner:
                 owner
                   ? {
@@ -32123,6 +32322,25 @@ app.get(
                     }
                   : null,
 
+              /*
+               * И одновременно отдаём
+               * плоские поля — экрану
+               * больше не потребуется
+               * загружать весь список
+               * владельцев.
+               */
+              ownerName:
+                owner?.name ||
+                "",
+
+              ownerEmail:
+                owner?.email ||
+                "",
+
+              ownerPhone:
+                owner?.phone ||
+                "",
+
               createdSource:
                 station.created_source ||
                 null,
@@ -32148,7 +32366,8 @@ app.get(
                 null,
 
               isActive:
-                station.is_active !== false,
+                station.is_active !==
+                false,
 
               status:
                 station.status ||
@@ -32162,6 +32381,11 @@ app.get(
           }
         );
 
+      const total =
+        Number(
+          totalCount || 0
+        );
+
       return res.json({
         ok: true,
 
@@ -32170,6 +32394,17 @@ app.get(
 
         count:
           result.length,
+
+        total,
+
+        page,
+
+        limit,
+
+        hasMore:
+          offset +
+            result.length <
+          total,
       });
     } catch (error) {
       const status =
@@ -32197,8 +32432,6 @@ app.get(
     }
   }
 );
-
-
 /*
  * STAFF_SERVICE_OWNER_SEARCH_V1
  *
@@ -32454,6 +32687,8 @@ app.post(
             "owner_id",
             "ownership_status",
             "claimed_by_user_id",
+            "created_source",
+            "created_by_user_id",
             "is_active",
           ].join(",")
         )
@@ -32483,6 +32718,67 @@ app.post(
             "STAFF_SERVICE_NOT_FOUND",
           message:
             "Сервис не найден.",
+        });
+      }
+
+      /*
+       * STAFF_SERVICE_TRANSFER_ELIGIBILITY_V2
+       *
+       * «Передать владельцу» предназначено
+       * только для бесхозной карточки,
+       * созданной директором.
+       *
+       * Уже принадлежащие карточки сюда
+       * не попадают. Для них существует
+       * отдельный будущий flow «Передать бизнес».
+       */
+      const eligibilityOwnerId =
+        String(
+          station?.owner_id ||
+          ""
+        ).trim();
+
+      const ownershipStatus =
+        String(
+          station?.ownership_status ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      const createdSource =
+        String(
+          station?.created_source ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      const createdByUserId =
+        String(
+          station?.created_by_user_id ||
+          ""
+        ).trim();
+
+      const staffCreated =
+        createdSource ===
+          "autodear_staff" ||
+        Boolean(
+          createdByUserId
+        );
+
+      if (
+        eligibilityOwnerId ||
+        ownershipStatus !==
+          "unclaimed" ||
+        !staffCreated
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_TRANSFER_NOT_ALLOWED",
+          message:
+            "Передать владельцу можно только бесхозную карточку, созданную директором.",
         });
       }
 
@@ -33247,6 +33543,76 @@ app.post(
             "Для подтверждения бизнеса сначала создайте или войдите в бизнес-аккаунт AUTODEAR.",
         });
       }
+
+      /*
+       * BUSINESS_CLAIM_BUSINESS_ACCOUNT_GUARD_V1
+       *
+       * Claiming an existing AUTODEAR card is allowed only
+       * for a real business account with a legal form:
+       * self-employed / IP / LLC.
+       */
+      const {
+        data: businessAccount,
+        error: businessAccountError,
+      } = await supabase
+        .from("business_accounts")
+        .select(
+          [
+            "id",
+            "auth_user_id",
+            "business_type",
+            "business_name",
+            "legal_name",
+            "inn",
+            "ogrn",
+            "phone",
+            "email",
+            "city",
+            "status",
+          ].join(",")
+        )
+        .eq(
+          "auth_user_id",
+          userId
+        )
+        .limit(1)
+        .maybeSingle();
+
+      if (businessAccountError) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_BUSINESS_ACCOUNT_LOOKUP_FAILED",
+        });
+      }
+
+      const businessType =
+        String(
+          businessAccount?.business_type ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        !businessAccount ||
+        ![
+          "self",
+          "ip",
+          "ooo",
+        ].includes(
+          businessType
+        )
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_CLAIM_BUSINESS_ACCOUNT_REQUIRED",
+          message:
+            "Сначала зарегистрируйте бизнес-аккаунт как самозанятый, ИП или ООО.",
+        });
+      }
+
 
       /*
        * Resume the same unfinished ownership request.
@@ -34427,6 +34793,7 @@ app.get(
               "decided_at",
               "claimed_at",
               "created_at",
+              "submitted_at",
               "updated_at",
             ].join(",")
           )
@@ -34538,6 +34905,210 @@ app.get(
           )
         );
 
+
+      /*
+       * STAFF_CLAIM_APPLICANT_ENRICHMENT_V1
+       *
+       * Director must see the real applicant of THIS claim,
+       * not a global list of business accounts.
+       */
+      const applicantAuthIds =
+        [
+          ...new Set(
+            claimRows
+              .map((item) =>
+                String(
+                  item?.requesting_auth_user_id ||
+                  ""
+                ).trim()
+              )
+              .filter(Boolean)
+          ),
+        ];
+
+      const applicantProfileIds =
+        [
+          ...new Set(
+            claimRows
+              .map((item) =>
+                String(
+                  item?.requesting_profile_id ||
+                  ""
+                ).trim()
+              )
+              .filter(Boolean)
+          ),
+        ];
+
+      const applicantProfilesByKey =
+        new Map();
+
+      const applicantBusinessAccountsByAuthId =
+        new Map();
+
+      try {
+        const applicantDb =
+          supabaseServiceRole ||
+          supabase;
+
+        const [
+          profilesByAuthResult,
+          profilesByIdResult,
+          businessAccountsResult,
+        ] = await Promise.all([
+          applicantAuthIds.length
+            ? applicantDb
+                .from("profiles")
+                .select(
+                  "id,auth_user_id,name,email,phone,role"
+                )
+                .in(
+                  "auth_user_id",
+                  applicantAuthIds
+                )
+            : Promise.resolve({
+                data: [],
+                error: null,
+              }),
+
+          applicantProfileIds.length
+            ? applicantDb
+                .from("profiles")
+                .select(
+                  "id,auth_user_id,name,email,phone,role"
+                )
+                .in(
+                  "id",
+                  applicantProfileIds
+                )
+            : Promise.resolve({
+                data: [],
+                error: null,
+              }),
+
+          applicantAuthIds.length
+            ? applicantDb
+                .from("business_accounts")
+                .select(
+                  [
+                    "id",
+                    "auth_user_id",
+                    "business_type",
+                    "business_name",
+                    "legal_name",
+                    "inn",
+                    "ogrn",
+                    "phone",
+                    "email",
+                    "city",
+                    "status",
+                  ].join(",")
+                )
+                .in(
+                  "auth_user_id",
+                  applicantAuthIds
+                )
+            : Promise.resolve({
+                data: [],
+                error: null,
+              }),
+        ]);
+
+        if (profilesByAuthResult?.error) {
+          console.warn(
+            "[AUTODEAR][BUSINESS_CLAIM][APPLICANT_PROFILE_AUTH_LOOKUP]",
+            profilesByAuthResult.error
+          );
+        }
+
+        if (profilesByIdResult?.error) {
+          console.warn(
+            "[AUTODEAR][BUSINESS_CLAIM][APPLICANT_PROFILE_ID_LOOKUP]",
+            profilesByIdResult.error
+          );
+        }
+
+        if (businessAccountsResult?.error) {
+          console.warn(
+            "[AUTODEAR][BUSINESS_CLAIM][APPLICANT_BUSINESS_ACCOUNT_LOOKUP]",
+            businessAccountsResult.error
+          );
+        }
+
+        for (
+          const profile of
+          Array.isArray(
+            profilesByAuthResult?.data
+          )
+            ? profilesByAuthResult.data
+            : []
+        ) {
+          if (profile?.auth_user_id) {
+            applicantProfilesByKey.set(
+              String(
+                profile.auth_user_id
+              ),
+              profile
+            );
+          }
+
+          if (profile?.id) {
+            applicantProfilesByKey.set(
+              String(profile.id),
+              profile
+            );
+          }
+        }
+
+        for (
+          const profile of
+          Array.isArray(
+            profilesByIdResult?.data
+          )
+            ? profilesByIdResult.data
+            : []
+        ) {
+          if (profile?.id) {
+            applicantProfilesByKey.set(
+              String(profile.id),
+              profile
+            );
+          }
+
+          if (profile?.auth_user_id) {
+            applicantProfilesByKey.set(
+              String(
+                profile.auth_user_id
+              ),
+              profile
+            );
+          }
+        }
+
+        for (
+          const account of
+          Array.isArray(
+            businessAccountsResult?.data
+          )
+            ? businessAccountsResult.data
+            : []
+        ) {
+          if (account?.auth_user_id) {
+            applicantBusinessAccountsByAuthId.set(
+              String(
+                account.auth_user_id
+              ),
+              account
+            );
+          }
+        }
+      } catch (error) {
+        console.warn(
+          "[AUTODEAR][BUSINESS_CLAIM][APPLICANT_ENRICHMENT_FAILED]",
+          error
+        );
+      }
+
       return res.json({
         ok: true,
         claims:
@@ -34550,6 +35121,107 @@ app.get(
                     claim.station_id
                   )
                 ) || null,
+
+              applicant:
+                (() => {
+                  const authUserId =
+                    String(
+                      claim?.requesting_auth_user_id ||
+                      ""
+                    ).trim();
+
+                  const profileId =
+                    String(
+                      claim?.requesting_profile_id ||
+                      ""
+                    ).trim();
+
+                  const profile =
+                    applicantProfilesByKey.get(
+                      authUserId
+                    ) ||
+                    applicantProfilesByKey.get(
+                      profileId
+                    ) ||
+                    null;
+
+                  const businessAccount =
+                    authUserId
+                      ? (
+                          applicantBusinessAccountsByAuthId.get(
+                            authUserId
+                          ) ||
+                          null
+                        )
+                      : null;
+
+                  const name =
+                    String(
+                      profile?.name ||
+                      businessAccount?.business_name ||
+                      businessAccount?.legal_name ||
+                      claim?.applicant_email ||
+                      claim?.applicant_phone ||
+                      authUserId ||
+                      "Заявитель не указан"
+                    ).trim();
+
+                  return {
+                    authUserId:
+                      authUserId ||
+                      null,
+
+                    profileId:
+                      profileId ||
+                      null,
+
+                    name,
+
+                    role:
+                      profile?.role ||
+                      "business",
+
+                    businessType:
+                      businessAccount?.business_type ||
+                      null,
+
+                    businessName:
+                      businessAccount?.business_name ||
+                      null,
+
+                    legalName:
+                      businessAccount?.legal_name ||
+                      null,
+
+                    inn:
+                      businessAccount?.inn ||
+                      null,
+
+                    ogrn:
+                      businessAccount?.ogrn ||
+                      null,
+
+                    phone:
+                      claim?.applicant_phone ||
+                      businessAccount?.phone ||
+                      profile?.phone ||
+                      null,
+
+                    email:
+                      claim?.applicant_email ||
+                      businessAccount?.email ||
+                      profile?.email ||
+                      null,
+
+                    city:
+                      businessAccount?.city ||
+                      null,
+
+                    status:
+                      businessAccount?.status ||
+                      null,
+                  };
+                })(),
             })
           ),
       });
@@ -35289,6 +35961,2058 @@ app.post(
           error:
             error?.message ||
             "BUSINESS_CLAIM_STAFF_REJECT_FATAL",
+        });
+    }
+  }
+);
+
+
+/* BUSINESS_OWNERSHIP_TRANSFER_API_V1 */
+
+const BUSINESS_OWNERSHIP_TRANSFER_TYPES = Object.freeze([
+  "self",
+  "ip",
+  "ooo",
+]);
+
+function businessOwnershipTransferTypeLabel(value) {
+  const type =
+    String(value || "")
+      .trim()
+      .toLowerCase();
+
+  if (type === "self") {
+    return "Самозанятый";
+  }
+
+  if (type === "ip") {
+    return "ИП";
+  }
+
+  if (type === "ooo") {
+    return "ООО";
+  }
+
+  return "Бизнес";
+}
+
+
+async function getTransferAuth(req) {
+  const authResult =
+    await resolveAuthenticatedUser(req);
+
+  const userId =
+    String(
+      authResult?.user?.id ||
+      ""
+    ).trim();
+
+  return {
+    userId,
+    error:
+      userId
+        ? ""
+        : (
+            authResult?.error ||
+            "AUTH_REQUIRED"
+          ),
+  };
+}
+
+
+async function getActiveBusinessAccountForTransfer(
+  authUserId
+) {
+  const userId =
+    String(
+      authUserId ||
+      ""
+    ).trim();
+
+  if (
+    !userId ||
+    !supabaseServiceRole
+  ) {
+    return null;
+  }
+
+  const {
+    data,
+    error,
+  } =
+    await supabaseServiceRole
+      .from(
+        "business_accounts"
+      )
+      .select(
+        [
+          "id",
+          "auth_user_id",
+          "business_type",
+          "business_name",
+          "legal_name",
+          "city",
+          "status",
+        ].join(",")
+      )
+      .eq(
+        "auth_user_id",
+        userId
+      )
+      .eq(
+        "status",
+        "active"
+      )
+      .in(
+        "business_type",
+        BUSINESS_OWNERSHIP_TRANSFER_TYPES
+      )
+      .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data || null;
+}
+
+
+function mapTransferOwner(
+  account
+) {
+  if (!account) {
+    return null;
+  }
+
+  return {
+    id:
+      account.id,
+
+    authUserId:
+      account.auth_user_id,
+
+    businessType:
+      account.business_type,
+
+    businessTypeLabel:
+      businessOwnershipTransferTypeLabel(
+        account.business_type
+      ),
+
+    businessName:
+      account.business_name ||
+      account.legal_name ||
+      "Бизнес",
+
+    legalName:
+      account.legal_name ||
+      null,
+
+    city:
+      account.city ||
+      null,
+  };
+}
+
+
+async function notifyBusinessOwnershipTransfer(
+  input
+) {
+  const recipientBusinessId =
+    String(
+      input?.recipientBusinessId ||
+      ""
+    ).trim();
+
+  const transferId =
+    String(
+      input?.transferId ||
+      ""
+    ).trim();
+
+  if (
+    !recipientBusinessId ||
+    !transferId ||
+    !supabaseServiceRole
+  ) {
+    return {
+      ok: false,
+      reason:
+        "NOTIFICATION_INPUT_INVALID",
+    };
+  }
+
+  const {
+    error,
+  } =
+    await supabaseServiceRole
+      .from(
+        "notifications"
+      )
+      .insert({
+        recipient_role:
+          "business",
+
+        recipient_id:
+          recipientBusinessId,
+
+        title:
+          String(
+            input?.title ||
+            "Передача бизнеса"
+          ).trim(),
+
+        body:
+          String(
+            input?.body ||
+            ""
+          ).trim(),
+
+        type:
+          "business_ownership_transfer",
+
+        related_type:
+          "business_ownership_transfer",
+
+        related_id:
+          transferId,
+
+        is_read:
+          false,
+      });
+
+  if (error) {
+    console.warn(
+      "[AUTODEAR][BUSINESS_TRANSFER][NOTIFICATION_ERROR]",
+      {
+        transferId,
+        recipientBusinessId,
+        code:
+          error.code ||
+          null,
+        message:
+          error.message ||
+          null,
+      }
+    );
+
+    return {
+      ok: false,
+      reason:
+        error.message ||
+        "NOTIFICATION_CREATE_FAILED",
+    };
+  }
+
+  return {
+    ok: true,
+  };
+}
+
+
+/*
+ * Search only real eligible business accounts.
+ */
+app.get(
+  "/api/business-directory/business-ownership/owners",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const auth =
+        await getTransferAuth(req);
+
+      if (!auth.userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            auth.error,
+        });
+      }
+
+      const currentAccount =
+        await getActiveBusinessAccountForTransfer(
+          auth.userId
+        );
+
+      if (!currentAccount) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCOUNT_REQUIRED",
+
+          message:
+            "Для передачи бизнеса нужен активный бизнес-аккаунт: самозанятый, ИП или ООО.",
+        });
+      }
+
+      const search =
+        String(
+          req.query?.q ||
+          ""
+        )
+          .trim()
+          .slice(
+            0,
+            80
+          );
+
+      let query =
+        supabaseServiceRole
+          .from(
+            "business_accounts"
+          )
+          .select(
+            [
+              "id",
+              "auth_user_id",
+              "business_type",
+              "business_name",
+              "legal_name",
+              "city",
+              "status",
+            ].join(",")
+          )
+          .eq(
+            "status",
+            "active"
+          )
+          .in(
+            "business_type",
+            BUSINESS_OWNERSHIP_TRANSFER_TYPES
+          )
+          .neq(
+            "auth_user_id",
+            auth.userId
+          )
+          .order(
+            "business_name",
+            {
+              ascending:
+                true,
+
+              nullsFirst:
+                false,
+            }
+          )
+          .limit(
+            100
+          );
+
+      if (search) {
+        const safe =
+          search
+            .replace(
+              /\\/g,
+              "\\\\"
+            )
+            .replace(
+              /"/g,
+              '\\"'
+            )
+            .replace(
+              /%/g,
+              "\\%"
+            )
+            .replace(
+              /_/g,
+              "\\_"
+            );
+
+        const pattern =
+          `*${safe}*`;
+
+        query =
+          query.or(
+            [
+              `business_name.ilike."${pattern}"`,
+              `legal_name.ilike."${pattern}"`,
+              `inn.ilike."${pattern}"`,
+              `ogrn.ilike."${pattern}"`,
+              `city.ilike."${pattern}"`,
+            ].join(",")
+          );
+      }
+
+      const {
+        data,
+        error,
+      } =
+        await query;
+
+      if (error) {
+        throw error;
+      }
+
+      return res.json({
+        ok:
+          true,
+
+        owners:
+          (
+            Array.isArray(
+              data
+            )
+              ? data
+              : []
+          ).map(
+            mapTransferOwner
+          ),
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_TRANSFER][OWNER_SEARCH_FATAL]",
+        error
+      );
+
+      return res
+        .status(
+          Number(
+            error?.statusCode ||
+            500
+          )
+        )
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "BUSINESS_TRANSFER_OWNER_SEARCH_FATAL",
+        });
+    }
+  }
+);
+
+
+
+/* BUSINESS_OWNERSHIP_TRANSFER_ACTIONS_API_V1 */
+
+function businessOwnershipTransferActionHttpStatus(payload) {
+  const code =
+    String(
+      payload?.error ||
+      ""
+    ).trim();
+
+  if (!code) {
+    return 500;
+  }
+
+  if (
+    code ===
+    "TRANSFER_INPUT_REQUIRED"
+  ) {
+    return 400;
+  }
+
+  if (
+    code ===
+    "BUSINESS_NOT_FOUND"
+  ) {
+    return 404;
+  }
+
+  if (
+    code ===
+      "TRANSFER_RECIPIENT_REQUIRED" ||
+    code ===
+      "TRANSFER_OWNER_REQUIRED" ||
+    code.includes("NOT_RECIPIENT") ||
+    code.includes("NOT_OWNER")
+  ) {
+    return 403;
+  }
+
+  if (
+    [
+      "TRANSFER_NOT_FOUND_OR_ALREADY_RESPONDED",
+      "TRANSFER_EXPIRED",
+      "BUSINESS_INACTIVE",
+      "BUSINESS_OWNER_CHANGED",
+      "TARGET_BUSINESS_ACCOUNT_NOT_ELIGIBLE",
+    ].includes(code)
+  ) {
+    return 409;
+  }
+
+  if (
+    [
+      "BUSINESS_OWNER_UPDATE_FAILED",
+      "TRANSFER_STATUS_UPDATE_FAILED",
+    ].includes(code)
+  ) {
+    return 500;
+  }
+
+  return 500;
+}
+
+
+function normalizeBusinessOwnershipTransferRpcResult(
+  data
+) {
+  if (
+    data &&
+    typeof data ===
+      "object" &&
+    !Array.isArray(data)
+  ) {
+    return data;
+  }
+
+  if (
+    typeof data ===
+      "string"
+  ) {
+    try {
+      const parsed =
+        JSON.parse(data);
+
+      if (
+        parsed &&
+        typeof parsed ===
+          "object" &&
+        !Array.isArray(parsed)
+      ) {
+        return parsed;
+      }
+    } catch (_) {
+      // fall through
+    }
+  }
+
+  return {
+    ok: false,
+    error:
+      "BUSINESS_TRANSFER_ACTION_INVALID_RESPONSE",
+  };
+}
+
+
+async function executeBusinessOwnershipTransferActionRpc(
+  functionName,
+  transferId,
+  actorUserId
+) {
+  const {
+    data,
+    error,
+  } =
+    await supabaseServiceRole.rpc(
+      functionName,
+      {
+        p_transfer_id:
+          transferId,
+        p_actor_user_id:
+          actorUserId,
+      }
+    );
+
+  if (error) {
+    throw error;
+  }
+
+  return normalizeBusinessOwnershipTransferRpcResult(
+    data
+  );
+}
+
+
+async function expireBusinessOwnershipTransfersInternal() {
+  if (!supabaseServiceRole) {
+    return {
+      ok: false,
+      error:
+        "SUPABASE_NOT_CONFIGURED",
+    };
+  }
+
+  const {
+    data,
+    error,
+  } =
+    await supabaseServiceRole.rpc(
+      "autodear_expire_business_ownership_transfers"
+    );
+
+  if (error) {
+    console.warn(
+      "[AUTODEAR][BUSINESS_TRANSFER][EXPIRE_ERROR]",
+      {
+        code:
+          error.code ||
+          null,
+        message:
+          error.message ||
+          null,
+      }
+    );
+
+    return {
+      ok: false,
+      error:
+        "BUSINESS_TRANSFER_EXPIRE_FAILED",
+    };
+  }
+
+  const count =
+    Number(data);
+
+  return {
+    ok: true,
+    expiredCount:
+      Number.isFinite(count)
+        ? count
+        : 0,
+  };
+}
+
+
+/*
+ * Execute atomic accept/reject/cancel action.
+ */
+/* BUSINESS_OWNERSHIP_TRANSFER_ACTION_NOTIFICATIONS_V2 */
+
+async function notifyBusinessOwnershipTransferAction(
+  input
+) {
+  const transferId =
+    String(
+      input?.transferId ||
+      ""
+    ).trim();
+
+  const stationId =
+    String(
+      input?.stationId ||
+      ""
+    ).trim();
+
+  const status =
+    String(
+      input?.status ||
+      ""
+    ).trim().toLowerCase();
+
+  const fromOwnerId =
+    String(
+      input?.fromOwnerId ||
+      ""
+    ).trim();
+
+  const toOwnerId =
+    String(
+      input?.toOwnerId ||
+      ""
+    ).trim();
+
+  if (
+    !supabaseServiceRole ||
+    !transferId ||
+    !stationId ||
+    !fromOwnerId ||
+    !toOwnerId
+  ) {
+    return {
+      ok: false,
+      reason:
+        "NOTIFICATION_INPUT_INVALID",
+    };
+  }
+
+  if (
+    ![
+      "accepted",
+      "rejected",
+      "cancelled",
+    ].includes(status)
+  ) {
+    return {
+      ok: false,
+      reason:
+        "NOTIFICATION_STATUS_UNSUPPORTED",
+    };
+  }
+
+  try {
+    const {
+      data: station,
+      error: stationError,
+    } =
+      await supabaseServiceRole
+        .from("stations")
+        .select(
+          "id,name,legal_name,address,city"
+        )
+        .eq(
+          "id",
+          stationId
+        )
+        .maybeSingle();
+
+    if (stationError) {
+      throw stationError;
+    }
+
+    const stationName =
+      String(
+        station?.name ||
+        station?.legal_name ||
+        "Бизнес-карточка"
+      ).trim();
+
+    /*
+     * Роль уведомления зависит от того,
+     * владеет ли пользователь карточкой
+     * в момент отправки события.
+     *
+     * accepted:
+     *   новый владелец -> business
+     *   бывший владелец -> user
+     *
+     * rejected/cancelled:
+     *   отправитель -> business
+     *   получатель -> user
+     */
+
+    /*
+     * notifications.recipient_id для роли
+     * "business" всегда является business_accounts.id.
+     *
+     * fromOwnerId / toOwnerId — это auth user ids,
+     * поэтому сначала строим соответствие:
+     *
+     * auth_user_id -> business_accounts.id
+     */
+    const businessOwnerIds =
+      Array.from(
+        new Set(
+          [
+            fromOwnerId,
+            toOwnerId,
+          ]
+            .map(
+              (value) =>
+                String(
+                  value || ""
+                ).trim()
+            )
+            .filter(Boolean)
+        )
+      );
+
+    const {
+      data: businessAccounts,
+      error:
+        businessAccountsError,
+    } =
+      await supabaseServiceRole
+        .from(
+          "business_accounts"
+        )
+        .select(
+          "id,auth_user_id"
+        )
+        .in(
+          "auth_user_id",
+          businessOwnerIds
+        )
+        .eq(
+          "status",
+          "active"
+        )
+        .in(
+          "business_type",
+          BUSINESS_OWNERSHIP_TRANSFER_TYPES
+        );
+
+    if (
+      businessAccountsError
+    ) {
+      throw businessAccountsError;
+    }
+
+    const businessAccountIdByAuthUserId =
+      new Map(
+        (
+          Array.isArray(
+            businessAccounts
+          )
+            ? businessAccounts
+            : []
+        ).map(
+          (account) => [
+            String(
+              account?.auth_user_id ||
+              ""
+            ).trim(),
+            String(
+              account?.id ||
+              ""
+            ).trim(),
+          ]
+        )
+      );
+
+    const targets =
+      status === "accepted"
+        ? [
+            {
+              userId:
+                toOwnerId,
+              recipientRole:
+                "business",
+              title:
+                "Передача бизнеса завершена",
+              body:
+                `Вы приняли передачу карточки «${stationName}». Теперь она находится в вашем управлении.`,
+            },
+            {
+              userId:
+                fromOwnerId,
+              recipientRole:
+                "user",
+              title:
+                "Бизнес передан",
+              body:
+                `Передача карточки «${stationName}» завершена. Управление карточкой передано новому владельцу.`,
+            },
+          ]
+        : status === "rejected"
+          ? [
+              {
+                userId:
+                  fromOwnerId,
+                recipientRole:
+                  "business",
+                title:
+                  "Передача бизнеса отклонена",
+                body:
+                  `Запрос на передачу карточки «${stationName}» был отклонён получателем.`,
+              },
+              {
+                userId:
+                  toOwnerId,
+                recipientRole:
+                  "user",
+                title:
+                  "Запрос отклонён",
+                body:
+                  `Вы отклонили передачу карточки «${stationName}».`,
+              },
+            ]
+          : [
+              {
+                userId:
+                  fromOwnerId,
+                recipientRole:
+                  "business",
+                title:
+                  "Передача отменена",
+                body:
+                  `Вы отменили передачу карточки «${stationName}».`,
+              },
+              {
+                userId:
+                  toOwnerId,
+                recipientRole:
+                  "user",
+                title:
+                  "Передача бизнеса отменена",
+                body:
+                  `Запрос на передачу карточки «${stationName}» был отменён отправителем.`,
+              },
+            ];
+
+    let notificationsCreated = 0;
+    let pushSent = 0;
+    let failed = 0;
+
+    for (
+      const target of targets
+    ) {
+      const userId =
+        String(
+          target?.userId ||
+          ""
+        ).trim();
+
+      if (!userId) {
+        failed += 1;
+        continue;
+      }
+
+      /*
+       * Сначала определяем реальный recipient_id.
+       *
+       * Для business это business_accounts.id.
+       * Для user это auth user id.
+       */
+      const recipientId =
+        target.recipientRole ===
+        "business"
+          ? (
+              businessAccountIdByAuthUserId.get(
+                userId
+              ) ||
+              ""
+            )
+          : userId;
+
+      if (!recipientId) {
+        failed += 1;
+
+        console.warn(
+          "[AUTODEAR][BUSINESS_TRANSFER][NOTIFICATION_RECIPIENT_NOT_FOUND]",
+          {
+            transferId,
+            userId,
+            recipientRole:
+              target.recipientRole,
+          }
+        );
+
+        continue;
+      }
+
+      /*
+       * Сначала создаём запись в центре
+       * уведомлений. Она не зависит от
+       * наличия push-токена.
+       */
+      const {
+        error:
+          notificationError,
+      } =
+        await supabaseServiceRole
+          .from("notifications")
+          .insert({
+            recipient_role:
+              target.recipientRole,
+
+            recipient_id:
+              recipientId,
+
+            title:
+              target.title,
+
+            body:
+              target.body,
+
+            type:
+              "business_ownership_transfer",
+
+            related_type:
+              "business_ownership_transfer",
+
+            related_id:
+              transferId,
+
+            is_read:
+              false,
+          });
+
+      if (notificationError) {
+        failed += 1;
+
+        console.warn(
+          "[AUTODEAR][BUSINESS_TRANSFER][NOTIFICATION_INSERT_ERROR]",
+          {
+            transferId,
+            stationId,
+            userId,
+            recipientRole:
+              target.recipientRole,
+            code:
+              notificationError.code ||
+              null,
+            message:
+              notificationError.message ||
+              null,
+          }
+        );
+      } else {
+        notificationsCreated += 1;
+      }
+
+      /*
+       * Push-токены принадлежат auth user.
+       * Для каждого получателя отправляем
+       * отдельный push, чтобы recipient_role
+       * соответствовал его рабочему контуру.
+       */
+      const {
+        data: tokenRows,
+        error:
+          tokensError,
+      } =
+        await supabaseServiceRole
+          .from("device_push_tokens")
+          .select(
+            "expo_push_token"
+          )
+          .eq(
+            "user_id",
+            userId
+          )
+          .eq(
+            "is_active",
+            true
+          );
+
+      if (tokensError) {
+        failed += 1;
+
+        console.warn(
+          "[AUTODEAR][BUSINESS_TRANSFER][PUSH_TOKEN_ERROR]",
+          {
+            transferId,
+            userId,
+            code:
+              tokensError.code ||
+              null,
+            message:
+              tokensError.message ||
+              null,
+          }
+        );
+
+        continue;
+      }
+
+      const tokens =
+        Array.from(
+          new Set(
+            (
+              Array.isArray(
+                tokenRows
+              )
+                ? tokenRows
+                : []
+            )
+              .map(
+                (row) =>
+                  String(
+                    row?.expo_push_token ||
+                    ""
+                  ).trim()
+              )
+              .filter(Boolean)
+          )
+        );
+
+      if (!tokens.length) {
+        continue;
+      }
+
+      try {
+        const pushResult =
+          await sendAutodearExpoPush({
+            tokens,
+
+            title:
+              target.title,
+
+            body:
+              target.body,
+
+            data: {
+              recipient_role:
+                target.recipientRole,
+
+              type:
+                "business_ownership_transfer",
+
+              eventType:
+                "business_ownership_transfer",
+
+              category:
+                "business",
+
+              transferId,
+
+              stationId,
+
+              relatedType:
+                "business_ownership_transfer",
+
+              relatedId:
+                transferId,
+
+              route:
+                target.recipientRole ===
+                "business"
+                  ? "/business/business-ownership-transfer"
+                  : "/profile/notification-center",
+            },
+          });
+
+        pushSent += Number(
+          pushResult?.sent ||
+          0
+        );
+      } catch (pushError) {
+        failed += 1;
+
+        console.warn(
+          "[AUTODEAR][BUSINESS_TRANSFER][PUSH_SEND_ERROR]",
+          {
+            transferId,
+            userId,
+            message:
+              pushError?.message ||
+              String(pushError),
+          }
+        );
+      }
+    }
+
+    console.log(
+      "[AUTODEAR][BUSINESS_TRANSFER][ACTION_NOTIFIED]",
+      {
+        transferId,
+        stationId,
+        status,
+        notificationsCreated,
+        pushSent,
+        failed,
+      }
+    );
+
+    return {
+      ok:
+        failed === 0,
+      notificationsCreated,
+      pushSent,
+      failed,
+    };
+  } catch (error) {
+    console.warn(
+      "[AUTODEAR][BUSINESS_TRANSFER][ACTION_NOTIFICATION_FATAL]",
+      {
+        transferId,
+        stationId,
+        status,
+        message:
+          error?.message ||
+          String(error),
+        code:
+          error?.code ||
+          null,
+      }
+    );
+
+    return {
+      ok: false,
+      reason:
+        "NOTIFICATION_CREATE_FAILED",
+    };
+  }
+}
+
+
+async function executeBusinessOwnershipTransferAction(
+  req,
+  res,
+  functionName
+) {
+  try {
+    if (
+      !supabase ||
+      !supabaseServiceRole
+    ) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          "SUPABASE_NOT_CONFIGURED",
+      });
+    }
+
+    const auth =
+      await getTransferAuth(req);
+
+    if (!auth.userId) {
+      return res.status(401).json({
+        ok: false,
+        error:
+          auth.error,
+      });
+    }
+
+    const transferId =
+      String(
+        req.params?.transferId ||
+        ""
+      ).trim();
+
+    if (!transferId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "TRANSFER_INPUT_REQUIRED",
+      });
+    }
+
+    const result =
+      await executeBusinessOwnershipTransferActionRpc(
+        functionName,
+        transferId,
+        auth.userId
+      );
+
+    if (
+      result?.ok !== true
+    ) {
+      return res
+        .status(
+          businessOwnershipTransferActionHttpStatus(
+            result
+          )
+        )
+        .json(result);
+    }
+
+    const notificationResult =
+      await notifyBusinessOwnershipTransferAction(
+        {
+          transferId:
+            result.transferId,
+          stationId:
+            result.stationId,
+          fromOwnerId:
+            result.fromOwnerId,
+          toOwnerId:
+            result.toOwnerId,
+          status:
+            result.status,
+        }
+      );
+
+    if (
+      !notificationResult.ok
+    ) {
+      const existingWarnings =
+        Array.isArray(
+          result.warnings
+        )
+          ? result.warnings
+          : [];
+
+      result.warnings = [
+        ...existingWarnings,
+        "NOTIFICATION_CREATE_FAILED",
+      ];
+    }
+
+
+    return res.status(200).json(
+      result
+    );
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][BUSINESS_TRANSFER][ACTION_FATAL]",
+      {
+        functionName,
+        transferId:
+          req.params?.transferId ||
+          null,
+        message:
+          error?.message ||
+          String(error),
+        code:
+          error?.code ||
+          null,
+      }
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "BUSINESS_TRANSFER_ACTION_RPC_FAILED",
+    });
+  }
+}
+
+
+/*
+ * Accept transfer request.
+ */
+app.post(
+  "/api/business-directory/business-ownership/transfers/:transferId/accept",
+  async (req, res) => {
+    return executeBusinessOwnershipTransferAction(
+      req,
+      res,
+      "autodear_accept_business_ownership_transfer"
+    );
+  }
+);
+
+
+/*
+ * Reject transfer request.
+ */
+app.post(
+  "/api/business-directory/business-ownership/transfers/:transferId/reject",
+  async (req, res) => {
+    return executeBusinessOwnershipTransferAction(
+      req,
+      res,
+      "autodear_reject_business_ownership_transfer"
+    );
+  }
+);
+
+
+/*
+ * Cancel transfer request.
+ */
+app.post(
+  "/api/business-directory/business-ownership/transfers/:transferId/cancel",
+  async (req, res) => {
+    return executeBusinessOwnershipTransferAction(
+      req,
+      res,
+      "autodear_cancel_business_ownership_transfer"
+    );
+  }
+);
+
+/*
+ * Create a transfer request.
+ */
+app.post(
+  "/api/business-directory/business-ownership/transfers",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const auth =
+        await getTransferAuth(req);
+
+      if (!auth.userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            auth.error,
+        });
+      }
+
+      await expireBusinessOwnershipTransfersInternal();
+
+      const stationId =
+        String(
+          req.body?.stationId ||
+          ""
+        ).trim();
+
+      const targetOwnerId =
+        String(
+          req.body?.toOwnerId ||
+          req.body?.targetUserId ||
+          ""
+        ).trim();
+
+      const message =
+        String(
+          req.body?.message ||
+          ""
+        )
+          .trim()
+          .slice(
+            0,
+            1000
+          );
+
+      if (!stationId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_TRANSFER_STATION_REQUIRED",
+        });
+      }
+
+      if (!targetOwnerId) {
+        return res.status(400).json({
+          ok: false,
+          error:
+            "BUSINESS_TRANSFER_TARGET_OWNER_REQUIRED",
+        });
+      }
+
+      if (
+        targetOwnerId ===
+        auth.userId
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_TRANSFER_TARGET_SAME_OWNER",
+        });
+      }
+
+      const currentAccount =
+        await getActiveBusinessAccountForTransfer(
+          auth.userId
+        );
+
+      if (!currentAccount) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_ACCOUNT_REQUIRED",
+
+          message:
+            "Для передачи бизнеса нужен активный бизнес-аккаунт: самозанятый, ИП или ООО.",
+        });
+      }
+
+      const {
+        data: station,
+        error: stationError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "stations"
+          )
+          .select(
+            [
+              "id",
+              "name",
+              "address",
+              "city",
+              "owner_id",
+              "ownership_status",
+              "is_active",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            stationId
+          )
+          .maybeSingle();
+
+      if (stationError) {
+        throw stationError;
+      }
+
+      if (!station) {
+        return res.status(404).json({
+          ok: false,
+          error:
+            "BUSINESS_NOT_FOUND",
+        });
+      }
+
+      if (
+        String(
+          station.owner_id ||
+          ""
+        ).trim() !==
+        auth.userId
+      ) {
+        return res.status(403).json({
+          ok: false,
+          error:
+            "BUSINESS_TRANSFER_NOT_OWNER",
+
+          message:
+            "Передать бизнес может только текущий владелец карточки.",
+        });
+      }
+
+      if (
+        station.is_active ===
+        false
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_INACTIVE",
+        });
+      }
+
+      if (
+        String(
+          station.ownership_status ||
+          ""
+        ).trim() !==
+        "claimed"
+      ) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_TRANSFER_ONLY_FOR_OWNED_CARD",
+
+          message:
+            "Передать можно только уже принадлежащую вам бизнес-карточку.",
+        });
+      }
+
+      const targetAccount =
+        await getActiveBusinessAccountForTransfer(
+          targetOwnerId
+        );
+
+      if (!targetAccount) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "TARGET_BUSINESS_ACCOUNT_NOT_ELIGIBLE",
+
+          message:
+            "Получатель должен иметь активный бизнес-аккаунт: самозанятый, ИП или ООО.",
+        });
+      }
+
+      const {
+        data: pending,
+        error: pendingError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "business_ownership_transfers"
+          )
+          .select(
+            "id,expires_at"
+          )
+          .eq(
+            "station_id",
+            stationId
+          )
+          .eq(
+            "status",
+            "pending"
+          )
+          .maybeSingle();
+
+      if (pendingError) {
+        throw pendingError;
+      }
+
+      if (pending) {
+        return res.status(409).json({
+          ok: false,
+          error:
+            "BUSINESS_TRANSFER_ALREADY_PENDING",
+
+          transferId:
+            pending.id,
+
+          expiresAt:
+            pending.expires_at,
+        });
+      }
+
+      const {
+        data: transfer,
+        error: insertError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "business_ownership_transfers"
+          )
+          .insert({
+            station_id:
+              stationId,
+
+            from_owner_id:
+              auth.userId,
+
+            to_owner_id:
+              targetOwnerId,
+
+            status:
+              "pending",
+
+            message:
+              message ||
+              null,
+          })
+          .select(
+            [
+              "id",
+              "station_id",
+              "from_owner_id",
+              "to_owner_id",
+              "status",
+              "message",
+              "created_at",
+              "updated_at",
+              "expires_at",
+            ].join(",")
+          )
+          .maybeSingle();
+
+      if (insertError) {
+        if (
+          String(
+            insertError.code ||
+            ""
+          ) ===
+          "23505"
+        ) {
+          return res.status(409).json({
+            ok: false,
+            error:
+              "BUSINESS_TRANSFER_ALREADY_PENDING",
+          });
+        }
+
+        throw insertError;
+      }
+
+      const senderName =
+        currentAccount.business_name ||
+        currentAccount.legal_name ||
+        "Текущий владелец";
+
+      const notification =
+        await notifyBusinessOwnershipTransfer({
+          recipientBusinessId:
+            targetAccount.id,
+
+          transferId:
+            transfer.id,
+
+          title:
+            "Запрос на передачу бизнеса",
+
+          body:
+            `${senderName} предлагает передать вам карточку «${station.name || "Бизнес-карточка"}».`,
+        });
+
+      return res.status(201).json({
+        ok:
+          true,
+
+        transfer,
+
+        station: {
+          id:
+            station.id,
+
+          name:
+            station.name ||
+            null,
+
+          address:
+            station.address ||
+            null,
+
+          city:
+            station.city ||
+            null,
+        },
+
+        fromOwner:
+          mapTransferOwner(
+            currentAccount
+          ),
+
+        toOwner:
+          mapTransferOwner(
+            targetAccount
+          ),
+
+        warnings:
+          notification.ok
+            ? []
+            : [
+                "NOTIFICATION_CREATE_FAILED",
+              ],
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_TRANSFER][CREATE_FATAL]",
+        error
+      );
+
+      return res
+        .status(
+          Number(
+            error?.statusCode ||
+            500
+          )
+        )
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "BUSINESS_TRANSFER_CREATE_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * List incoming / outgoing transfers.
+ */
+app.get(
+  "/api/business-directory/business-ownership/transfers",
+  async (req, res) => {
+    try {
+      if (
+        !supabase ||
+        !supabaseServiceRole
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const auth =
+        await getTransferAuth(req);
+
+      if (!auth.userId) {
+        return res.status(401).json({
+          ok: false,
+          error:
+            auth.error,
+        });
+      }
+
+      await expireBusinessOwnershipTransfersInternal();
+
+      let query =
+        supabaseServiceRole
+          .from(
+            "business_ownership_transfers"
+          )
+          .select(
+            [
+              "id",
+              "station_id",
+              "from_owner_id",
+              "to_owner_id",
+              "status",
+              "message",
+              "created_at",
+              "updated_at",
+              "expires_at",
+              "responded_at",
+              "accepted_by_user_id",
+              "rejected_by_user_id",
+              "cancelled_by_user_id",
+            ].join(",")
+          )
+          .order(
+            "created_at",
+            {
+              ascending:
+                false,
+            }
+          )
+          .limit(
+            100
+          );
+
+      const direction =
+        String(
+          req.query?.direction ||
+          "all"
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        direction ===
+        "incoming"
+      ) {
+        query =
+          query.eq(
+            "to_owner_id",
+            auth.userId
+          );
+
+      } else if (
+        direction ===
+        "outgoing"
+      ) {
+        query =
+          query.eq(
+            "from_owner_id",
+            auth.userId
+          );
+
+      } else {
+        query =
+          query.or(
+            `from_owner_id.eq.${auth.userId},to_owner_id.eq.${auth.userId}`
+          );
+      }
+
+      const status =
+        String(
+          req.query?.status ||
+          ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        [
+          "pending",
+          "accepted",
+          "rejected",
+          "cancelled",
+          "expired",
+        ].includes(
+          status
+        )
+      ) {
+        query =
+          query.eq(
+            "status",
+            status
+          );
+      }
+
+      const {
+        data: rows,
+        error,
+      } =
+        await query;
+
+      if (error) {
+        throw error;
+      }
+
+      const list =
+        Array.isArray(
+          rows
+        )
+          ? rows
+          : [];
+
+      const stationIds =
+        [
+          ...new Set(
+            list
+              .map(
+                (item) =>
+                  String(
+                    item?.station_id ||
+                    ""
+                  ).trim()
+              )
+              .filter(Boolean)
+          ),
+        ];
+
+      const ownerIds =
+        [
+          ...new Set(
+            list
+              .flatMap(
+                (item) => [
+                  item?.from_owner_id,
+                  item?.to_owner_id,
+                ]
+              )
+              .map(
+                (value) =>
+                  String(
+                    value ||
+                    ""
+                  ).trim()
+              )
+              .filter(Boolean)
+          ),
+        ];
+
+      const [
+        stationsResult,
+        ownersResult,
+      ] =
+        await Promise.all([
+          stationIds.length
+            ? supabaseServiceRole
+                .from(
+                  "stations"
+                )
+                .select(
+                  [
+                    "id",
+                    "name",
+                    "address",
+                    "city",
+                    "phone",
+                    "photo_url",
+                    "owner_id",
+                    "ownership_status",
+                    "is_active",
+                  ].join(",")
+                )
+                .in(
+                  "id",
+                  stationIds
+                )
+            : Promise.resolve({
+                data: [],
+                error: null,
+              }),
+
+          ownerIds.length
+            ? supabaseServiceRole
+                .from(
+                  "business_accounts"
+                )
+                .select(
+                  [
+                    "id",
+                    "auth_user_id",
+                    "business_type",
+                    "business_name",
+                    "legal_name",
+                    "city",
+                    "status",
+                  ].join(",")
+                )
+                .in(
+                  "auth_user_id",
+                  ownerIds
+                )
+            : Promise.resolve({
+                data: [],
+                error: null,
+              }),
+        ]);
+
+      if (
+        stationsResult.error
+      ) {
+        throw stationsResult.error;
+      }
+
+      if (
+        ownersResult.error
+      ) {
+        throw ownersResult.error;
+      }
+
+      const stationById =
+        new Map(
+          (
+            stationsResult.data ||
+            []
+          ).map(
+            (item) => [
+              String(
+                item.id
+              ),
+              item,
+            ]
+          )
+        );
+
+      const ownerByAuthId =
+        new Map(
+          (
+            ownersResult.data ||
+            []
+          ).map(
+            (item) => [
+              String(
+                item.auth_user_id
+              ),
+              item,
+            ]
+          )
+        );
+
+      return res.json({
+        ok:
+          true,
+
+        transfers:
+          list.map(
+            (item) => ({
+              ...item,
+
+              direction:
+                String(
+                  item.to_owner_id
+                ) ===
+                auth.userId
+                  ? "incoming"
+                  : "outgoing",
+
+              station:
+                stationById.get(
+                  String(
+                    item.station_id
+                  )
+                ) ||
+                null,
+
+              fromOwner:
+                mapTransferOwner(
+                  ownerByAuthId.get(
+                    String(
+                      item.from_owner_id
+                    )
+                  )
+                ),
+
+              toOwner:
+                mapTransferOwner(
+                  ownerByAuthId.get(
+                    String(
+                      item.to_owner_id
+                    )
+                  )
+                ),
+            })
+          ),
+      });
+
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][BUSINESS_TRANSFER][LIST_FATAL]",
+        error
+      );
+
+      return res
+        .status(
+          Number(
+            error?.statusCode ||
+            500
+          )
+        )
+        .json({
+          ok:
+            false,
+
+          error:
+            error?.message ||
+            "BUSINESS_TRANSFER_LIST_FATAL",
         });
     }
   }
