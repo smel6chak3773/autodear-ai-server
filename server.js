@@ -33010,151 +33010,21 @@ app.get(
           ? stations
           : [];
 
-      const ownerIds =
-        [
-          ...new Set(
-            rows
-              .map(
-                (station) =>
-                  String(
-                    station?.owner_id ||
-                    ""
-                  ).trim()
-              )
-              .filter(Boolean)
-          ),
-        ];
-
-      const profilesByKey =
-        new Map();
-
       /*
-       * Только владельцы текущей страницы.
+       * ВАЖНО:
+       * Список владельцев НЕ загружаем здесь.
        *
-       * Два варианта идентификатора
-       * запрашиваем параллельно.
+       * Клиентский экран отдельно вызывает
+       * /staff/service-owners после получения
+       * основного каталога.
+       *
+       * Поэтому запросы profiles из критического
+       * пути /staff/services убраны.
+       *
+       * ownerId при этом сохраняется в каждой
+       * карточке и используется клиентом.
        */
-      if (ownerIds.length) {
-        const profilesStartedAt = Date.now();
-
-        console.log(
-          "[AUTODEAR][STAFF_SERVICES_SERVER][PROFILES_START]",
-          {
-            ownerCount:
-              ownerIds.length,
-          }
-        );
-
-        const [
-          byAuthUserIdResult,
-          byProfileIdResult,
-        ] = await Promise.all([
-          db
-            .from("profiles")
-            .select(
-              "id,auth_user_id,name,email,phone,role"
-            )
-            .in(
-              "auth_user_id",
-              ownerIds
-            ),
-
-          db
-            .from("profiles")
-            .select(
-              "id,auth_user_id,name,email,phone,role"
-            )
-            .in(
-              "id",
-              ownerIds
-            ),
-        ]);
-
-        console.log(
-          "[AUTODEAR][STAFF_SERVICES_SERVER][PROFILES_DONE]",
-          {
-            ms:
-              Date.now() -
-              profilesStartedAt,
-            byAuthUserId:
-              Array.isArray(
-                byAuthUserIdResult?.data
-              )
-                ? byAuthUserIdResult.data.length
-                : 0,
-            byProfileId:
-              Array.isArray(
-                byProfileIdResult?.data
-              )
-                ? byProfileIdResult.data.length
-                : 0,
-            authError:
-              byAuthUserIdResult?.error?.message ||
-              null,
-            profileError:
-              byProfileIdResult?.error?.message ||
-              null,
-          }
-        );
-
-        for (
-          const profile of
-          Array.isArray(
-            byAuthUserIdResult?.data
-          )
-            ? byAuthUserIdResult.data
-            : []
-        ) {
-          if (
-            profile?.auth_user_id
-          ) {
-            profilesByKey.set(
-              String(
-                profile.auth_user_id
-              ),
-              profile
-            );
-          }
-
-          if (profile?.id) {
-            profilesByKey.set(
-              String(
-                profile.id
-              ),
-              profile
-            );
-          }
-        }
-
-        for (
-          const profile of
-          Array.isArray(
-            byProfileIdResult?.data
-          )
-            ? byProfileIdResult.data
-            : []
-        ) {
-          if (profile?.id) {
-            profilesByKey.set(
-              String(
-                profile.id
-              ),
-              profile
-            );
-          }
-
-          if (
-            profile?.auth_user_id
-          ) {
-            profilesByKey.set(
-              String(
-                profile.auth_user_id
-              ),
-              profile
-            );
-          }
-        }
-      }
+      const profilesByKey = new Map();
 
       const result =
         rows.map(
