@@ -16326,6 +16326,838 @@ app.get("/api/vehicle-reports/:reportId", async (req, res) => {
   }
 });
 
+
+/*
+ * ============================================================
+ * AUTODEAR — APP UPDATE POLICY API
+ * ============================================================
+ *
+ * Public GET:
+ *   GET /api/app-update-policy
+ *
+ * Protected director PATCH:
+ *   PATCH /api/director/app-update-policy
+ *
+ * Источник истины:
+ *   public.app_update_policy
+ *
+ * Клиент НЕ получает service_role и не пишет
+ * напрямую в app_update_policy.
+ * ============================================================
+ */
+
+function normalizeAutodearUpdatePolicyUrl(value) {
+  const url =
+    String(value || "")
+      .trim();
+
+  if (!url) {
+    return "";
+  }
+
+  if (!/^https:\/\//i.test(url)) {
+    return "";
+  }
+
+  return url;
+}
+
+function normalizeAutodearUpdatePolicyString(
+  value,
+  maxLength
+) {
+  const result =
+    String(value ?? "")
+      .trim();
+
+  return result.slice(
+    0,
+    maxLength
+  );
+}
+
+function mapAutodearUpdatePolicy(row) {
+  const source =
+    row || {};
+
+  return {
+    id:
+      "production",
+
+    android: {
+      forceUpdateEnabled:
+        Boolean(
+          source.android_force_update_enabled
+        ),
+
+      minVersionCode:
+        Number.isFinite(
+          Number(
+            source.android_min_version_code
+          )
+        )
+          ? Number(
+              source.android_min_version_code
+            )
+          : 0,
+
+      minVersion:
+        String(
+          source.android_min_version ||
+            ""
+        ),
+
+      storeUrl:
+        String(
+          source.android_store_url ||
+            ""
+        ),
+    },
+
+    ios: {
+      forceUpdateEnabled:
+        Boolean(
+          source.ios_force_update_enabled
+        ),
+
+      minBuild:
+        String(
+          source.ios_min_build ||
+            ""
+        ),
+
+      minVersion:
+        String(
+          source.ios_min_version ||
+            ""
+        ),
+
+      storeUrl:
+        String(
+          source.ios_store_url ||
+            ""
+        ),
+    },
+
+    title:
+      String(
+        source.title ||
+          "Доступно обновление"
+      ),
+
+    message:
+      String(
+        source.message ||
+          "Для продолжения работы необходимо обновить приложение."
+      ),
+
+    updatedAt:
+      source.updated_at ||
+      null,
+
+    updatedBy:
+      source.updated_by ||
+      null,
+  };
+}
+
+
+/*
+ * Public policy read.
+ *
+ * This route intentionally does not require
+ * an authenticated user: it is used by the
+ * application before normal navigation.
+ */
+app.get(
+  "/api/app-update-policy",
+  async (req, res) => {
+    try {
+      res.set(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate"
+      );
+
+      if (!supabaseServiceRole) {
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+          });
+      }
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "app_update_policy"
+          )
+          .select(
+            [
+              "id",
+              "android_force_update_enabled",
+              "android_min_version_code",
+              "android_min_version",
+              "android_store_url",
+              "ios_force_update_enabled",
+              "ios_min_build",
+              "ios_min_version",
+              "ios_store_url",
+              "title",
+              "message",
+              "updated_at",
+              "updated_by",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            "production"
+          )
+          .maybeSingle();
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][APP_UPDATE_POLICY][GET_ERROR]",
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_GET_FAILED",
+          });
+      }
+
+      if (!data) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_NOT_FOUND",
+          });
+      }
+
+      return res.json({
+        ok: true,
+        policy:
+          mapAutodearUpdatePolicy(
+            data
+          ),
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][APP_UPDATE_POLICY][GET_FATAL]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "APP_UPDATE_POLICY_GET_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Director-only policy read.
+ *
+ * GET is protected intentionally: the public application
+ * check and the director management screen are separate
+ * access paths.
+ */
+app.get(
+  "/api/director/app-update-policy",
+  async (req, res) => {
+    try {
+      if (!supabaseServiceRole) {
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+          });
+      }
+
+      const access =
+        await resolveStaffAccess(
+          req,
+          "director"
+        );
+
+      if (!access.ok) {
+        return res
+          .status(
+            access.status || 403
+          )
+          .json({
+            ok: false,
+            error:
+              access.error ||
+              "STAFF_ACCESS_DENIED",
+          });
+      }
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "app_update_policy"
+          )
+          .select(
+            [
+              "id",
+              "android_force_update_enabled",
+              "android_min_version_code",
+              "android_min_version",
+              "android_store_url",
+              "ios_force_update_enabled",
+              "ios_min_build",
+              "ios_min_version",
+              "ios_store_url",
+              "title",
+              "message",
+              "updated_at",
+              "updated_by",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            "production"
+          )
+          .maybeSingle();
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][APP_UPDATE_POLICY][DIRECTOR_GET_ERROR]",
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_DIRECTOR_GET_FAILED",
+          });
+      }
+
+      if (!data) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_NOT_FOUND",
+          });
+      }
+
+      return res.json({
+        ok: true,
+        policy:
+          mapAutodearUpdatePolicy(
+            data
+          ),
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][APP_UPDATE_POLICY][DIRECTOR_GET_FATAL]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "APP_UPDATE_POLICY_DIRECTOR_GET_FATAL",
+        });
+    }
+  }
+);
+
+
+/*
+ * Director-only policy update.
+ */
+app.patch(
+  "/api/director/app-update-policy",
+  async (req, res) => {
+    try {
+      if (!supabaseServiceRole) {
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+          });
+      }
+
+      const access =
+        await resolveStaffAccess(
+          req,
+          "director"
+        );
+
+      if (!access.ok) {
+        return res
+          .status(
+            access.status || 403
+          )
+          .json({
+            ok: false,
+            error:
+              access.error ||
+              "STAFF_ACCESS_DENIED",
+          });
+      }
+
+      const body =
+        req.body &&
+        typeof req.body ===
+          "object" &&
+        !Array.isArray(
+          req.body
+        )
+          ? req.body
+          : {};
+
+      const {
+        data: current,
+        error: currentError,
+      } =
+        await supabaseServiceRole
+          .from(
+            "app_update_policy"
+          )
+          .select("*")
+          .eq(
+            "id",
+            "production"
+          )
+          .maybeSingle();
+
+      if (currentError) {
+        console.error(
+          "[AUTODEAR][APP_UPDATE_POLICY][CURRENT_ERROR]",
+          currentError
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_CURRENT_READ_FAILED",
+          });
+      }
+
+      if (!current) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_NOT_FOUND",
+          });
+      }
+
+      const update = {};
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "androidForceUpdateEnabled"
+        )
+      ) {
+        if (
+          typeof body.androidForceUpdateEnabled !==
+          "boolean"
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "ANDROID_FORCE_UPDATE_ENABLED_INVALID",
+            });
+        }
+
+        update.android_force_update_enabled =
+          body.androidForceUpdateEnabled;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "androidMinVersionCode"
+        )
+      ) {
+        const value =
+          Number(
+            body.androidMinVersionCode
+          );
+
+        if (
+          !Number.isInteger(value) ||
+          value < 0
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "ANDROID_MIN_VERSION_CODE_INVALID",
+            });
+        }
+
+        update.android_min_version_code =
+          value;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "androidMinVersion"
+        )
+      ) {
+        update.android_min_version =
+          normalizeAutodearUpdatePolicyString(
+            body.androidMinVersion,
+            32
+          );
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "androidStoreUrl"
+        )
+      ) {
+        const raw =
+          String(
+            body.androidStoreUrl ||
+              ""
+          ).trim();
+
+        if (
+          raw &&
+          !/^https:\/\//i.test(raw)
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "ANDROID_STORE_URL_INVALID",
+            });
+        }
+
+        update.android_store_url =
+          normalizeAutodearUpdatePolicyUrl(
+            raw
+          );
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "iosForceUpdateEnabled"
+        )
+      ) {
+        if (
+          typeof body.iosForceUpdateEnabled !==
+          "boolean"
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "IOS_FORCE_UPDATE_ENABLED_INVALID",
+            });
+        }
+
+        update.ios_force_update_enabled =
+          body.iosForceUpdateEnabled;
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "iosMinBuild"
+        )
+      ) {
+        update.ios_min_build =
+          normalizeAutodearUpdatePolicyString(
+            body.iosMinBuild,
+            32
+          );
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "iosMinVersion"
+        )
+      ) {
+        update.ios_min_version =
+          normalizeAutodearUpdatePolicyString(
+            body.iosMinVersion,
+            32
+          );
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "iosStoreUrl"
+        )
+      ) {
+        const raw =
+          String(
+            body.iosStoreUrl ||
+              ""
+          ).trim();
+
+        if (
+          raw &&
+          !/^https:\/\//i.test(raw)
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "IOS_STORE_URL_INVALID",
+            });
+        }
+
+        update.ios_store_url =
+          normalizeAutodearUpdatePolicyUrl(
+            raw
+          );
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "title"
+        )
+      ) {
+        update.title =
+          normalizeAutodearUpdatePolicyString(
+            body.title,
+            200
+          );
+
+        if (!update.title) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "APP_UPDATE_TITLE_REQUIRED",
+            });
+        }
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(
+          body,
+          "message"
+        )
+      ) {
+        update.message =
+          normalizeAutodearUpdatePolicyString(
+            body.message,
+            2000
+          );
+
+        if (!update.message) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "APP_UPDATE_MESSAGE_REQUIRED",
+            });
+        }
+      }
+
+      if (
+        Object.keys(update).length ===
+        0
+      ) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_NO_CHANGES",
+          });
+      }
+
+      const merged = {
+        ...current,
+        ...update,
+      };
+
+      if (
+        merged.android_force_update_enabled
+      ) {
+        if (
+          Number(
+            merged.android_min_version_code
+          ) <= 0
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "ANDROID_FORCE_UPDATE_MIN_VERSION_REQUIRED",
+            });
+        }
+
+        if (
+          !String(
+            merged.android_store_url ||
+              ""
+          ).trim()
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "ANDROID_FORCE_UPDATE_STORE_URL_REQUIRED",
+            });
+        }
+      }
+
+      if (
+        merged.ios_force_update_enabled
+      ) {
+        if (
+          !String(
+            merged.ios_min_build ||
+              ""
+          ).trim() &&
+          !String(
+            merged.ios_min_version ||
+              ""
+          ).trim()
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "IOS_FORCE_UPDATE_VERSION_REQUIRED",
+            });
+        }
+
+        if (
+          !String(
+            merged.ios_store_url ||
+              ""
+          ).trim()
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "IOS_FORCE_UPDATE_STORE_URL_REQUIRED",
+            });
+        }
+      }
+
+      update.updated_at =
+        new Date().toISOString();
+
+      update.updated_by =
+        access.actor?.authUserId ||
+        null;
+
+      const {
+        data,
+        error,
+      } =
+        await supabaseServiceRole
+          .from(
+            "app_update_policy"
+          )
+          .update(update)
+          .eq(
+            "id",
+            "production"
+          )
+          .select("*")
+          .single();
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][APP_UPDATE_POLICY][UPDATE_ERROR]",
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "APP_UPDATE_POLICY_UPDATE_FAILED",
+          });
+      }
+
+      return res.json({
+        ok: true,
+        policy:
+          mapAutodearUpdatePolicy(
+            data
+          ),
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][APP_UPDATE_POLICY][PATCH_FATAL]",
+        error
+      );
+
+      return res
+        .status(
+          Number(
+            error?.statusCode ||
+              500
+          )
+        )
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "APP_UPDATE_POLICY_PATCH_FATAL",
+        });
+    }
+  }
+);
+
+
+
 app.get("/download", (req, res) => {
   const googlePlayUrl = String(process.env.AUTODEAR_GOOGLE_PLAY_URL || "").trim();
   const ruStoreUrl = String(process.env.AUTODEAR_RUSTORE_URL || "").trim();
@@ -31886,7 +32718,35 @@ app.get(
   "/api/business-directory/staff/services",
   async (req, res) => {
     try {
+      const routeStartedAt = Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICES_SERVER][START]",
+        {
+          page:
+            req.query?.page ||
+            "1",
+          limit:
+            req.query?.limit ||
+            "50",
+        }
+      );
+
+      const authStartedAt = Date.now();
+
       await requireBusinessDirectoryStaffUser(req);
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICES_SERVER][AUTH_DONE]",
+        {
+          ms:
+            Date.now() -
+            authStartedAt,
+          totalMs:
+            Date.now() -
+            routeStartedAt,
+        }
+      );
 
       const db =
         getStaffServiceManagementDb();
@@ -32095,6 +32955,16 @@ app.get(
           );
       }
 
+      const stationsStartedAt = Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICES_SERVER][STATIONS_START]",
+        {
+          offset,
+          limit,
+        }
+      );
+
       const {
         data: stations,
         error: stationsError,
@@ -32102,6 +32972,24 @@ app.get(
       } = await request.range(
         offset,
         offset + limit - 1
+      );
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICES_SERVER][STATIONS_DONE]",
+        {
+          ms:
+            Date.now() -
+            stationsStartedAt,
+          count:
+            Array.isArray(stations)
+              ? stations.length
+              : 0,
+          total:
+            Number(totalCount || 0),
+          error:
+            stationsError?.message ||
+            null,
+        }
       );
 
       if (stationsError) {
@@ -32147,6 +33035,16 @@ app.get(
        * запрашиваем параллельно.
        */
       if (ownerIds.length) {
+        const profilesStartedAt = Date.now();
+
+        console.log(
+          "[AUTODEAR][STAFF_SERVICES_SERVER][PROFILES_START]",
+          {
+            ownerCount:
+              ownerIds.length,
+          }
+        );
+
         const [
           byAuthUserIdResult,
           byProfileIdResult,
@@ -32171,6 +33069,33 @@ app.get(
               ownerIds
             ),
         ]);
+
+        console.log(
+          "[AUTODEAR][STAFF_SERVICES_SERVER][PROFILES_DONE]",
+          {
+            ms:
+              Date.now() -
+              profilesStartedAt,
+            byAuthUserId:
+              Array.isArray(
+                byAuthUserIdResult?.data
+              )
+                ? byAuthUserIdResult.data.length
+                : 0,
+            byProfileId:
+              Array.isArray(
+                byProfileIdResult?.data
+              )
+                ? byProfileIdResult.data.length
+                : 0,
+            authError:
+              byAuthUserIdResult?.error?.message ||
+              null,
+            profileError:
+              byProfileIdResult?.error?.message ||
+              null,
+          }
+        );
 
         for (
           const profile of
@@ -32385,6 +33310,18 @@ app.get(
         Number(
           totalCount || 0
         );
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICES_SERVER][READY]",
+        {
+          totalMs:
+            Date.now() -
+            routeStartedAt,
+          count:
+            result.length,
+          total,
+        }
+      );
 
       return res.json({
         ok: true,
@@ -38542,6 +39479,12 @@ app.post(
 
 
 async function requireAdsAuthUser(req) {
+  const authStartedAt = Date.now();
+
+  console.log(
+    "[AUTODEAR][STAFF_AUTH_SERVER][START]"
+  );
+
   if (!supabaseAuth) {
     const error = new Error(
       "SUPABASE_AUTH_NOT_CONFIGURED"
@@ -38570,10 +39513,33 @@ async function requireAdsAuthUser(req) {
     throw error;
   }
 
+  const authGetUserStartedAt = Date.now();
+
+  console.log(
+    "[AUTODEAR][STAFF_AUTH_SERVER][GET_USER_START]"
+  );
+
   const {
     data,
     error: authError,
   } = await supabaseAuth.auth.getUser(token);
+
+  console.log(
+    "[AUTODEAR][STAFF_AUTH_SERVER][GET_USER_DONE]",
+    {
+      ms:
+        Date.now() -
+        authGetUserStartedAt,
+      totalMs:
+        Date.now() -
+        authStartedAt,
+      ok:
+        Boolean(data?.user?.id),
+      error:
+        authError?.message ||
+        null,
+    }
+  );
 
   if (
     authError ||
