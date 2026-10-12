@@ -32718,35 +32718,7 @@ app.get(
   "/api/business-directory/staff/services",
   async (req, res) => {
     try {
-      const routeStartedAt = Date.now();
-
-      console.log(
-        "[AUTODEAR][STAFF_SERVICES_SERVER][START]",
-        {
-          page:
-            req.query?.page ||
-            "1",
-          limit:
-            req.query?.limit ||
-            "50",
-        }
-      );
-
-      const authStartedAt = Date.now();
-
       await requireBusinessDirectoryStaffUser(req);
-
-      console.log(
-        "[AUTODEAR][STAFF_SERVICES_SERVER][AUTH_DONE]",
-        {
-          ms:
-            Date.now() -
-            authStartedAt,
-          totalMs:
-            Date.now() -
-            routeStartedAt,
-        }
-      );
 
       const db =
         getStaffServiceManagementDb();
@@ -32955,16 +32927,6 @@ app.get(
           );
       }
 
-      const stationsStartedAt = Date.now();
-
-      console.log(
-        "[AUTODEAR][STAFF_SERVICES_SERVER][STATIONS_START]",
-        {
-          offset,
-          limit,
-        }
-      );
-
       const {
         data: stations,
         error: stationsError,
@@ -32972,24 +32934,6 @@ app.get(
       } = await request.range(
         offset,
         offset + limit - 1
-      );
-
-      console.log(
-        "[AUTODEAR][STAFF_SERVICES_SERVER][STATIONS_DONE]",
-        {
-          ms:
-            Date.now() -
-            stationsStartedAt,
-          count:
-            Array.isArray(stations)
-              ? stations.length
-              : 0,
-          total:
-            Number(totalCount || 0),
-          error:
-            stationsError?.message ||
-            null,
-        }
       );
 
       if (stationsError) {
@@ -33180,18 +33124,6 @@ app.get(
         Number(
           totalCount || 0
         );
-
-      console.log(
-        "[AUTODEAR][STAFF_SERVICES_SERVER][READY]",
-        {
-          totalMs:
-            Date.now() -
-            routeStartedAt,
-          count:
-            result.length,
-          total,
-        }
-      );
 
       return res.json({
         ok: true,
@@ -39349,12 +39281,6 @@ app.post(
 
 
 async function requireAdsAuthUser(req) {
-  const authStartedAt = Date.now();
-
-  console.log(
-    "[AUTODEAR][STAFF_AUTH_SERVER][START]"
-  );
-
   if (!supabaseAuth) {
     const error = new Error(
       "SUPABASE_AUTH_NOT_CONFIGURED"
@@ -39383,33 +39309,10 @@ async function requireAdsAuthUser(req) {
     throw error;
   }
 
-  const authGetUserStartedAt = Date.now();
-
-  console.log(
-    "[AUTODEAR][STAFF_AUTH_SERVER][GET_USER_START]"
-  );
-
   const {
     data,
     error: authError,
   } = await supabaseAuth.auth.getUser(token);
-
-  console.log(
-    "[AUTODEAR][STAFF_AUTH_SERVER][GET_USER_DONE]",
-    {
-      ms:
-        Date.now() -
-        authGetUserStartedAt,
-      totalMs:
-        Date.now() -
-        authStartedAt,
-      ok:
-        Boolean(data?.user?.id),
-      error:
-        authError?.message ||
-        null,
-    }
-  );
 
   if (
     authError ||
