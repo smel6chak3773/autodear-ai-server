@@ -2135,6 +2135,111 @@ async function resolveAuthenticatedUser(req) {
 }
 
 
+
+// REFERRAL_AUTH_CLAIMS_V1
+//
+// Для реферального кода нужен только проверенный UUID
+// пользователя. Полный объект Auth User здесь не нужен.
+//
+// getClaims() позволяет проверить JWT без отдельного
+// Auth API-запроса getUser() на каждый вход в раздел.
+
+async function resolveReferralAuthenticatedUser(req) {
+  const authHeader =
+    String(
+      req.headers?.authorization || ""
+    ).trim();
+
+  if (
+    !authHeader
+      .toLowerCase()
+      .startsWith("bearer ")
+  ) {
+    return {
+      user: null,
+      error: "AUTH_TOKEN_REQUIRED",
+    };
+  }
+
+  const accessToken =
+    authHeader
+      .slice(7)
+      .trim();
+
+  if (!accessToken) {
+    return {
+      user: null,
+      error: "AUTH_TOKEN_REQUIRED",
+    };
+  }
+
+  if (!supabaseAuth) {
+    return {
+      user: null,
+      error: "AUTH_SERVICE_NOT_CONFIGURED",
+    };
+  }
+
+  try {
+    const {
+      data,
+      error,
+    } =
+      await supabaseAuth.auth.getClaims(
+        accessToken
+      );
+
+    const authUserId =
+      String(
+        data?.claims?.sub || ""
+      ).trim();
+
+    if (
+      error ||
+      !authUserId
+    ) {
+      console.warn(
+        "[AUTODEAR][REFERRAL][CLAIMS_INVALID]",
+        {
+          code:
+            error?.code ||
+            null,
+          message:
+            error?.message ||
+            null,
+        }
+      );
+
+      return {
+        user: null,
+        error: "AUTH_TOKEN_INVALID",
+      };
+    }
+
+    return {
+      user: {
+        id: authUserId,
+      },
+      error: null,
+    };
+  } catch (error) {
+    console.warn(
+      "[AUTODEAR][REFERRAL][CLAIMS_ERROR]",
+      {
+        message:
+          error?.message ||
+          String(error),
+      }
+    );
+
+    return {
+      user: null,
+      error: "AUTH_TOKEN_INVALID",
+    };
+  }
+}
+
+
 // REFERRAL_CODE_ENDPOINT_ONE_AUTH_V1
 //
 // Auth UUID is NOT assumed to be the same as profiles.id.
@@ -2145,7 +2250,7 @@ app.get(
   "/api/referrals/me/code",
   async (req, res) => {
     const authResult =
-      await resolveAuthenticatedUser(req);
+      await resolveReferralAuthenticatedUser(req);
 
     const authUser =
       authResult?.user || null;
