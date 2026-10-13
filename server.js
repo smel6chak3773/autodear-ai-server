@@ -32927,13 +32927,45 @@ app.get(
           );
       }
 
-      const {
+            const staffServicesDbStartedAt =
+        Date.now();
+
+const {
         data: stations,
         error: stationsError,
         count: totalCount,
       } = await request.range(
         offset,
         offset + limit - 1
+      );
+
+      console.log(
+        "[AUTODEAR][STAFF_SERVICE_MANAGEMENT][DB_TIMING]",
+        JSON.stringify({
+          ms:
+            Date.now() -
+            staffServicesDbStartedAt,
+
+          page,
+          limit,
+
+          query:
+            Boolean(
+              safeQuery
+            ),
+
+          rows:
+            Array.isArray(
+              stations
+            )
+              ? stations.length
+              : 0,
+
+          totalCount:
+            Number(
+              totalCount || 0
+            ),
+        })
       );
 
       if (stationsError) {
