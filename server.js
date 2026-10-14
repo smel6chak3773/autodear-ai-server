@@ -3814,6 +3814,419 @@ async function sendAdminListingModerationPush({
 
 
 
+
+/*
+ * ADMIN_REVIEW_COMPLAINT_DECISION_V1
+ *
+ * Администратор принимает решение по жалобе
+ * на опубликованный отзыв.
+ *
+ * ВАЖНО:
+ * - доступ только через server-side admin access;
+ * - клиент не меняет reviews напрямую;
+ * - target_id отзыва берём из самой жалобы;
+ * - service-role используется только на сервере;
+ * - RLS НЕ изменяется.
+ *
+ * keep:
+ *   review.status    = published
+ *   complaint.status = rejected
+ *
+ * remove:
+ *   review.status    = rejected
+ *   complaint.status = resolved
+ */
+app.patch(
+  "/api/admin/moderation/complaints/:complaintId/review-decision",
+  async (req, res) => {
+    const access =
+      await resolveStaffAccess(
+        req,
+        "admin"
+      );
+
+    if (!access.ok) {
+      return res
+        .status(
+          access.status || 403
+        )
+        .json({
+          ok: false,
+          error:
+            access.error ||
+            "STAFF_ACCESS_DENIED",
+        });
+    }
+
+    if (!supabaseServiceRole) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "STAFF_SERVICE_ROLE_NOT_CONFIGURED",
+        });
+    }
+
+    const complaintId =
+      String(
+        req.params?.complaintId ||
+          ""
+      ).trim();
+
+    if (
+      !adminModerationUuidOrNull(
+        complaintId
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "COMPLAINT_ID_INVALID",
+        });
+    }
+
+    const decision =
+      String(
+        req.body?.decision ||
+          ""
+      )
+        .trim()
+        .toLowerCase();
+
+    if (
+      ![
+        "keep",
+        "remove",
+      ].includes(decision)
+    ) {
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            "REVIEW_DECISION_INVALID",
+        });
+    }
+
+    const nextReviewStatus =
+      decision === "remove"
+        ? "rejected"
+        : "published";
+
+    const nextComplaintStatus =
+      decision === "remove"
+        ? "resolved"
+        : "rejected";
+
+    try {
+      /*
+       * Сначала читаем саму жалобу.
+       * Клиент НЕ передаёт reviewId — сервер
+       * самостоятельно получает его из target_id.
+       */
+      const {
+        data: complaint,
+        error: complaintError,
+      } =
+        await supabaseServiceRole
+          .from("complaints")
+          .select(
+            [
+              "id",
+              "target_type",
+              "target_id",
+              "status",
+            ].join(",")
+          )
+          .eq(
+            "id",
+            complaintId
+          )
+          .maybeSingle();
+
+      if (complaintError) {
+        throw complaintError;
+      }
+
+      if (!complaint) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "COMPLAINT_NOT_FOUND",
+          });
+      }
+
+      const targetType =
+        String(
+          complaint.target_type ||
+            ""
+        )
+          .trim()
+          .toLowerCase();
+
+      if (targetType !== "review") {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "COMPLAINT_TARGET_NOT_REVIEW",
+          });
+      }
+
+      const reviewId =
+        String(
+          complaint.target_id ||
+            ""
+        ).trim();
+
+      if (
+        !adminModerationUuidOrNull(
+          reviewId
+        )
+      ) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "REVIEW_ID_INVALID",
+          });
+      }
+
+      /*
+       * Получаем исходное состояние отзыва.
+       * Это нужно также для безопасного rollback,
+       * если обновление жалобы не пройдёт.
+       */
+      const {
+        data: review,
+        error: reviewError,
+      } =
+        await supabaseServiceRole
+          .from("reviews")
+          .select(
+            "id,status"
+          )
+          .eq(
+            "id",
+            reviewId
+          )
+          .maybeSingle();
+
+      if (reviewError) {
+        throw reviewError;
+      }
+
+      if (!review) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "REVIEW_NOT_FOUND",
+          });
+      }
+
+      const currentReviewStatus =
+        String(
+          review.status ||
+            ""
+        ).trim();
+
+      const currentComplaintStatus =
+        String(
+          complaint.status ||
+            ""
+        ).trim();
+
+      /*
+       * Повторное нажатие должно быть безопасным.
+       */
+      if (
+        currentReviewStatus ===
+          nextReviewStatus &&
+        currentComplaintStatus ===
+          nextComplaintStatus
+      ) {
+        return res.json({
+          ok: true,
+          idempotent: true,
+          decision,
+          review: {
+            id: reviewId,
+            status:
+              nextReviewStatus,
+          },
+          complaint: {
+            id: complaintId,
+            status:
+              nextComplaintStatus,
+          },
+        });
+      }
+
+      /*
+       * Закрытую жалобу не переигрываем другим решением.
+       */
+      if (
+        currentComplaintStatus &&
+        ![
+          "new",
+          "in_progress",
+        ].includes(
+          currentComplaintStatus
+        )
+      ) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "REVIEW_COMPLAINT_ALREADY_CLOSED",
+            status:
+              currentComplaintStatus,
+          });
+      }
+
+      let reviewChanged = false;
+
+      /*
+       * 1. Меняем отзыв.
+       */
+      if (
+        currentReviewStatus !==
+        nextReviewStatus
+      ) {
+        const {
+          error: updateReviewError,
+        } =
+          await supabaseServiceRole
+            .from("reviews")
+            .update({
+              status:
+                nextReviewStatus,
+              updated_at:
+                new Date().toISOString(),
+            })
+            .eq(
+              "id",
+              reviewId
+            );
+
+        if (updateReviewError) {
+          throw updateReviewError;
+        }
+
+        reviewChanged = true;
+      }
+
+      /*
+       * 2. Закрываем жалобу.
+       */
+      if (
+        currentComplaintStatus !==
+        nextComplaintStatus
+      ) {
+        const {
+          error: updateComplaintError,
+        } =
+          await supabaseServiceRole
+            .from("complaints")
+            .update({
+              status:
+                nextComplaintStatus,
+            })
+            .eq(
+              "id",
+              complaintId
+            );
+
+        if (updateComplaintError) {
+          /*
+           * Если отзыв уже поменяли, пытаемся
+           * вернуть его исходный статус.
+           */
+          if (reviewChanged) {
+            const {
+              error: rollbackError,
+            } =
+              await supabaseServiceRole
+                .from("reviews")
+                .update({
+                  status:
+                    currentReviewStatus,
+                  updated_at:
+                    new Date().toISOString(),
+                })
+                .eq(
+                  "id",
+                  reviewId
+                );
+
+            if (rollbackError) {
+              console.error(
+                "[AUTODEAR][ADMIN_REVIEW_DECISION][ROLLBACK_ERROR]",
+                rollbackError
+              );
+            }
+          }
+
+          throw updateComplaintError;
+        }
+      }
+
+      console.log(
+        "[AUTODEAR][ADMIN_REVIEW_DECISION]",
+        JSON.stringify({
+          complaintId,
+          reviewId,
+          decision,
+          reviewStatus:
+            nextReviewStatus,
+          complaintStatus:
+            nextComplaintStatus,
+        })
+      );
+
+      return res.json({
+        ok: true,
+        idempotent: false,
+        decision,
+        review: {
+          id: reviewId,
+          status:
+            nextReviewStatus,
+        },
+        complaint: {
+          id: complaintId,
+          status:
+            nextComplaintStatus,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][ADMIN_REVIEW_DECISION][FATAL]",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            error?.message ||
+            "ADMIN_REVIEW_DECISION_FAILED",
+        });
+    }
+  }
+);
+
 // ADMIN_COMPLAINT_EVIDENCE_V1
 //
 // Фото жалобы лежат в приватном Storage.
