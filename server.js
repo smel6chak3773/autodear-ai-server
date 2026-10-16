@@ -44451,6 +44451,30 @@ app.post("/api/assistant/message", async (req, res) => {
   }
 });
 
+/*
+ * PAMPADU_POSTBACK_RECEIVER_V1
+ *
+ * Временный диагностический приёмник.
+ * Ничего в БД не записывает.
+ * Нужен, чтобы получить реальный набор параметров,
+ * который Pampadu присылает для ОСАГО.
+ */
+app.get("/api/integrations/pampadu/postback", (req, res) => {
+  const payload = {
+    ...req.query,
+  };
+
+  console.log(
+    "[AUTODEAR][PAMPADU][POSTBACK]",
+    JSON.stringify(payload)
+  );
+
+  return res.status(200).json({
+    ok: true,
+  });
+});
+
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`AUTODEAR AI Server started on port ${PORT}`);
 
