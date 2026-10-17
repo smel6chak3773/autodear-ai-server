@@ -44452,25 +44452,299 @@ app.post("/api/assistant/message", async (req, res) => {
 });
 
 /*
- * PAMPADU_POSTBACK_RECEIVER_V1
+ * PAMPADU_POSTBACK_RECEIVER_V2
  *
- * Временный диагностический приёмник.
- * Ничего в БД не записывает.
- * Нужен, чтобы получить реальный набор параметров,
- * который Pampadu присылает для ОСАГО.
+ * Принимает GET Postback от Pampadu.
+ *
+ * sub1 = user_id
+ * sub2 = car_id
+ * sub3 = osago_session_id
+ *
+ * Каждый Postback сохраняется в public.osago_sessions.
  */
-app.get("/api/integrations/pampadu/postback", (req, res) => {
-  const payload = {
-    ...req.query,
-  };
+app.get("/api/integrations/pampadu/postback", async (req, res) => {
+  const raw = req.query || {};
+
+  function first(value) {
+    if (Array.isArray(value)) {
+      return String(value[0] || "").trim();
+    }
+
+    return String(value || "").trim();
+  }
+
+  function textOrNull(value) {
+    const result = first(value);
+    return result || null;
+  }
+
+  function numberOrNull(value) {
+    const result = first(value);
+
+    if (!result) {
+      return null;
+    }
+
+    const normalized = result.replace(",", ".");
+    const number = Number(normalized);
+
+    return Number.isFinite(number)
+      ? number
+      : null;
+  }
+
+  const payload = Object.fromEntries(
+    Object.entries(raw).map(([key, value]) => [
+      key,
+      Array.isArray(value)
+        ? value.map((item) => String(item))
+        : value,
+    ])
+  );
+
+  const userId = first(raw.sub1);
+  const carId = first(raw.sub2);
+  const osagoSessionId = first(raw.sub3);
+
+  const providerOrderId = first(
+    raw.order_id ||
+    raw.conversion_id ||
+    raw.conversion ||
+    ""
+  );
+
+  const status = first(raw.status);
 
   console.log(
     "[AUTODEAR][PAMPADU][POSTBACK]",
-    JSON.stringify(payload)
+    JSON.stringify({
+      userId: userId || null,
+      carId: carId || null,
+      osagoSessionId: osagoSessionId || null,
+      providerOrderId: providerOrderId || null,
+      status: status || null,
+      payload,
+    })
+  );
+
+  /*
+   * Pampadu должен получить HTTP 200 даже если
+   * тестовый Postback ещё не содержит наших sub1/sub2/sub3.
+   */
+  if (!supabaseServiceRole) {
+    console.error(
+      "[AUTODEAR][PAMPADU][POSTBACK_DB_ERROR]",
+      "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED"
+    );
+
+    return res.status(200).json({
+      ok: false,
+      saved: false,
+      error: "SUPABASE_SERVICE_ROLE_NOT_CONFIGURED",
+    });
+  }
+
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  if (!uuidPattern.test(userId)) {
+    console.warn(
+      "[AUTODEAR][PAMPADU][POSTBACK_SKIP]",
+      "invalid sub1/user_id"
+    );
+
+    return res.status(200).json({
+      ok: true,
+      saved: false,
+      reason: "INVALID_SUB1_USER_ID",
+    });
+  }
+
+  if (!carId || !osagoSessionId) {
+    console.warn(
+      "[AUTODEAR][PAMPADU][POSTBACK_SKIP]",
+      "sub2/sub3 missing"
+    );
+
+    return res.status(200).json({
+      ok: true,
+      saved: false,
+      reason: "MISSING_SUB2_OR_SUB3",
+    });
+  }
+
+  /*
+   * Сначала ищем существующую сессию:
+   * 1. по sub3;
+   * 2. затем по order_id.
+   *
+   * Это позволяет корректно принимать повторные Postback
+   * при изменении статуса одной и той же конверсии.
+   */
+  let existing = null;
+
+  const existingByIdResult =
+    await supabaseServiceRole
+      .from("osago_sessions")
+      .select("id,raw_payload")
+      .eq("id", osagoSessionId)
+      .maybeSingle();
+
+  if (existingByIdResult.error) {
+    console.error(
+      "[AUTODEAR][PAMPADU][POSTBACK_LOOKUP_ERROR]",
+      JSON.stringify({
+        message: existingByIdResult.error.message,
+        details: existingByIdResult.error.details,
+        code: existingByIdResult.error.code,
+      })
+    );
+
+    return res.status(500).json({
+      ok: false,
+      saved: false,
+      error: "OSAGO_SESSION_LOOKUP_FAILED",
+    });
+  }
+
+  existing = existingByIdResult.data || null;
+
+  if (!existing && providerOrderId) {
+    const existingByOrderResult =
+      await supabaseServiceRole
+        .from("osago_sessions")
+        .select("id,raw_payload")
+        .eq("order_id", providerOrderId)
+        .maybeSingle();
+
+    if (existingByOrderResult.error) {
+      console.error(
+        "[AUTODEAR][PAMPADU][POSTBACK_ORDER_LOOKUP_ERROR]",
+        JSON.stringify({
+          message: existingByOrderResult.error.message,
+          details: existingByOrderResult.error.details,
+          code: existingByOrderResult.error.code,
+        })
+      );
+
+      return res.status(500).json({
+        ok: false,
+        saved: false,
+        error: "OSAGO_SESSION_ORDER_LOOKUP_FAILED",
+      });
+    }
+
+    existing = existingByOrderResult.data || null;
+  }
+
+  const sessionId =
+    existing?.id || osagoSessionId;
+
+  const previousPayload =
+    existing?.raw_payload &&
+    typeof existing.raw_payload === "object"
+      ? existing.raw_payload
+      : {};
+
+  const mergedPayload = {
+    ...previousPayload,
+    ...payload,
+  };
+
+  const now = new Date().toISOString();
+
+  const sessionRow = {
+    id: sessionId,
+    user_id: userId,
+    car_id: carId,
+    provider: "pampadu",
+
+    offer_id:
+      textOrNull(raw.offer_id),
+
+    offer_name:
+      textOrNull(raw.offer_name),
+
+    click_id:
+      textOrNull(raw.click_id),
+
+    order_id:
+      providerOrderId || null,
+
+    status:
+      status || "Pending",
+
+    conversion_time:
+      textOrNull(raw.conversion_time),
+
+    amount:
+      numberOrNull(raw.amount),
+
+    cost:
+      numberOrNull(raw.cost),
+
+    raw_payload:
+      mergedPayload,
+
+    last_postback_at:
+      now,
+
+    updated_at:
+      now,
+  };
+
+  const { data, error } =
+    await supabaseServiceRole
+      .from("osago_sessions")
+      .upsert(
+        sessionRow,
+        {
+          onConflict: "id",
+        }
+      )
+      .select(
+        "id,user_id,car_id,provider,offer_id,offer_name,click_id,order_id,status,conversion_time,amount,cost,last_postback_at,updated_at"
+      )
+      .single();
+
+  if (error) {
+    console.error(
+      "[AUTODEAR][PAMPADU][POSTBACK_DB_ERROR]",
+      JSON.stringify({
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      })
+    );
+
+    return res.status(500).json({
+      ok: false,
+      saved: false,
+      error: "OSAGO_SESSION_SAVE_FAILED",
+    });
+  }
+
+  console.log(
+    "[AUTODEAR][PAMPADU][POSTBACK_SAVED]",
+    JSON.stringify({
+      sessionId:
+        data?.id || sessionId,
+
+      userId,
+      carId,
+
+      status:
+        status || null,
+
+      orderId:
+        providerOrderId || null,
+    })
   );
 
   return res.status(200).json({
     ok: true,
+    saved: true,
   });
 });
 
