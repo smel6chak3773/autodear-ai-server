@@ -44502,9 +44502,25 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
     ])
   );
 
-  const userId = first(raw.sub1);
-  const carId = first(raw.sub2);
-  const osagoSessionId = first(raw.sub3);
+  /*
+   * Pampadu может передавать наши sub-параметры
+   * либо напрямую как sub1/sub2/sub3,
+   * либо через сохранённые имена autodear_*.
+   *
+   * Поддерживаем оба варианта, чтобы не менять
+   * уже сохранённый Postback в кабинете Pampadu.
+   */
+  const userId =
+    first(raw.sub1) ||
+    first(raw.autodear_user_id);
+
+  const carId =
+    first(raw.sub2) ||
+    first(raw.autodear_car_id);
+
+  const osagoSessionId =
+    first(raw.sub3) ||
+    first(raw.autodear_osago_session_id);
 
   const providerOrderId = first(
     raw.order_id ||
