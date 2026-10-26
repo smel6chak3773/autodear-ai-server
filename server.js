@@ -30337,6 +30337,111 @@ app.post(
  * Старый multipart endpoint ниже НЕ изменяется.
  * DELETE endpoint НЕ изменяется.
  */
+
+/*
+ * STAFF PHOTO DIRECT STORAGE V1
+ *
+ * Авторизованная выдача подписанного URL для
+ * прямой загрузки фотографий СТО в Supabase.
+ *
+ * Сам файл через Render не передаётся.
+ */
+app.post(
+  "/api/business-directory/staff/listings/photo-upload-url",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(500).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const { user } =
+        await requireBusinessDirectoryStaffUser(req);
+
+      const userId = String(user?.id || "").trim();
+
+      if (!userId) {
+        return res.status(401).json({
+          ok: false,
+          error: "AUTH_REQUIRED",
+        });
+      }
+
+      const mimeType = String(
+        req.body?.mimeType || "image/jpeg"
+      ).trim().toLowerCase();
+
+      const extensions = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+      };
+
+      const extension = extensions[mimeType];
+
+      if (!extension) {
+        return res.status(415).json({
+          ok: false,
+          error: "STAFF_BUSINESS_PHOTO_TYPE_UNSUPPORTED",
+        });
+      }
+
+      const safeUserId =
+        userId.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+      const storageBucket = "business-photos";
+
+      const storagePath =
+        `${safeUserId}/staff_directory_${Date.now()}_${crypto.randomBytes(8).toString("hex")}.${extension}`;
+
+      const { data, error } = await supabase.storage
+        .from(storageBucket)
+        .createSignedUploadUrl(storagePath);
+
+      if (error || !data?.token) {
+        console.error(
+          "[AUTODEAR][STAFF_PHOTO_SIGNED][CREATE_ERROR]",
+          error?.message || "TOKEN_MISSING"
+        );
+
+        return res.status(502).json({
+          ok: false,
+          error: "STAFF_PHOTO_SIGNED_URL_FAILED",
+        });
+      }
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_SIGNED][CREATED]",
+        JSON.stringify({
+          storageBucket,
+          storagePath,
+        })
+      );
+
+      return res.json({
+        ok: true,
+        storageBucket,
+        storagePath,
+        token: data.token,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][STAFF_PHOTO_SIGNED][FATAL]",
+        error?.message || String(error)
+      );
+
+      return res.status(
+        Number(error?.statusCode || 500)
+      ).json({
+        ok: false,
+        error: error?.message || "STAFF_PHOTO_SIGNED_URL_FAILED",
+      });
+    }
+  }
+);
+
 app.post(
   "/api/business-directory/staff/listings/photo-binary",
     (req, res, next) => {
@@ -32374,21 +32479,80 @@ app.post(
             ? req.body.gallery
             : [];
 
+      /*
+       * STAFF_GALLERY_SECURITY_V1
+       * Only accept images uploaded to this staff user's
+       * own business-photos directory.
+       */
+      const staffPhotoPrefix =
+        String(user.id || "")
+          .replace(/[^a-zA-Z0-9_-]/g, "_") +
+        "/staff_directory_";
+
+      const validateStaffPhotoUrl = (value) => {
+        const normalized =
+          normalizeBusinessListingPhotoUrl(value);
+
+        if (!normalized) {
+          return null;
+        }
+
+        try {
+          const parsed = new URL(normalized);
+          const prefix =
+            "/storage/v1/object/public/business-photos/";
+
+          if (!parsed.pathname.startsWith(prefix)) {
+            return null;
+          }
+
+          const objectPath =
+            decodeURIComponent(
+              parsed.pathname.slice(prefix.length)
+            );
+
+          if (
+            !objectPath.startsWith(staffPhotoPrefix) ||
+            objectPath.includes("..") ||
+            objectPath.includes("\\")
+          ) {
+            return null;
+          }
+
+          return normalized;
+        } catch {
+          return null;
+        }
+      };
+
+      const requestedStaffGallery = [
+        ...(photoUrl ? [photoUrl] : []),
+        ...incomingStaffGallery,
+      ]
+        .map((item) => String(item || "").trim())
+        .filter(Boolean);
+
+      const validatedStaffGallery =
+        requestedStaffGallery.map(
+          validateStaffPhotoUrl
+        );
+
+      if (
+        validatedStaffGallery.some(
+          (item) => !item
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "BUSINESS_LISTING_GALLERY_INVALID",
+          message:
+            "Фотографии должны быть загружены в хранилище AUTODEAR.",
+        });
+      }
+
       const staffGallery =
         Array.from(
-          new Set(
-            [
-              ...(photoUrl
-                ? [photoUrl]
-                : []),
-              ...incomingStaffGallery,
-            ]
-              .map(
-                (item) =>
-                  String(item || "").trim()
-              )
-              .filter(Boolean)
-          )
+          new Set(validatedStaffGallery)
         ).slice(0, 20);
 
       const stationPayload = {
