@@ -30357,8 +30357,20 @@ app.post(
         });
       }
 
+      // STAFF_PHOTO_SIGN_TRACE_V1
+      const signStartedAt = Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_SIGNED][AUTH_BEGIN]"
+      );
+
       const { user } =
         await requireBusinessDirectoryStaffUser(req);
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_SIGNED][AUTH_OK]",
+        Date.now() - signStartedAt
+      );
 
       const userId = String(user?.id || "").trim();
 
@@ -30396,9 +30408,20 @@ app.post(
       const storagePath =
         `${safeUserId}/staff_directory_${Date.now()}_${crypto.randomBytes(8).toString("hex")}.${extension}`;
 
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_SIGNED][STORAGE_BEGIN]",
+        Date.now() - signStartedAt
+      );
+
       const { data, error } = await supabase.storage
         .from(storageBucket)
         .createSignedUploadUrl(storagePath);
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_SIGNED][STORAGE_DONE]",
+        Date.now() - signStartedAt,
+        error?.message || "OK"
+      );
 
       if (error || !data?.token) {
         console.error(
