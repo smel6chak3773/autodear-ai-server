@@ -29689,7 +29689,7 @@ function scoreBusinessListingCandidate(
     rowPhone &&
     wantedPhone === rowPhone
   ) {
-    score += 70;
+    score += 25;
     reasons.push(
       "Совпадает телефон"
     );
@@ -29711,7 +29711,7 @@ function scoreBusinessListingCandidate(
     rowAddress &&
     wantedAddress === rowAddress
   ) {
-    score += 50;
+    score += 35;
     reasons.push(
       "Совпадает адрес"
     );
@@ -29733,7 +29733,7 @@ function scoreBusinessListingCandidate(
     rowCity &&
     wantedCity === rowCity
   ) {
-    score += 10;
+    score += 5;
     reasons.push(
       "Совпадает город"
     );
@@ -29783,6 +29783,48 @@ function scoreBusinessListingCandidate(
   }
 
 
+
+  /*
+   * STAFF_DUPLICATE_CONTEXT_V1
+   * Address or phone alone does not prove duplication.
+   */
+  const sameName =
+    Boolean(wantedName && rowName) &&
+    wantedName === rowName;
+
+  const similarName =
+    Boolean(wantedName && rowName) &&
+    (
+      sameName ||
+      (
+        Math.min(wantedName.length, rowName.length) >= 5 &&
+        (
+          wantedName.includes(rowName) ||
+          rowName.includes(wantedName)
+        )
+      )
+    );
+
+  const sameAddress =
+    Boolean(wantedAddress && rowAddress) &&
+    wantedAddress === rowAddress;
+
+  const samePhone =
+    Boolean(wantedPhone && rowPhone) &&
+    wantedPhone === rowPhone;
+
+  const cityCompatible =
+    !wantedCity ||
+    !rowCity ||
+    wantedCity === rowCity;
+
+  const blockingDuplicate =
+    cityCompatible &&
+    (
+      (sameName && sameAddress) ||
+      (similarName && sameAddress && samePhone)
+    );
+
   return {
     id:
       row?.id || null,
@@ -29821,6 +29863,8 @@ function scoreBusinessListingCandidate(
     createdSource:
       row?.created_source ||
       null,
+
+    blockingDuplicate,
 
     matchScore:
       score,
@@ -31659,6 +31703,111 @@ app.post(
 );
 
 
+
+/*
+ * STAFF_CREATE_RESULT_ENDPOINT_V1
+ * Authenticated recovery of a staff listing creation result.
+ */
+app.get(
+  "/api/business-directory/staff/listings/create-result/:requestId",
+  async (req, res) => {
+    try {
+      if (!supabase) {
+        return res.status(503).json({
+          ok: false,
+          error: "SUPABASE_NOT_CONFIGURED",
+        });
+      }
+
+      const { user } =
+        await requireBusinessDirectoryStaffUser(req);
+
+      const requestId =
+        String(req.params.requestId || "").trim();
+
+      if (
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "STAFF_CREATE_REQUEST_ID_INVALID",
+        });
+      }
+
+      const { data: station, error } =
+        await supabase
+          .from("stations")
+          .select(
+            "id,name,address,city,phone,directions,services,photo_url,gallery,ownership_status,created_at,staff_create_completed_at"
+          )
+          .eq("staff_create_request_id", requestId)
+          .eq("created_by_user_id", user.id)
+          .maybeSingle();
+
+      if (error) {
+        console.error(
+          "[AUTODEAR][STAFF_CREATE][RESULT_LOOKUP_ERROR]",
+          error
+        );
+
+        return res.status(503).json({
+          ok: false,
+          error: "STAFF_CREATE_RESULT_UNAVAILABLE",
+        });
+      }
+
+      if (!station) {
+        return res.status(404).json({
+          ok: false,
+          pendingVerification: true,
+          error: "STAFF_CREATE_NOT_FOUND",
+        });
+      }
+
+      if (!station.staff_create_completed_at) {
+        return res.status(202).json({
+          ok: false,
+          pendingVerification: true,
+          listing: {
+            id: station.id,
+            name: station.name,
+          },
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        recovered: true,
+        listing: {
+          id: station.id,
+          name: station.name,
+          address: station.address,
+          city: station.city,
+          phone: station.phone,
+          directions: station.directions || [],
+          services: station.services || [],
+          photoUrl: station.photo_url || null,
+          gallery: station.gallery || [],
+          ownershipStatus: station.ownership_status,
+          createdAt: station.created_at,
+        },
+      });
+    } catch (error) {
+      const status = Number(error?.statusCode || 500);
+
+      console.error(
+        "[AUTODEAR][STAFF_CREATE][RESULT_FATAL]",
+        error
+      );
+
+      return res.status(status).json({
+        ok: false,
+        error: "STAFF_CREATE_RESULT_FAILED",
+      });
+    }
+  }
+);
+
 /*
  * Staff creates a public ownerless business listing.
  *
@@ -31788,6 +31937,27 @@ app.post(
         !Array.isArray(req.body)
           ? req.body
           : {};
+
+      /*
+       * STAFF_CREATE_REQUEST_ID_V1
+       * Client-generated UUID for safe creation retries.
+       */
+      const staffCreateRequestId =
+        String(body?.requestId || "").trim();
+
+      if (
+        staffCreateRequestId &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          staffCreateRequestId
+        )
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "STAFF_CREATE_REQUEST_ID_INVALID",
+          message: "Некорректный идентификатор операции.",
+        });
+      }
+
 
       const name =
         String(
@@ -32385,6 +32555,82 @@ app.post(
       }
 
 
+
+      /*
+       * STAFF_CREATE_IDEMPOTENCY_LOOKUP_V1
+       *
+       * A retry with the same requestId must never
+       * create a second station.
+       */
+      if (staffCreateRequestId) {
+        const {
+          data: existingStation,
+          error: existingLookupError,
+        } = await supabase
+          .from("stations")
+          .select(
+            "id,name,address,city,phone,directions,services,photo_url,gallery,ownership_status,created_at,created_by_user_id,staff_create_completed_at"
+          )
+          .eq(
+            "staff_create_request_id",
+            staffCreateRequestId
+          )
+          .maybeSingle();
+
+        if (existingLookupError) {
+          console.error(
+            "[AUTODEAR][STAFF_CREATE][IDEMPOTENCY_LOOKUP_ERROR]",
+            existingLookupError
+          );
+
+          return res.status(503).json({
+            ok: false,
+            error: "STAFF_CREATE_RESULT_UNAVAILABLE",
+          });
+        }
+
+        if (existingStation) {
+          if (
+            existingStation.created_by_user_id !== user.id
+          ) {
+            return res.status(409).json({
+              ok: false,
+              error: "STAFF_CREATE_REQUEST_CONFLICT",
+            });
+          }
+
+          if (existingStation.staff_create_completed_at) {
+            return res.status(200).json({
+              ok: true,
+              recovered: true,
+              listing: {
+                id: existingStation.id,
+                name: existingStation.name,
+                address: existingStation.address,
+                city: existingStation.city,
+                phone: existingStation.phone,
+                directions: existingStation.directions || [],
+                services: existingStation.services || [],
+                photoUrl: existingStation.photo_url || null,
+                gallery: existingStation.gallery || [],
+                ownershipStatus: existingStation.ownership_status,
+                createdAt: existingStation.created_at,
+              },
+            });
+          }
+
+          return res.status(202).json({
+            ok: false,
+            pendingVerification: true,
+            listing: {
+              id: existingStation.id,
+              name: existingStation.name,
+              address: existingStation.address,
+            },
+          });
+        }
+      }
+
       /*
        * Проверка выполняется ДО INSERT.
        *
@@ -32420,10 +32666,7 @@ app.post(
       const blockingDuplicates =
         duplicateCandidates.filter(
           (item) =>
-            Number(
-              item.matchScore ||
-              0
-            ) >= 70
+            item.blockingDuplicate === true
         );
 
       if (
@@ -32579,6 +32822,10 @@ app.post(
         ).slice(0, 20);
 
       const stationPayload = {
+        ...(staffCreateRequestId
+          ? { staff_create_request_id: staffCreateRequestId }
+          : {}),
+
         /*
          * STAFF_STATION_EXPLICIT_ID_V1
          *
@@ -32727,6 +32974,66 @@ app.post(
       );
 
       if (stationError) {
+        /*
+         * STAFF_CREATE_RACE_RECOVERY_V1
+         * Concurrent requests with the same operation UUID.
+         */
+        if (
+          staffCreateRequestId &&
+          stationError.code === "23505"
+        ) {
+          const {
+            data: concurrentStation,
+            error: concurrentLookupError,
+          } = await supabase
+            .from("stations")
+            .select(
+              "id,name,address,city,phone,directions,services,photo_url,gallery,ownership_status,created_at,created_by_user_id,staff_create_completed_at"
+            )
+            .eq(
+              "staff_create_request_id",
+              staffCreateRequestId
+            )
+            .maybeSingle();
+
+          if (
+            !concurrentLookupError &&
+            concurrentStation &&
+            concurrentStation.created_by_user_id === user.id
+          ) {
+            if (concurrentStation.staff_create_completed_at) {
+              return res.status(200).json({
+                ok: true,
+                recovered: true,
+                listing: {
+                  id: concurrentStation.id,
+                  name: concurrentStation.name,
+                  address: concurrentStation.address,
+                  city: concurrentStation.city,
+                  phone: concurrentStation.phone,
+                  directions: concurrentStation.directions || [],
+                  services: concurrentStation.services || [],
+                  photoUrl: concurrentStation.photo_url || null,
+                  gallery: concurrentStation.gallery || [],
+                  ownershipStatus: concurrentStation.ownership_status,
+                  createdAt: concurrentStation.created_at,
+                },
+              });
+            }
+
+            return res.status(202).json({
+              ok: false,
+              pendingVerification: true,
+              listing: {
+                id: concurrentStation.id,
+                name: concurrentStation.name,
+                address: concurrentStation.address,
+              },
+            });
+          }
+        }
+
+
         console.error(
           "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_STATION_ERROR]",
           JSON.stringify({
@@ -32883,6 +33190,34 @@ app.post(
        *
        * No confirmation code is generated at card creation time.
        */
+      /*
+       * STAFF_CREATE_COMPLETION_V1
+       * Mark completed only after station services are saved.
+       */
+      if (staffCreateRequestId) {
+        const { error: completionError } = await supabase
+          .from("stations")
+          .update({
+            staff_create_completed_at: new Date().toISOString(),
+          })
+          .eq("id", station.id)
+          .eq("staff_create_request_id", staffCreateRequestId)
+          .eq("created_by_user_id", user.id);
+
+        if (completionError) {
+          console.error(
+            "[AUTODEAR][STAFF_CREATE][COMPLETION_ERROR]",
+            completionError
+          );
+
+          return res.status(503).json({
+            ok: false,
+            error: "STAFF_CREATE_COMPLETION_UNCONFIRMED",
+            pendingVerification: true,
+          });
+        }
+      }
+
       markStaffBusinessListingCreateDiagnostic(
         diagnosticRequestId,
         diagnosticStartedAt,
