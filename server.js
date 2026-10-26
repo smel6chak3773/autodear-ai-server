@@ -30340,6 +30340,42 @@ app.post(
 app.post(
   "/api/business-directory/staff/listings/photo-binary",
     (req, res, next) => {
+      const requestStartedAt = Date.now();
+
+      console.log(
+        "[AUTODEAR][STAFF_PHOTO_BINARY][HTTP_ARRIVED]",
+        JSON.stringify({
+          method: req.method,
+          contentType: req.headers["content-type"] || null,
+          contentLength: req.headers["content-length"] || null,
+          transferEncoding: req.headers["transfer-encoding"] || null,
+        })
+      );
+
+      res.once("finish", () => {
+        console.log(
+          "[AUTODEAR][STAFF_PHOTO_BINARY][HTTP_FINISHED]",
+          JSON.stringify({
+            status: res.statusCode,
+            elapsedMs: Date.now() - requestStartedAt,
+          })
+        );
+      });
+
+      res.once("close", () => {
+        if (!res.writableFinished) {
+          console.warn(
+            "[AUTODEAR][STAFF_PHOTO_BINARY][HTTP_CLOSED]",
+            JSON.stringify({
+              elapsedMs: Date.now() - requestStartedAt,
+            })
+          );
+        }
+      });
+
+      next();
+    },
+    (req, res, next) => {
       const contentType =
         String(
           req.headers?.["content-type"] || ""
