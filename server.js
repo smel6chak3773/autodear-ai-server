@@ -32822,6 +32822,15 @@ app.post(
         ).slice(0, 20);
 
       const stationPayload = {
+        // AUTODEAR_DIRECTOR_CARD_EDITOR_V1: do not fabricate service description or experience.
+        description: String(body.description || "").trim().slice(0, 2000),
+        experience_years:
+          body.experienceYears == null || body.experienceYears === ""
+            ? null
+            : Number.isInteger(Number(body.experienceYears)) &&
+              Number(body.experienceYears) >= 1 && Number(body.experienceYears) <= 150
+              ? Number(body.experienceYears) : null,
+
         ...(staffCreateRequestId
           ? { staff_create_request_id: staffCreateRequestId }
           : {}),
@@ -33952,6 +33961,8 @@ app.get(
               "city",
               "phone",
               "photo_url",
+              "description",
+              "experience_years",
               "created_source",
               "created_by_user_id",
               "ownership_status",
@@ -34130,6 +34141,8 @@ const {
               photoUrl:
                 station.photo_url ||
                 null,
+              description: station.description || "",
+              experienceYears: station.experience_years ?? null,
 
               ownerId:
                 ownerId ||
@@ -34877,6 +34890,48 @@ app.post(
   }
 );
 
+
+/* AUTODEAR_DIRECTOR_CARD_EDITOR_V1 — staff may edit only unclaimed staff-created cards.
+ * Never changes ownership, reviews, gallery, services, address or schedule.
+ */
+app.patch("/api/business-directory/staff/services/:stationId/profile", async (req, res) => {
+  try {
+    await requireBusinessDirectoryStaffUser(req);
+    const db = getStaffServiceManagementDb();
+    const stationId = String(req.params?.stationId || "").trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(stationId)) {
+      return res.status(400).json({ ok: false, message: "Некорректный ID сервиса." });
+    }
+    const { data: existing, error: findError } = await db.from("stations")
+      .select("id,owner_id,created_source,ownership_status").eq("id", stationId).maybeSingle();
+    if (findError) return res.status(500).json({ ok: false, message: "Не удалось проверить сервис." });
+    if (!existing) return res.status(404).json({ ok: false, message: "Сервис не найден." });
+    if (existing.created_source !== "autodear_staff" || existing.owner_id || existing.ownership_status !== "unclaimed") {
+      return res.status(403).json({ ok: false, message: "Редактирование доступно только для ещё не переданных карточек директора." });
+    }
+    const rawDescription = req.body?.description;
+    const rawYears = req.body?.experienceYears;
+    if (typeof rawDescription !== "string" || rawDescription.trim().length > 2000) {
+      return res.status(400).json({ ok: false, message: "Описание должно быть текстом до 2000 символов." });
+    }
+    const years = rawYears == null || rawYears === "" ? null : Number(rawYears);
+    if (years !== null && (!Number.isInteger(years) || years < 1 || years > 150)) {
+      return res.status(400).json({ ok: false, message: "Стаж работы должен быть от 1 до 150 лет." });
+    }
+    const { data: saved, error: updateError } = await db.from("stations")
+      .update({ description: rawDescription.trim(), experience_years: years })
+      .eq("id", stationId).is("owner_id", null).eq("created_source", "autodear_staff")
+      .eq("ownership_status", "unclaimed").select("id,description,experience_years").maybeSingle();
+    if (updateError) {
+      console.error("[AUTODEAR][STAFF_PROFILE_EDIT]", updateError);
+      return res.status(500).json({ ok: false, message: "Не удалось сохранить описание сервиса." });
+    }
+    if (!saved) return res.status(409).json({ ok: false, message: "Владение сервисом изменилось; обновление отменено." });
+    return res.json({ ok: true, station: { id: saved.id, description: saved.description, experienceYears: saved.experience_years } });
+  } catch (error) {
+    return res.status(Number(error?.statusCode || 500)).json({ ok: false, message: "Недостаточно прав или сервер временно недоступен." });
+  }
+});
 
 /*
  * STAFF_SERVICE_DELETE_V1
