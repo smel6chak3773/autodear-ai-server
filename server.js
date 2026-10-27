@@ -45020,6 +45020,158 @@ app.post("/api/assistant/message", async (req, res) => {
  *
  * Каждый Postback сохраняется в public.osago_sessions.
  */
+
+/*
+ * AUTODEAR_OSAGO_SESSION_START_V1
+ *
+ * Authenticated session creation before Pampadu.
+ * own   -> verified garage car
+ * other -> no garage car
+ *
+ * No bonus awards. No policy creation.
+ */
+app.post(
+  "/api/osago/sessions/start",
+  express.json({ limit: "16kb" }),
+  async (req, res) => {
+    try {
+      if (!supabaseServiceRole) {
+        return res.status(503).json({
+          ok: false,
+          error: "OSAGO_STORAGE_UNAVAILABLE",
+        });
+      }
+
+      const authorization = String(
+        req.headers.authorization || ""
+      );
+
+      const match = authorization.match(
+        /^Bearer\s+(.+)$/i
+      );
+
+      if (!match) {
+        return res.status(401).json({
+          ok: false,
+          error: "AUTH_REQUIRED",
+        });
+      }
+
+      const { data: authData, error: authError } =
+        await supabaseAuth.auth.getUser(match[1]);
+
+      if (authError || !authData?.user?.id) {
+        return res.status(401).json({
+          ok: false,
+          error: "AUTH_INVALID",
+        });
+      }
+
+      const userId = String(authData.user.id);
+      const mode = String(
+        req.body?.mode || ""
+      ).trim();
+
+      const carId = String(
+        req.body?.carId || ""
+      ).trim();
+
+      if (mode !== "own" && mode !== "other") {
+        return res.status(400).json({
+          ok: false,
+          error: "INVALID_PURCHASE_MODE",
+        });
+      }
+
+      if (
+        (mode === "own" && !carId) ||
+        (mode === "other" && carId)
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "INVALID_CAR_FOR_PURCHASE_MODE",
+        });
+      }
+
+      if (mode === "own") {
+        const { data: car, error: carError } =
+          await supabaseServiceRole
+            .from("cars")
+            .select("id")
+            .eq("id", carId)
+            .eq("auth_user_id", userId)
+            .maybeSingle();
+
+        if (carError) {
+          return res.status(500).json({
+            ok: false,
+            error: "OSAGO_CAR_LOOKUP_FAILED",
+          });
+        }
+
+        if (!car) {
+          return res.status(403).json({
+            ok: false,
+            error: "CAR_NOT_OWNED",
+          });
+        }
+      }
+
+      const crypto = require("node:crypto");
+
+      const osagoSessionId =
+        `osago_${crypto.randomUUID()}`;
+
+      const { error: insertError } =
+        await supabaseServiceRole
+          .from("osago_sessions")
+          .insert({
+            id: osagoSessionId,
+            user_id: userId,
+            car_id: mode === "own" ? carId : null,
+            purchase_for: mode,
+            provider: "pampadu",
+            status: "Pending",
+            raw_payload: {
+              autodear_session_origin: "authenticated_start_v1",
+            },
+          });
+
+      if (insertError) {
+        console.error(
+          "[AUTODEAR][OSAGO_SESSION_START][DB_ERROR]",
+          {
+            code: insertError.code || null,
+            message: insertError.message || null,
+          }
+        );
+
+        return res.status(500).json({
+          ok: false,
+          error: "OSAGO_SESSION_CREATE_FAILED",
+        });
+      }
+
+      return res.status(201).json({
+        ok: true,
+        osagoSessionId,
+        mode,
+        carId: mode === "own" ? carId : null,
+      });
+    } catch (error) {
+      console.error(
+        "[AUTODEAR][OSAGO_SESSION_START][ERROR]",
+        error?.message || String(error)
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "OSAGO_SESSION_START_FAILED",
+      });
+    }
+  }
+);
+
 app.get("/api/integrations/pampadu/postback", async (req, res) => {
   const raw = req.query || {};
 
@@ -45029,6 +45181,34 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
     }
 
     return String(value || "").trim();
+  }
+
+  // AUTODEAR_PAMPADU_POSTBACK_AUTH_V3
+  // Секрет задаётся только на сервере и в кабинете Pampadu.
+  const crypto = require("node:crypto");
+  const expectedSecret = String(
+    process.env.PAMPADU_POSTBACK_SECRET || ""
+  ).trim();
+  const suppliedSecret = first(raw.autodear_key);
+
+  if (!expectedSecret) {
+    return res.status(503).json({
+      ok: false,
+      error: "POSTBACK_AUTH_NOT_CONFIGURED",
+    });
+  }
+
+  const expectedBuffer = Buffer.from(expectedSecret);
+  const suppliedBuffer = Buffer.from(suppliedSecret);
+
+  if (
+    expectedBuffer.length !== suppliedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, suppliedBuffer)
+  ) {
+    return res.status(403).json({
+      ok: false,
+      error: "INVALID_POSTBACK_AUTH",
+    });
   }
 
   function textOrNull(value) {
@@ -45052,7 +45232,9 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
   }
 
   const payload = Object.fromEntries(
-    Object.entries(raw).map(([key, value]) => [
+    Object.entries(raw)
+      .filter(([key]) => key !== "autodear_key")
+      .map(([key, value]) => [
       key,
       Array.isArray(value)
         ? value.map((item) => String(item))
@@ -45134,17 +45316,38 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
     });
   }
 
-  if (!carId || !osagoSessionId) {
-    console.warn(
-      "[AUTODEAR][PAMPADU][POSTBACK_SKIP]",
-      "sub2/sub3 missing"
-    );
-
+  if (!osagoSessionId) {
     return res.status(200).json({
       ok: true,
       saved: false,
-      reason: "MISSING_SUB2_OR_SUB3",
+      reason: "MISSING_SUB3",
     });
+  }
+
+  // Для собственного ОСАГО проверяем принадлежность машины.
+  // Для покупки другому человеку carId отсутствует.
+  if (carId) {
+    const ownership = await supabaseServiceRole
+      .from("cars")
+      .select("id")
+      .eq("id", carId)
+      .eq("auth_user_id", userId)
+      .maybeSingle();
+
+    if (ownership.error) {
+      return res.status(500).json({
+        ok: false,
+        error: "OSAGO_CAR_OWNERSHIP_LOOKUP_FAILED",
+      });
+    }
+
+    if (!ownership.data) {
+      return res.status(200).json({
+        ok: true,
+        saved: false,
+        reason: "CAR_NOT_OWNED_BY_USER",
+      });
+    }
   }
 
   /*
@@ -45160,7 +45363,7 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
   const existingByIdResult =
     await supabaseServiceRole
       .from("osago_sessions")
-      .select("id,raw_payload")
+      .select("id,user_id,car_id,purchase_for,raw_payload")
       .eq("id", osagoSessionId)
       .maybeSingle();
 
@@ -45187,7 +45390,7 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
     const existingByOrderResult =
       await supabaseServiceRole
         .from("osago_sessions")
-        .select("id,raw_payload")
+        .select("id,user_id,car_id,purchase_for,raw_payload")
         .eq("order_id", providerOrderId)
         .maybeSingle();
 
@@ -45211,6 +45414,78 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
     existing = existingByOrderResult.data || null;
   }
 
+  // AUTODEAR_OSAGO_LEGACY_COMPAT_V4
+  // Современные сессии должны быть зарегистрированы сервером.
+  // Старые приложения могут отправлять ID самостоятельно,
+  // но только для собственного проверенного автомобиля.
+  // Проверка секрета и владельца машины выполнена выше.
+  const existingOrigin = String(
+    existing?.raw_payload?.autodear_session_origin || ""
+  );
+
+  const isRegisteredOsagoSession =
+    Boolean(existing) &&
+    existingOrigin === "authenticated_start_v1";
+
+  const isLegacyOsagoSession =
+    Boolean(carId) &&
+    (
+      !existing ||
+      existingOrigin === "" ||
+      existingOrigin === "legacy_postback_v1"
+    );
+
+  if (
+    !isRegisteredOsagoSession &&
+    !isLegacyOsagoSession
+  ) {
+    console.warn(
+      "[AUTODEAR][PAMPADU][UNREGISTERED_SESSION]"
+    );
+
+    return res.status(200).json({
+      ok: true,
+      saved: false,
+      reason: "SESSION_NOT_REGISTERED",
+    });
+  }
+
+  // Запрещаем привязку одного заказа к другой сессии.
+  if (String(existing.id) !== osagoSessionId) {
+    return res.status(409).json({
+      ok: false,
+      saved: false,
+      error: "OSAGO_SESSION_MISMATCH",
+    });
+  }
+
+  const expectedMode =
+    carId ? "own" : "other";
+
+  if (existing && existing.purchase_for !== expectedMode) {
+    return res.status(409).json({
+      ok: false,
+      saved: false,
+      error: "OSAGO_PURCHASE_MODE_MISMATCH",
+    });
+  }
+
+  // Не разрешаем повторным событиям менять владельца
+  // или автомобиль уже учтённого заказа.
+  if (
+    existing &&
+    (
+      String(existing.user_id || "") !== userId ||
+      String(existing.car_id || "") !== carId
+    )
+  ) {
+    return res.status(409).json({
+      ok: false,
+      saved: false,
+      error: "OSAGO_SESSION_IDENTITY_CONFLICT",
+    });
+  }
+
   const sessionId =
     existing?.id || osagoSessionId;
 
@@ -45220,9 +45495,15 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
       ? existing.raw_payload
       : {};
 
+  // Не позволяем параметрам postback менять
+  // служебный признак серверной регистрации.
   const mergedPayload = {
     ...previousPayload,
     ...payload,
+    autodear_session_origin:
+      isRegisteredOsagoSession
+        ? "authenticated_start_v1"
+        : "legacy_postback_v1",
   };
 
   const now = new Date().toISOString();
@@ -45230,7 +45511,8 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
   const sessionRow = {
     id: sessionId,
     user_id: userId,
-    car_id: carId,
+    car_id: carId || null,
+    purchase_for: carId ? "own" : "other",
     provider: "pampadu",
 
     offer_id:
