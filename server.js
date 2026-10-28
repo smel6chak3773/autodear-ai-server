@@ -27133,6 +27133,28 @@ app.post(
 // but must never create money locally.
 // ============================================================
 
+// V35.37: read access ONLY for a business linked by a verified password flow.
+// Never allow personal-wallet access via account_links; never grant charge rights.
+async function canReadLinkedBusinessWalletV3537(authUserId, walletOwnerId) {
+  if (!supabase || !authUserId || !walletOwnerId) return false;
+  const { data: ownedBusinesses, error: businessError } = await supabase
+    .from("business_accounts").select("id")
+    .eq("auth_user_id", walletOwnerId);
+  if (businessError || !Array.isArray(ownedBusinesses) || !ownedBusinesses.length) return false;
+  const allowedIds = ownedBusinesses.map((row) => String(row.id)).filter(Boolean);
+  if (!allowedIds.length) return false;
+  const { data: verifiedLinks, error: linkError } = await supabase
+    .from("account_links")
+    .select("id")
+    .eq("owner_auth_user_id", authUserId)
+    .eq("linked_auth_user_id", walletOwnerId)
+    .eq("link_type", "business")
+    .not("verified_at", "is", null)
+    .in("business_id", allowedIds)
+    .limit(1);
+  return !linkError && Array.isArray(verifiedLinks) && verifiedLinks.length > 0;
+}
+
 app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
@@ -27180,7 +27202,10 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
      * Финансовые данные доступны только
      * владельцу текущей авторизованной сессии.
      */
-    if (ownerId !== authUserId) {
+    const allowedLinkedReadV3537 = walletType === "business" && ownerId !== authUserId
+      ? await canReadLinkedBusinessWalletV3537(authUserId, ownerId)
+      : false;
+    if (ownerId !== authUserId && !allowedLinkedReadV3537) {
       console.warn(
         "[AUTODEAR][WALLET][GET_OWNER_MISMATCH]",
         {
