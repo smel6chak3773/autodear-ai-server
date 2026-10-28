@@ -27143,6 +27143,9 @@ async function canReadLinkedBusinessWalletV3537(authUserId, walletOwnerId) {
   if (businessError || !Array.isArray(ownedBusinesses) || !ownedBusinesses.length) return false;
   const allowedIds = ownedBusinesses.map((row) => String(row.id)).filter(Boolean);
   if (!allowedIds.length) return false;
+  // Legacy verified account_links can store the owner's Auth UUID in business_id.
+  // The owner and link are also checked below; this is NOT a general owner bypass.
+  const permittedBusinessKeysV3541 = [...new Set([...allowedIds, String(walletOwnerId)])];
   const { data: verifiedLinks, error: linkError } = await supabase
     .from("account_links")
     .select("id")
@@ -27150,7 +27153,7 @@ async function canReadLinkedBusinessWalletV3537(authUserId, walletOwnerId) {
     .eq("linked_auth_user_id", walletOwnerId)
     .eq("link_type", "business")
     .not("verified_at", "is", null)
-    .in("business_id", allowedIds)
+    .in("business_id", permittedBusinessKeysV3541)
     .limit(1);
   return !linkError && Array.isArray(verifiedLinks) && verifiedLinks.length > 0;
 }
