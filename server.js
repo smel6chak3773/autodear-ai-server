@@ -2284,6 +2284,44 @@ app.get(
     }
 
     try {
+      // AUTODEAR_REFERRAL_WORKSPACE_SERVER_V3546
+      // Never trust UI role, supplied owner UUID or email as authorization.
+      const requestedBusinessIdV3546 = String(req.query?.businessWorkspaceId || "").trim();
+      let referralOwnerAuthIdV3546 = authUserId;
+      if (requestedBusinessIdV3546) {
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedBusinessIdV3546)) {
+          return res.status(400).json({ ok: false, error: "REFERRAL_WORKSPACE_ID_INVALID" });
+        }
+        const { data: businessV3546, error: businessErrorV3546 } =
+          await supabaseServiceRole.from("business_accounts")
+            .select("id,auth_user_id")
+            .eq("id", requestedBusinessIdV3546).maybeSingle();
+        if (businessErrorV3546) {
+          return res.status(503).json({ ok: false, error: "REFERRAL_WORKSPACE_LOOKUP_FAILED" });
+        }
+        const originalOwnerV3546 = String(businessV3546?.auth_user_id || "").trim();
+        if (!originalOwnerV3546) {
+          return res.status(404).json({ ok: false, error: "REFERRAL_WORKSPACE_NOT_FOUND" });
+        }
+        if (originalOwnerV3546 !== authUserId) {
+          const { data: verifiedLinksV3546, error: linkErrorV3546 } =
+            await supabaseServiceRole.from("account_links")
+              .select("id")
+              .eq("owner_auth_user_id", authUserId)
+              .eq("linked_auth_user_id", originalOwnerV3546)
+              .eq("link_type", "business")
+              .not("verified_at", "is", null)
+              .in("business_id", [requestedBusinessIdV3546, originalOwnerV3546])
+              .limit(1);
+          if (linkErrorV3546) {
+            return res.status(503).json({ ok: false, error: "REFERRAL_WORKSPACE_LINK_LOOKUP_FAILED" });
+          }
+          if (!Array.isArray(verifiedLinksV3546) || verifiedLinksV3546.length === 0) {
+            return res.status(403).json({ ok: false, error: "REFERRAL_WORKSPACE_FORBIDDEN" });
+          }
+        }
+        referralOwnerAuthIdV3546 = originalOwnerV3546;
+      }
       const {
         data: profile,
         error: profileError,
@@ -2294,7 +2332,7 @@ app.get(
             "id,auth_user_id"
           )
           .or(
-            `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+            `auth_user_id.eq.${referralOwnerAuthIdV3546},id.eq.${referralOwnerAuthIdV3546}`
           )
           .limit(1)
           .maybeSingle();
@@ -2337,11 +2375,27 @@ app.get(
         });
       }
 
+      // Connected business: read the ORIGINAL OWNER's already issued code.
+      // Personal user: leave the legacy RPC path fully unchanged.
+      const {
+        data: referralCodeRowV3546,
+        error: existingCodeErrorV3546,
+      } = (requestedBusinessIdV3546 && referralOwnerAuthIdV3546 !== authUserId)
+        ? await supabaseServiceRole.from("user_referral_codes")
+            .select("code").eq("profile_id", profileId).maybeSingle()
+        : { data: null, error: null };
+      if (existingCodeErrorV3546) {
+        return res.status(503).json({ ok: false, error: "REFERRAL_EXISTING_CODE_LOOKUP_FAILED" });
+      }
+      if (requestedBusinessIdV3546 && referralOwnerAuthIdV3546 !== authUserId && !referralCodeRowV3546?.code) {
+        return res.status(404).json({ ok: false, error: "REFERRAL_BUSINESS_OWNER_CODE_NOT_FOUND" });
+      }
       const {
         data: referralCode,
         error: referralCodeError,
-      } =
-        await supabaseServiceRole
+      } = (requestedBusinessIdV3546 && referralOwnerAuthIdV3546 !== authUserId)
+        ? { data: referralCodeRowV3546.code, error: null }
+        : await supabaseServiceRole
           .rpc(
             "autodear_ensure_referral_code",
             {
