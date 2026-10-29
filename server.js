@@ -30796,6 +30796,16 @@ function normalizeBusinessListingPhotoUrl(
 let latestStaffBusinessListingCreateDiagnostic =
   null;
 
+// AUTODEAR_STAFF_DIAGNOSTIC_HISTORY_V3560E
+// Only technical metadata. No tokens, addresses, phones or photos.
+const staffCreateDiagnosticsV3560E = new Map();
+const STAFF_CREATE_DIAG_LIMIT_V3560E = 30;
+
+function getStaffCreateDiagnosticV3560E(requestId) {
+  return staffCreateDiagnosticsV3560E.get(requestId) || null;
+}
+
+
 
 function markStaffBusinessListingCreateDiagnostic(
   requestId,
@@ -30806,7 +30816,11 @@ function markStaffBusinessListingCreateDiagnostic(
   const now =
     Date.now();
 
+  const previousV3560E =
+    getStaffCreateDiagnosticV3560E(requestId);
+
   latestStaffBusinessListingCreateDiagnostic = {
+    ...(previousV3560E || {}),
     requestId,
     stage,
 
@@ -30826,6 +30840,21 @@ function markStaffBusinessListingCreateDiagnostic(
 
     ...extra,
   };
+
+  staffCreateDiagnosticsV3560E.delete(requestId);
+  staffCreateDiagnosticsV3560E.set(
+    requestId,
+    { ...latestStaffBusinessListingCreateDiagnostic }
+  );
+
+  while (
+    staffCreateDiagnosticsV3560E.size >
+    STAFF_CREATE_DIAG_LIMIT_V3560E
+  ) {
+    const oldest = staffCreateDiagnosticsV3560E.keys().next().value;
+    if (oldest === undefined) break;
+    staffCreateDiagnosticsV3560E.delete(oldest);
+  }
 
   console.log(
     "[AUTODEAR][BUSINESS_DIRECTORY][STAFF_CREATE_DIAG]",
@@ -32691,11 +32720,7 @@ app.post(
           true;
 
         const previousDiagnostic =
-          latestStaffBusinessListingCreateDiagnostic
-            ?.requestId ===
-          diagnosticRequestId
-            ? latestStaffBusinessListingCreateDiagnostic
-            : null;
+          getStaffCreateDiagnosticV3560E(diagnosticRequestId);
 
         markStaffBusinessListingCreateDiagnostic(
           diagnosticRequestId,
@@ -34216,6 +34241,34 @@ const stationPayload = {
  *
  * Remove after the release blocker is diagnosed.
  */
+// AUTODEAR_STAFF_DIAGNOSTIC_HISTORY_V3560E
+// Authenticated director/staff diagnostics; never expose forms or tokens.
+app.get(
+  "/api/business-directory/staff/listings/diagnostics/history",
+  async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      await requireBusinessDirectoryStaffUser(req);
+
+      const history = Array.from(
+        staffCreateDiagnosticsV3560E.values()
+      ).reverse();
+
+      return res.json({
+        ok: true,
+        count: history.length,
+        diagnostics: history
+      });
+    } catch (error) {
+      const code = Number(error?.status || error?.statusCode);
+      return res.status(code === 403 ? 403 : 401).json({
+        ok: false,
+        error: "STAFF_DIAGNOSTICS_UNAUTHORIZED"
+      });
+    }
+  }
+);
+
 app.get(
   "/api/business-directory/staff/listings/diagnostics/latest",
   (req, res) => {
