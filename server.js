@@ -27597,8 +27597,13 @@ app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
     else if (
       taxonomy === 'transport.trucks' ||
       taxonomy.startsWith('transport.special.') ||
-      vehicle === 'trucks' ||
-      vehicle === 'special' ||
+      [
+        'trucks',
+        'special',
+        'грузовая техника',
+        'грузовик',
+        'спецтехника'
+      ].includes(vehicle) ||
       trailer.includes('полуприцеп') ||
       category === 'business_sale' ||
       category === 'services'
@@ -27684,7 +27689,7 @@ app.post(
     }
 
     if (
-      process.env.AUTODEAR_PROMOTION_PURCHASE_V3550_ENABLED !== '1'
+      true /* AUTODEAR_V3550K_PURCHASE_HARD_OFF */
     ) {
       return res.status(503).json({
         ok: false,
@@ -27932,7 +27937,7 @@ app.put('/api/director/pricing-config', async (req, res) => {
       });
     }
 
-    if (process.env.AUTODEAR_DIRECTOR_PRICING_V3550_ENABLED !== '1') {
+    if (true /* AUTODEAR_V3550K_PRICING_HARD_OFF */) {
       return res.status(503).json({
         ok: false,
         error: 'DIRECTOR_PRICING_NOT_ENABLED'
