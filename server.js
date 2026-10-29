@@ -2284,6 +2284,44 @@ app.get(
     }
 
     try {
+      // AUTODEAR_REFERRAL_WORKSPACE_SERVER_V3546
+      // Never trust UI role, supplied owner UUID or email as authorization.
+      const requestedBusinessIdV3546 = String(req.query?.businessWorkspaceId || "").trim();
+      let referralOwnerAuthIdV3546 = authUserId;
+      if (requestedBusinessIdV3546) {
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedBusinessIdV3546)) {
+          return res.status(400).json({ ok: false, error: "REFERRAL_WORKSPACE_ID_INVALID" });
+        }
+        const { data: businessV3546, error: businessErrorV3546 } =
+          await supabaseServiceRole.from("business_accounts")
+            .select("id,auth_user_id")
+            .eq("id", requestedBusinessIdV3546).maybeSingle();
+        if (businessErrorV3546) {
+          return res.status(503).json({ ok: false, error: "REFERRAL_WORKSPACE_LOOKUP_FAILED" });
+        }
+        const originalOwnerV3546 = String(businessV3546?.auth_user_id || "").trim();
+        if (!originalOwnerV3546) {
+          return res.status(404).json({ ok: false, error: "REFERRAL_WORKSPACE_NOT_FOUND" });
+        }
+        if (originalOwnerV3546 !== authUserId) {
+          const { data: verifiedLinksV3546, error: linkErrorV3546 } =
+            await supabaseServiceRole.from("account_links")
+              .select("id")
+              .eq("owner_auth_user_id", authUserId)
+              .eq("linked_auth_user_id", originalOwnerV3546)
+              .eq("link_type", "business")
+              .not("verified_at", "is", null)
+              .in("business_id", [requestedBusinessIdV3546, originalOwnerV3546])
+              .limit(1);
+          if (linkErrorV3546) {
+            return res.status(503).json({ ok: false, error: "REFERRAL_WORKSPACE_LINK_LOOKUP_FAILED" });
+          }
+          if (!Array.isArray(verifiedLinksV3546) || verifiedLinksV3546.length === 0) {
+            return res.status(403).json({ ok: false, error: "REFERRAL_WORKSPACE_FORBIDDEN" });
+          }
+        }
+        referralOwnerAuthIdV3546 = originalOwnerV3546;
+      }
       const {
         data: profile,
         error: profileError,
@@ -2294,7 +2332,7 @@ app.get(
             "id,auth_user_id"
           )
           .or(
-            `auth_user_id.eq.${authUserId},id.eq.${authUserId}`
+            `auth_user_id.eq.${referralOwnerAuthIdV3546},id.eq.${referralOwnerAuthIdV3546}`
           )
           .limit(1)
           .maybeSingle();
@@ -2337,11 +2375,27 @@ app.get(
         });
       }
 
+      // Connected business: read the ORIGINAL OWNER's already issued code.
+      // Personal user: leave the legacy RPC path fully unchanged.
+      const {
+        data: referralCodeRowV3546,
+        error: existingCodeErrorV3546,
+      } = (requestedBusinessIdV3546 && referralOwnerAuthIdV3546 !== authUserId)
+        ? await supabaseServiceRole.from("user_referral_codes")
+            .select("code").eq("profile_id", profileId).maybeSingle()
+        : { data: null, error: null };
+      if (existingCodeErrorV3546) {
+        return res.status(503).json({ ok: false, error: "REFERRAL_EXISTING_CODE_LOOKUP_FAILED" });
+      }
+      if (requestedBusinessIdV3546 && referralOwnerAuthIdV3546 !== authUserId && !referralCodeRowV3546?.code) {
+        return res.status(404).json({ ok: false, error: "REFERRAL_BUSINESS_OWNER_CODE_NOT_FOUND" });
+      }
       const {
         data: referralCode,
         error: referralCodeError,
-      } =
-        await supabaseServiceRole
+      } = (requestedBusinessIdV3546 && referralOwnerAuthIdV3546 !== authUserId)
+        ? { data: referralCodeRowV3546.code, error: null }
+        : await supabaseServiceRole
           .rpc(
             "autodear_ensure_referral_code",
             {
@@ -7893,6 +7947,8 @@ app.get("/api/business/card", async (req, res) => {
             station.experience_years ||
             0
           ),
+        experienceQualifier:
+          station.experience_qualifier || null,
 
         warrantyDays:
           Number(
@@ -27133,6 +27189,31 @@ app.post(
 // but must never create money locally.
 // ============================================================
 
+// V35.37: read access ONLY for a business linked by a verified password flow.
+// Never allow personal-wallet access via account_links; never grant charge rights.
+async function canReadLinkedBusinessWalletV3537(authUserId, walletOwnerId) {
+  if (!supabase || !authUserId || !walletOwnerId) return false;
+  const { data: ownedBusinesses, error: businessError } = await supabase
+    .from("business_accounts").select("id")
+    .eq("auth_user_id", walletOwnerId);
+  if (businessError || !Array.isArray(ownedBusinesses) || !ownedBusinesses.length) return false;
+  const allowedIds = ownedBusinesses.map((row) => String(row.id)).filter(Boolean);
+  if (!allowedIds.length) return false;
+  // Legacy verified account_links can store the owner's Auth UUID in business_id.
+  // The owner and link are also checked below; this is NOT a general owner bypass.
+  const permittedBusinessKeysV3541 = [...new Set([...allowedIds, String(walletOwnerId)])];
+  const { data: verifiedLinks, error: linkError } = await supabase
+    .from("account_links")
+    .select("id")
+    .eq("owner_auth_user_id", authUserId)
+    .eq("linked_auth_user_id", walletOwnerId)
+    .eq("link_type", "business")
+    .not("verified_at", "is", null)
+    .in("business_id", permittedBusinessKeysV3541)
+    .limit(1);
+  return !linkError && Array.isArray(verifiedLinks) && verifiedLinks.length > 0;
+}
+
 app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
@@ -27180,7 +27261,10 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
      * Финансовые данные доступны только
      * владельцу текущей авторизованной сессии.
      */
-    if (ownerId !== authUserId) {
+    const allowedLinkedReadV3537 = walletType === "business" && ownerId !== authUserId
+      ? await canReadLinkedBusinessWalletV3537(authUserId, ownerId)
+      : false;
+    if (ownerId !== authUserId && !allowedLinkedReadV3537) {
       console.warn(
         "[AUTODEAR][WALLET][GET_OWNER_MISMATCH]",
         {
@@ -27390,6 +27474,654 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
       error:
         error?.message ||
         "WALLET_GET_FATAL",
+    });
+  }
+});
+
+
+// AUTODEAR_V3550B_QUOTE_SERVER_V1
+// Только проверка и расчёт. Денежных операций здесь нет.
+app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
+  const authResult = await resolveAuthenticatedUser(req);
+  const actorId = String(authResult?.user?.id || '').trim();
+
+  if (!actorId)
+    return res.status(401).json({ok:false,error:'AUTH_REQUIRED'});
+
+  if (!supabaseServiceRole)
+    return res.status(503).json({ok:false,error:'SERVICE_ROLE_MISSING'});
+
+  const listingId = String(req.params.listingId || '').trim();
+  const codes = Array.isArray(req.body?.services) ? req.body.services : [];
+  const validCodes = new Set([
+    'raise24h','highlight7days','vip7days','wide7days','turbo7days'
+  ]);
+
+  if (!listingId || listingId.length > 160 ||
+      !codes.length || codes.length > 5 ||
+      codes.some(c => typeof c !== 'string' || !validCodes.has(c)) ||
+      new Set(codes).size !== codes.length) {
+    return res.status(400).json({
+      ok:false,error:'PROMOTION_SELECTION_INVALID'
+    });
+  }
+
+  try {
+    const {data:listing,error:listingError} =
+      await supabaseServiceRole.from('listings')
+        .select('id,owner_id,status,category_id,extra_fields,payload,type')
+        .eq('id',listingId).maybeSingle();
+
+    if (listingError) throw listingError;
+
+    if (!listing)
+      return res.status(404).json({ok:false,error:'LISTING_NOT_FOUND'});
+
+    if (String(listing.status||'').toLowerCase() !== 'active')
+      return res.status(409).json({ok:false,error:'LISTING_NOT_ACTIVE'});
+
+    const ownerId = String(listing.owner_id||'').trim();
+
+    if (!ownerId)
+      return res.status(409).json({ok:false,error:'LISTING_OWNER_MISSING'});
+
+    // Проверяем подтверждённую связь, если объявление чужого бизнеса.
+    if (ownerId !== actorId) {
+      const {data:biz,error:bizErr} =
+        await supabaseServiceRole.from('business_accounts')
+          .select('id').eq('auth_user_id',ownerId);
+
+      if (bizErr) throw bizErr;
+
+      if (!Array.isArray(biz) || !biz.length)
+        return res.status(403).json({
+          ok:false,error:'LINKED_BUSINESS_REQUIRED'
+        });
+
+      const ids = [...new Set([
+        ownerId,
+        ...biz.map(b=>String(b.id))
+      ])];
+
+      const {data:links,error:linkErr} =
+        await supabaseServiceRole.from('account_links')
+          .select('id')
+          .eq('owner_auth_user_id',actorId)
+          .eq('linked_auth_user_id',ownerId)
+          .eq('link_type','business')
+          .not('verified_at','is',null)
+          .in('business_id',ids).limit(1);
+
+      if (linkErr) throw linkErr;
+
+      if (!links?.length)
+        return res.status(403).json({
+          ok:false,error:'LINKED_BUSINESS_FORBIDDEN'
+        });
+    }
+
+    // Источник цен — действующие настройки Supabase.
+    const {data:setting,error:settingsErr} =
+      await supabaseServiceRole.from('app_settings')
+        .select('value')
+        .eq('key','pricing_config').maybeSingle();
+
+    if (settingsErr) throw settingsErr;
+
+    const conf = setting?.value;
+
+    if (!conf || typeof conf !== 'object')
+      return res.status(503).json({
+        ok:false,error:'PROMOTION_PRICE_NOT_CONFIGURED'
+      });
+
+    const p = listing.payload || {};
+    const extra = listing.extra_fields || p.extraFields || {};
+    const norm = v => String(v || '').trim().toLowerCase();
+
+    const category = norm(listing.category_id || p.categoryId);
+    const taxonomy = norm(p.taxonomyId || extra.taxonomyId);
+    const vehicle = norm(extra.vehicleType || p.type);
+    const water = norm(extra.waterType || p.waterType);
+    const trailer = norm(
+      extra.trailerKind || p.trailerKind ||
+      extra.trailerType || p.trailerType
+    );
+
+    let priceClass = 'standard';
+
+    if (water === 'yacht' || water === 'motorboat')
+      priceClass = 'commercial';
+    else if (water)
+      priceClass = 'transport';
+    else if (
+      taxonomy === 'transport.trucks' ||
+      taxonomy.startsWith('transport.special.') ||
+      vehicle === 'trucks' ||
+      vehicle === 'special' ||
+      trailer.includes('полуприцеп') ||
+      category === 'business_sale' ||
+      category === 'services'
+    )
+      priceClass = 'commercial';
+    else if (category === 'transport')
+      priceClass = 'transport';
+
+    const rules = conf.promotionGroups?.[priceClass];
+    const promotion = p.promotion || {};
+
+    const fields = {
+      raise24h:'raiseUntil',
+      highlight7days:'highlightUntil',
+      vip7days:'vipUntil',
+      wide7days:'wideUntil',
+      turbo7days:'turboUntil'
+    };
+
+    const items = [];
+
+    for (const code of codes) {
+      if (Date.parse(String(promotion[fields[code]] || '')) > Date.now())
+        return res.status(409).json({
+          ok:false,error:'PROMOTION_ALREADY_ACTIVE',service:code
+        });
+
+      const price = Number(rules?.[code]?.price);
+      const days = Number(rules?.[code]?.durationDays);
+
+      if (!Number.isSafeInteger(price) ||
+          price <= 0 || price > 10000000 ||
+          !Number.isSafeInteger(days) ||
+          days < 1 || days > 365) {
+        return res.status(503).json({
+          ok:false,error:'PROMOTION_TARIFF_INVALID',service:code
+        });
+      }
+
+      items.push({code,price,durationDays:days});
+    }
+
+    const total = items.reduce((sum,item)=>sum+item.price,0);
+
+    return res.json({
+      ok:true,
+      listingId,
+      ownerId,
+      priceClass,
+      items,
+      total,
+      currency:'RUB',
+      paymentEnabled:false
+    });
+  } catch(error) {
+    console.error('[AUTODEAR][PROMOTION][QUOTE_FAILED_V3550B]', {
+      listingId,
+      message:error?.message || String(error)
+    });
+
+    return res.status(503).json({
+      ok:false,error:'PROMOTION_QUOTE_FAILED'
+    });
+  }
+});
+
+
+// AUTODEAR_V3550D_PURCHASE_SERVER_V1
+// STAGED: оплата выключена по умолчанию.
+// Авторизация определяется только из проверенного JWT.
+
+app.post(
+  '/api/listings/:listingId/promotion/purchase',
+  async (req, res) => {
+    const auth = await resolveAuthenticatedUser(req);
+    const actor = String(auth?.user?.id || '').trim();
+
+    if (!actor) {
+      return res.status(401).json({
+        ok: false,
+        error: 'AUTH_REQUIRED'
+      });
+    }
+
+    if (
+      process.env.AUTODEAR_PROMOTION_PURCHASE_V3550_ENABLED !== '1'
+    ) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_PURCHASE_NOT_ENABLED'
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    const listingId =
+      String(req.params?.listingId || '').trim();
+
+    const operationKey =
+      String(req.body?.operationKey || '').trim();
+
+    const walletType =
+      String(req.body?.walletType || '').trim();
+
+    const services = req.body?.services;
+
+    const valid = new Set([
+      'raise24h',
+      'highlight7days',
+      'vip7days',
+      'wide7days',
+      'turbo7days'
+    ]);
+
+    if (
+      !listingId ||
+      listingId.length > 160 ||
+      !/^listing-promotion:[A-Za-z0-9._:-]{8,192}$/.test(
+        operationKey
+      ) ||
+      !['personal', 'business'].includes(walletType) ||
+      !Array.isArray(services) ||
+      services.length < 1 ||
+      services.length > 5 ||
+      services.some(
+        x => typeof x !== 'string' || !valid.has(x)
+      ) ||
+      new Set(services).size !== services.length
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROMOTION_PURCHASE_REQUEST_INVALID'
+      });
+    }
+
+    try {
+      // Внутри PostgreSQL одной транзакцией:
+      // проверка владельца и связи,
+      // актуальная цена,
+      // списание,
+      // обновление объявления,
+      // сохранение результата операции.
+
+      const { data, error } =
+        await supabaseServiceRole.rpc(
+          'autodear_buy_listing_promotion_v3550',
+          {
+            p_actor_auth_id: actor,
+            p_listing_id: listingId,
+            p_services: services,
+            p_wallet_type: walletType,
+            p_operation_key: operationKey
+          }
+        );
+
+      if (error) {
+        const rawError = String(error.message || '');
+
+        const tag =
+          rawError.match(/PROMOTION_[A-Z_]+/)?.[0] ||
+          'PROMOTION_PURCHASE_FAILED';
+
+        const status =
+          tag.includes('FORBIDDEN') ? 403 :
+          tag.includes('NOT_FOUND') ? 404 :
+          rawError.includes('INSUFFICIENT_FUNDS') ? 409 :
+          (tag.includes('ACTIVE') ||
+           tag.includes('CONFLICT')) ? 409 :
+          tag.includes('INVALID') ? 400 : 503;
+
+        console.error(
+          '[AUTODEAR][PROMOTION][PURCHASE_RPC_ERROR_V3550D]',
+          {
+            tag,
+            pgCode: error.code || null,
+            listingId
+          }
+        );
+
+        return res.status(status).json({
+          ok: false,
+          error: tag
+        });
+      }
+
+      if (
+        !data ||
+        data.ok !== true ||
+        String(data.listingId || '') !== listingId
+      ) {
+        return res.status(503).json({
+          ok: false,
+          error: 'PROMOTION_PURCHASE_RESULT_INVALID'
+        });
+      }
+
+      return res.json(data);
+
+    } catch (error) {
+      console.error(
+        '[AUTODEAR][PROMOTION][PURCHASE_FATAL_V3550D]',
+        {
+          listingId,
+          message: String(error?.message || error)
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_PURCHASE_UNAVAILABLE'
+      });
+    }
+  }
+);
+
+
+// Проверка результата операции БЕЗ списания.
+// Отсутствие записи не доказывает отсутствие
+// старого платежа через прежний кошелёк.
+
+app.get(
+  '/api/listings/:listingId/promotion/order-status',
+  async (req, res) => {
+    const auth = await resolveAuthenticatedUser(req);
+    const actor = String(auth?.user?.id || '').trim();
+
+    if (!actor) {
+      return res.status(401).json({
+        ok: false,
+        error: 'AUTH_REQUIRED'
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    const listingId =
+      String(req.params?.listingId || '').trim();
+
+    const operationKey =
+      String(req.query?.operationKey || '').trim();
+
+    if (
+      !listingId ||
+      listingId.length > 160 ||
+      !/^listing-promotion:[A-Za-z0-9._:-]{8,192}$/.test(
+        operationKey
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROMOTION_STATUS_REQUEST_INVALID'
+      });
+    }
+
+    try {
+      const { data, error } =
+        await supabaseServiceRole
+          .from('listing_promotion_orders_v3550')
+          .select(
+            'listing_id,owner_auth_id,wallet_type,' +
+            'service_codes,total_amount,transaction_id,' +
+            'promotion_snapshot,created_at'
+          )
+          .eq('operation_key', operationKey)
+          .eq('actor_auth_id', actor)
+          .eq('listing_id', listingId)
+          .maybeSingle();
+
+      if (error) throw error;
+
+      if (!data) {
+        return res.json({
+          ok: true,
+          status: 'not_found',
+          listingId
+        });
+      }
+
+      return res.json({
+        ok: true,
+        status: 'completed',
+        listingId,
+        ownerId: data.owner_auth_id,
+        walletType: data.wallet_type,
+        services: data.service_codes,
+        total: data.total_amount,
+        transactionId: data.transaction_id,
+        promotion: data.promotion_snapshot,
+        createdAt: data.created_at
+      });
+
+    } catch (error) {
+      console.error(
+        '[AUTODEAR][PROMOTION][STATUS_FAILED_V3550D]',
+        {
+          listingId,
+          message: String(error?.message || error)
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_STATUS_UNAVAILABLE'
+      });
+    }
+  }
+);
+
+
+// AUTODEAR_V3550G_DIRECTOR_PRICING_API
+// Директорская запись через проверенную серверную роль.
+// Выключена до завершения тестов и обновления клиента.
+app.put('/api/director/pricing-config', async (req, res) => {
+  try {
+    const access = await resolveStaffAccess(req, 'director');
+
+    if (!access.ok) {
+      return res.status(access.status || 403).json({
+        ok: false,
+        error: access.error || 'DIRECTOR_REQUIRED'
+      });
+    }
+
+    if (process.env.AUTODEAR_DIRECTOR_PRICING_V3550_ENABLED !== '1') {
+      return res.status(503).json({
+        ok: false,
+        error: 'DIRECTOR_PRICING_NOT_ENABLED'
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PRICING_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    const config = req.body?.config;
+
+    const plain = value =>
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value);
+
+    const positiveInt = (value, min, max) =>
+      Number.isSafeInteger(value) &&
+      value >= min && value <= max;
+
+    const allowedTop = new Set([
+      'freeListingsLimit',
+      'categories',
+      'promotions',
+      'promotionGroups',
+      'business',
+      'paidFeatures'
+    ]);
+
+    if (
+      !plain(config) ||
+      JSON.stringify(config).length > 60000 ||
+      Object.keys(config).some(key => !allowedTop.has(key)) ||
+      !positiveInt(config.freeListingsLimit, 0, 1000000000)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PRICING_CONFIG_INVALID'
+      });
+    }
+
+    const ruleFields = new Set([
+      'price', 'durationDays',
+      'oldPrice', 'discountEnabled'
+    ]);
+
+    function validRule(rule, paid) {
+      if (!plain(rule)) return false;
+
+      if (Object.keys(rule).some(
+        key => !ruleFields.has(key)
+      )) return false;
+
+      if (!positiveInt(rule.price, paid ? 1 : 0, 10000000))
+        return false;
+
+      if (
+        rule.durationDays !== undefined &&
+        !positiveInt(rule.durationDays, 1, 365)
+      ) return false;
+
+      if (
+        rule.oldPrice !== undefined &&
+        !positiveInt(rule.oldPrice, 0, 10000000)
+      ) return false;
+
+      if (
+        rule.discountEnabled !== undefined &&
+        typeof rule.discountEnabled !== 'boolean'
+      ) return false;
+
+      return true;
+    }
+
+    function validDomain(domain, paid, maxEntries = 100) {
+      return plain(domain) &&
+        Object.keys(domain).length <= maxEntries &&
+        Object.entries(domain).every(([key, rule]) =>
+          /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) &&
+          validRule(rule, paid)
+        );
+    }
+
+    if (
+      !validDomain(config.categories, false) ||
+      !validDomain(config.promotions, true) ||
+      !validDomain(config.business, false) ||
+      !validDomain(config.paidFeatures, false)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PRICING_RULE_INVALID'
+      });
+    }
+
+    const groupNames = [
+      'standard', 'transport', 'commercial'
+    ];
+
+    const services = [
+      'raise24h', 'highlight7days',
+      'vip7days', 'wide7days', 'turbo7days'
+    ];
+
+    const groups = config.promotionGroups;
+
+    if (
+      !plain(groups) ||
+      Object.keys(groups).length !== 3 ||
+      groupNames.some(group =>
+        !plain(groups[group]) ||
+        Object.keys(groups[group]).length !== 5 ||
+        services.some(service =>
+          !validRule(groups[group][service], true) ||
+          !positiveInt(
+            groups[group][service]?.durationDays, 1, 365
+          )
+        )
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROMOTION_GROUPS_INVALID'
+      });
+    }
+
+    const { data: existing, error: readError } =
+      await supabaseServiceRole
+        .from('app_settings')
+        .select('value,updated_at')
+        .eq('key', 'pricing_config')
+        .maybeSingle();
+
+    if (readError || !existing) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PRICING_READ_FAILED'
+      });
+    }
+
+    // Сохраняем поля старой конфигурации,
+    // которых нет в разрешённой схеме.
+    const next = {
+      ...(plain(existing.value) ? existing.value : {}),
+      ...config
+    };
+
+    const { data: saved, error: saveError } =
+      await supabaseServiceRole
+        .from('app_settings')
+        .update({
+          value: next,
+          updated_at: new Date().toISOString()
+        })
+        .eq('key', 'pricing_config')
+        .eq('updated_at', existing.updated_at)
+        .select('updated_at')
+        .maybeSingle();
+
+    if (saveError) throw saveError;
+
+    if (!saved) {
+      return res.status(409).json({
+        ok: false,
+        error: 'PRICING_CHANGED_RELOAD_REQUIRED'
+      });
+    }
+
+    console.log('[AUTODEAR][DIRECTOR][PRICING_SAVED_V3550G]', {
+      actorId: access.actor.authUserId
+    });
+
+    return res.json({
+      ok: true,
+      updatedAt: saved.updated_at
+    });
+
+  } catch (error) {
+    console.error('[AUTODEAR][DIRECTOR][PRICING_ERROR_V3550G]', {
+      message: error?.message || String(error)
+    });
+
+    return res.status(503).json({
+      ok: false,
+      error: 'PRICING_SAVE_FAILED'
     });
   }
 });
@@ -30390,6 +31122,47 @@ app.post(
  *
  * Сам файл через Render не передаётся.
  */
+/* AUTODEAR_STAFF_PHOTO_BATCH_V10
+ * Sign up to two direct storage uploads with one staff auth request.
+ * Backward-compatible: original /photo-upload-url is unchanged.
+ * This endpoint never creates a station, writes a photo or changes ownership.
+ */
+app.post("/api/business-directory/staff/listings/photo-upload-urls", async (req, res) => {
+  const startedAt = Date.now();
+  try {
+    if (!supabase) return res.status(503).json({ ok: false, error: "SUPABASE_NOT_CONFIGURED" });
+    const { user } = await requireBusinessDirectoryStaffUser(req);
+    const userId = String(user?.id || "").trim();
+    if (!userId) return res.status(401).json({ ok: false, error: "AUTH_REQUIRED" });
+    const mimeTypes = req.body?.mimeTypes;
+    const extensions = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+    if (!Array.isArray(mimeTypes) || mimeTypes.length !== 2 ||
+        !mimeTypes.every((type) => typeof type === "string" && Object.prototype.hasOwnProperty.call(extensions, type))) {
+      return res.status(400).json({ ok: false, error: "INVALID_PHOTO_TYPES" });
+    }
+    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const paths = mimeTypes.map((type) =>
+      `${safeUserId}/staff_directory_${Date.now()}_${crypto.randomBytes(8).toString("hex")}.${extensions[type]}`
+    );
+    const signed = await Promise.all(paths.map((path) =>
+      supabase.storage.from("business-photos").createSignedUploadUrl(path)
+    ));
+    if (signed.some((item) => item?.error || !item?.data?.token)) {
+      console.error("[AUTODEAR][STAFF_PHOTO_BATCH_V10][SIGN_FAILED]", { elapsedMs: Date.now() - startedAt });
+      return res.status(502).json({ ok: false, error: "STAFF_PHOTO_SIGNED_URL_FAILED" });
+    }
+    console.log("[AUTODEAR][STAFF_PHOTO_BATCH_V10][SUCCESS]", {
+      elapsedMs: Date.now() - startedAt, count: paths.length
+    });
+    return res.json({ ok: true, uploads: signed.map((item, i) => ({
+      storageBucket: "business-photos", storagePath: paths[i], token: item.data.token
+    })) });
+  } catch (error) {
+    console.error("[AUTODEAR][STAFF_PHOTO_BATCH_V10][FATAL]", error?.message || String(error));
+    return res.status(Number(error?.statusCode || 500)).json({ ok: false, error: "STAFF_PHOTO_BATCH_FAILED" });
+  }
+});
+
 app.post(
   "/api/business-directory/staff/listings/photo-upload-url",
   async (req, res) => {
@@ -31738,7 +32511,7 @@ app.get(
         await supabase
           .from("stations")
           .select(
-            "id,name,address,city,phone,directions,services,photo_url,gallery,ownership_status,created_at,staff_create_completed_at"
+            "id,name,address,city,phone,directions,services,photo_url,gallery,ownership_status,created_at,staff_create_completed_at,created_source,owner_id,is_active,status"
           )
           .eq("staff_create_request_id", requestId)
           .eq("created_by_user_id", user.id)
@@ -31762,6 +32535,76 @@ app.get(
           pendingVerification: true,
           error: "STAFF_CREATE_NOT_FOUND",
         });
+      }
+
+      /* AUTODEAR_STAFF_RECOVERY_RECONCILE_V7
+       * Recovery may run after stations and station_services were persisted,
+       * but the final completion timestamp failed to write. Never create a
+       * second station here. Reconcile ONLY owned-by-this-request, public,
+       * unclaimed staff-created records older than 10 seconds. Verify the
+       * stored service title multiset against the station snapshot first.
+       * No client-supplied list and no self-declared success are trusted.
+       */
+      if (!station.staff_create_completed_at &&
+          station.created_source === "autodear_staff" &&
+          !station.owner_id &&
+          station.ownership_status === "unclaimed" &&
+          station.is_active === true &&
+          station.status === "active" &&
+          Number.isFinite(Date.parse(station.created_at)) &&
+          Date.now() - Date.parse(station.created_at) > 10000) {
+        const titles = Array.isArray(station.services) ? station.services : null;
+        if (titles && titles.length <= 100 && titles.every(x => typeof x === "string")) {
+          const { data: serviceRows, error: serviceError } = await supabase
+            .from("station_services")
+            .select("title")
+            .eq("station_id", station.id)
+            .limit(101);
+          if (!serviceError && Array.isArray(serviceRows)) {
+            const clean = (v) => String(v || "").trim();
+            const expected = titles.map(clean).sort();
+            const actual = serviceRows.map(row => clean(row.title)).sort();
+            const exactlyMatches = expected.length === actual.length &&
+              expected.every((title, index) => title && title === actual[index]);
+            if (exactlyMatches) {
+              const { data: finalized, error: finalizeError } = await supabase
+                .from("stations")
+                .update({ staff_create_completed_at: new Date().toISOString() })
+                .eq("id", station.id)
+                .eq("staff_create_request_id", requestId)
+                .eq("created_by_user_id", user.id)
+                .eq("created_source", "autodear_staff")
+                .eq("ownership_status", "unclaimed")
+                .eq("is_active", true)
+                .eq("status", "active")
+                .is("owner_id", null)
+                .is("staff_create_completed_at", null)
+                .select("staff_create_completed_at")
+                .maybeSingle();
+              if (!finalizeError && finalized?.staff_create_completed_at) {
+                station.staff_create_completed_at = finalized.staff_create_completed_at;
+                console.log("[AUTODEAR][STAFF_CREATE][RECOVERY_RECONCILED]", { stationId: station.id });
+              } else if (finalizeError) {
+                console.warn("[AUTODEAR][STAFF_CREATE][RECOVERY_FINALIZE_FAILED]", finalizeError.code || "unknown");
+              } else {
+                // Another request may have finalized concurrently; read status only.
+                const { data: concurrent } = await supabase.from("stations")
+                  .select("staff_create_completed_at")
+                  .eq("id", station.id).eq("staff_create_request_id", requestId)
+                  .eq("created_by_user_id", user.id).maybeSingle();
+                if (concurrent?.staff_create_completed_at) {
+                  station.staff_create_completed_at = concurrent.staff_create_completed_at;
+                }
+              }
+            } else {
+              console.warn("[AUTODEAR][STAFF_CREATE][RECOVERY_INCOMPLETE_SERVICES]", {
+                stationId: station.id, expected: expected.length, actual: actual.length
+              });
+            }
+          } else if (serviceError) {
+            console.warn("[AUTODEAR][STAFF_CREATE][RECOVERY_SERVICE_CHECK_FAILED]", serviceError.code || "unknown");
+          }
+        }
       }
 
       if (!station.staff_create_completed_at) {
@@ -32821,7 +33664,16 @@ app.post(
           new Set(validatedStaffGallery)
         ).slice(0, 20);
 
-      const stationPayload = {
+            // AUTODEAR_STAFF_EXPERIENCE_V12: do not silently turn untrusted approximate modes into exact claims.
+      if (body.experienceMode != null && !["exact", "more_than", "up_to"].includes(body.experienceMode)) {
+        return res.status(400).json({ ok: false, error: "STAFF_EXPERIENCE_MODE_INVALID" });
+      }
+      if (body.experienceYears != null && body.experienceYears !== "" &&
+          (!Number.isInteger(Number(body.experienceYears)) || Number(body.experienceYears) < 1 || Number(body.experienceYears) > 150)) {
+        return res.status(400).json({ ok: false, error: "STAFF_EXPERIENCE_YEARS_INVALID" });
+      }
+
+const stationPayload = {
         // AUTODEAR_DIRECTOR_CARD_EDITOR_V1: do not fabricate service description or experience.
         description: String(body.description || "").trim().slice(0, 2000),
         experience_years:
@@ -32830,6 +33682,11 @@ app.post(
             : Number.isInteger(Number(body.experienceYears)) &&
               Number(body.experienceYears) >= 1 && Number(body.experienceYears) <= 150
               ? Number(body.experienceYears) : null,
+        // AUTODEAR_STAFF_EXPERIENCE_V12: qualifier stays null for exact years and unknown years.
+        experience_qualifier:
+          (body.experienceYears === null || body.experienceYears === "" || body.experienceYears === undefined) ? null :
+          body.experienceMode === "more_than" || body.experienceMode === "up_to"
+            ? body.experienceMode : null,
 
         ...(staffCreateRequestId
           ? { staff_create_request_id: staffCreateRequestId }
@@ -33204,16 +34061,27 @@ app.post(
        * Mark completed only after station services are saved.
        */
       if (staffCreateRequestId) {
-        const { error: completionError } = await supabase
+        // AUTODEAR_STAFF_CREATE_COMPLETION_VERIFY_V35_54H
+        // Never report success without a confirmed database row.
+        const {
+          data: completedStation,
+          error: completionError,
+        } = await supabase
           .from("stations")
           .update({
             staff_create_completed_at: new Date().toISOString(),
           })
           .eq("id", station.id)
           .eq("staff_create_request_id", staffCreateRequestId)
-          .eq("created_by_user_id", user.id);
+          .eq("created_by_user_id", user.id)
+          .select("id,staff_create_completed_at")
+          .maybeSingle();
 
-        if (completionError) {
+        if (
+          completionError ||
+          completedStation?.id !== station.id ||
+          !completedStation?.staff_create_completed_at
+        ) {
           console.error(
             "[AUTODEAR][STAFF_CREATE][COMPLETION_ERROR]",
             completionError
@@ -33963,6 +34831,7 @@ app.get(
               "photo_url",
               "description",
               "experience_years",
+              "experience_qualifier",
               "created_source",
               "created_by_user_id",
               "ownership_status",
@@ -34143,6 +35012,7 @@ const {
                 null,
               description: station.description || "",
               experienceYears: station.experience_years ?? null,
+              experienceMode: station.experience_qualifier || "exact",
 
               ownerId:
                 ownerId ||
@@ -34911,6 +35781,10 @@ app.patch("/api/business-directory/staff/services/:stationId/profile", async (re
     }
     const rawDescription = req.body?.description;
     const rawYears = req.body?.experienceYears;
+    const rawMode = req.body?.experienceMode ?? "exact";
+    if (!["exact", "more_than", "up_to"].includes(rawMode)) {
+      return res.status(400).json({ ok: false, message: "Укажите допустимый вариант стажа." });
+    }
     if (typeof rawDescription !== "string" || rawDescription.trim().length > 2000) {
       return res.status(400).json({ ok: false, message: "Описание должно быть текстом до 2000 символов." });
     }
@@ -34919,15 +35793,16 @@ app.patch("/api/business-directory/staff/services/:stationId/profile", async (re
       return res.status(400).json({ ok: false, message: "Стаж работы должен быть от 1 до 150 лет." });
     }
     const { data: saved, error: updateError } = await db.from("stations")
-      .update({ description: rawDescription.trim(), experience_years: years })
+      .update({ description: rawDescription.trim(), experience_years: years,
+        experience_qualifier: years == null || rawMode === "exact" ? null : rawMode })
       .eq("id", stationId).is("owner_id", null).eq("created_source", "autodear_staff")
-      .eq("ownership_status", "unclaimed").select("id,description,experience_years").maybeSingle();
+      .eq("ownership_status", "unclaimed").select("id,description,experience_years,experience_qualifier").maybeSingle();
     if (updateError) {
       console.error("[AUTODEAR][STAFF_PROFILE_EDIT]", updateError);
       return res.status(500).json({ ok: false, message: "Не удалось сохранить описание сервиса." });
     }
     if (!saved) return res.status(409).json({ ok: false, message: "Владение сервисом изменилось; обновление отменено." });
-    return res.json({ ok: true, station: { id: saved.id, description: saved.description, experienceYears: saved.experience_years } });
+    return res.json({ ok: true, station: { id: saved.id, description: saved.description, experienceYears: saved.experience_years, experienceMode: saved.experience_qualifier || "exact" } });
   } catch (error) {
     return res.status(Number(error?.statusCode || 500)).json({ ok: false, message: "Недостаточно прав или сервер временно недоступен." });
   }
@@ -36649,10 +37524,51 @@ app.post(
  * BUSINESS LISTING CLAIM — STAFF REVIEW
  */
 
+/* AUTODEAR_BUSINESS_CLAIM_COUNT_V20
+ * The badge does NOT need station or applicant enrichment. This endpoint
+ * shares the same staff authorization as the full ownership-claims queue.
+ * It is read-only and returns only the count of actionable claims.
+ */
+app.get(
+  "/api/business-directory/staff/claim-review-count",
+  async (req, res) => {
+    const startedAt = Date.now();
+    try {
+      if (!supabase) {
+        return res.status(503).json({ok: false, error: "SUPABASE_NOT_CONFIGURED"});
+      }
+      await requireBusinessDirectoryStaffUser(req);
+      const { count, error } = await supabase
+        .from("business_listing_claims")
+        .select("id", {count: "exact", head: true})
+        .in("status", ["under_review", "needs_information"]);
+      if (error) throw error;
+      const result = Number(count);
+      if (!Number.isSafeInteger(result) || result < 0) {
+        throw new Error("BUSINESS_CLAIM_COUNT_INVALID");
+      }
+      res.set("Cache-Control", "private, no-store");
+      console.log("[AUTODEAR][BUSINESS_CLAIMS][BADGE_COUNT_V20]", {
+        elapsedMs: Date.now() - startedAt,
+      });
+      return res.json({ok: true, count: result});
+    } catch (error) {
+      const status = Number(error?.statusCode || 500);
+      console.error("[AUTODEAR][BUSINESS_CLAIMS][BADGE_COUNT_ERROR_V20]", {
+        elapsedMs: Date.now() - startedAt,
+        message: String(error?.message || error).slice(0, 180),
+      });
+      return res.status(status).json({ok: false, error: "BUSINESS_CLAIM_COUNT_UNAVAILABLE"});
+    }
+  }
+);
+
 app.get(
   "/api/business-directory/staff/claim-requests",
   async (req, res) => {
     try {
+      const reviewQueueStartedAt = Date.now();
+
       if (!supabase) {
         return res.status(500).json({
           ok: false,
@@ -36664,6 +37580,14 @@ app.get(
 
       const requestedStatus =
         String(req.query?.status || "").trim();
+
+      /* AUTODEAR_STAFF_REVIEW_QUEUE_V18:
+       * Only the actionable review queue needs applicant enrichment.
+       * Other staff callers without ?queue=review keep historical semantics.
+       */
+      const reviewQueueOnly =
+        String(req.query?.queue || "").trim() === "review";
+
 
       const allowedStatuses =
         new Set([
@@ -36705,7 +37629,11 @@ app.get(
           )
           .limit(200);
 
-      if (
+      if (reviewQueueOnly) {
+        // The client already keeps only these same two states.
+        // Filter at the database, before stations/applicants enrichment.
+        query = query.in("status", ["under_review", "needs_information"]);
+      } else if (
         requestedStatus &&
         allowedStatuses.has(requestedStatus)
       ) {
@@ -37010,6 +37938,12 @@ app.get(
           error
         );
       }
+
+      console.log("[AUTODEAR][BUSINESS_CLAIMS][QUEUE_V18]", {
+        reviewQueueOnly,
+        rows: claimRows.length,
+        elapsedMs: Date.now() - reviewQueueStartedAt,
+      });
 
       return res.json({
         ok: true,
