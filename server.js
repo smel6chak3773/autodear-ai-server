@@ -27476,6 +27476,653 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
   }
 });
 
+// AUTODEAR_V3550B_QUOTE_SERVER_V1
+// Только проверка и расчёт. Денежных операций здесь нет.
+app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
+  const authResult = await resolveAuthenticatedUser(req);
+  const actorId = String(authResult?.user?.id || '').trim();
+
+  if (!actorId)
+    return res.status(401).json({ok:false,error:'AUTH_REQUIRED'});
+
+  if (!supabaseServiceRole)
+    return res.status(503).json({ok:false,error:'SERVICE_ROLE_MISSING'});
+
+  const listingId = String(req.params.listingId || '').trim();
+  const codes = Array.isArray(req.body?.services) ? req.body.services : [];
+  const validCodes = new Set([
+    'raise24h','highlight7days','vip7days','wide7days','turbo7days'
+  ]);
+
+  if (!listingId || listingId.length > 160 ||
+      !codes.length || codes.length > 5 ||
+      codes.some(c => typeof c !== 'string' || !validCodes.has(c)) ||
+      new Set(codes).size !== codes.length) {
+    return res.status(400).json({
+      ok:false,error:'PROMOTION_SELECTION_INVALID'
+    });
+  }
+
+  try {
+    const {data:listing,error:listingError} =
+      await supabaseServiceRole.from('listings')
+        .select('id,owner_id,status,category_id,extra_fields,payload,type')
+        .eq('id',listingId).maybeSingle();
+
+    if (listingError) throw listingError;
+
+    if (!listing)
+      return res.status(404).json({ok:false,error:'LISTING_NOT_FOUND'});
+
+    if (String(listing.status||'').toLowerCase() !== 'active')
+      return res.status(409).json({ok:false,error:'LISTING_NOT_ACTIVE'});
+
+    const ownerId = String(listing.owner_id||'').trim();
+
+    if (!ownerId)
+      return res.status(409).json({ok:false,error:'LISTING_OWNER_MISSING'});
+
+    // Проверяем подтверждённую связь, если объявление чужого бизнеса.
+    if (ownerId !== actorId) {
+      const {data:biz,error:bizErr} =
+        await supabaseServiceRole.from('business_accounts')
+          .select('id').eq('auth_user_id',ownerId);
+
+      if (bizErr) throw bizErr;
+
+      if (!Array.isArray(biz) || !biz.length)
+        return res.status(403).json({
+          ok:false,error:'LINKED_BUSINESS_REQUIRED'
+        });
+
+      const ids = [...new Set([
+        ownerId,
+        ...biz.map(b=>String(b.id))
+      ])];
+
+      const {data:links,error:linkErr} =
+        await supabaseServiceRole.from('account_links')
+          .select('id')
+          .eq('owner_auth_user_id',actorId)
+          .eq('linked_auth_user_id',ownerId)
+          .eq('link_type','business')
+          .not('verified_at','is',null)
+          .in('business_id',ids).limit(1);
+
+      if (linkErr) throw linkErr;
+
+      if (!links?.length)
+        return res.status(403).json({
+          ok:false,error:'LINKED_BUSINESS_FORBIDDEN'
+        });
+    }
+
+    // Источник цен — действующие настройки Supabase.
+    const {data:setting,error:settingsErr} =
+      await supabaseServiceRole.from('app_settings')
+        .select('value')
+        .eq('key','pricing_config').maybeSingle();
+
+    if (settingsErr) throw settingsErr;
+
+    const conf = setting?.value;
+
+    if (!conf || typeof conf !== 'object')
+      return res.status(503).json({
+        ok:false,error:'PROMOTION_PRICE_NOT_CONFIGURED'
+      });
+
+    const p = listing.payload || {};
+    const extra = listing.extra_fields || p.extraFields || {};
+    const norm = v => String(v || '').trim().toLowerCase();
+
+    const category = norm(listing.category_id || p.categoryId);
+    const taxonomy = norm(p.taxonomyId || extra.taxonomyId);
+    const vehicle = norm(extra.vehicleType || p.type);
+    const water = norm(extra.waterType || p.waterType);
+    const trailer = norm(
+      extra.trailerKind || p.trailerKind ||
+      extra.trailerType || p.trailerType
+    );
+
+    let priceClass = 'standard';
+
+    if (water === 'yacht' || water === 'motorboat')
+      priceClass = 'commercial';
+    else if (water)
+      priceClass = 'transport';
+    else if (
+      taxonomy === 'transport.trucks' ||
+      taxonomy.startsWith('transport.special.') ||
+      vehicle === 'trucks' ||
+      vehicle === 'special' ||
+      trailer.includes('полуприцеп') ||
+      category === 'business_sale' ||
+      category === 'services'
+    )
+      priceClass = 'commercial';
+    else if (category === 'transport')
+      priceClass = 'transport';
+
+    const rules = conf.promotionGroups?.[priceClass];
+    const promotion = p.promotion || {};
+
+    const fields = {
+      raise24h:'raiseUntil',
+      highlight7days:'highlightUntil',
+      vip7days:'vipUntil',
+      wide7days:'wideUntil',
+      turbo7days:'turboUntil'
+    };
+
+    const items = [];
+
+    for (const code of codes) {
+      if (Date.parse(String(promotion[fields[code]] || '')) > Date.now())
+        return res.status(409).json({
+          ok:false,error:'PROMOTION_ALREADY_ACTIVE',service:code
+        });
+
+      const price = Number(rules?.[code]?.price);
+      const days = Number(rules?.[code]?.durationDays);
+
+      if (!Number.isSafeInteger(price) ||
+          price <= 0 || price > 10000000 ||
+          !Number.isSafeInteger(days) ||
+          days < 1 || days > 365) {
+        return res.status(503).json({
+          ok:false,error:'PROMOTION_TARIFF_INVALID',service:code
+        });
+      }
+
+      items.push({code,price,durationDays:days});
+    }
+
+    const total = items.reduce((sum,item)=>sum+item.price,0);
+
+    return res.json({
+      ok:true,
+      listingId,
+      ownerId,
+      priceClass,
+      items,
+      total,
+      currency:'RUB',
+      paymentEnabled:false
+    });
+  } catch(error) {
+    console.error('[AUTODEAR][PROMOTION][QUOTE_FAILED_V3550B]', {
+      listingId,
+      message:error?.message || String(error)
+    });
+
+    return res.status(503).json({
+      ok:false,error:'PROMOTION_QUOTE_FAILED'
+    });
+  }
+});
+
+
+// AUTODEAR_V3550D_PURCHASE_SERVER_V1
+// STAGED: оплата выключена по умолчанию.
+// Авторизация определяется только из проверенного JWT.
+
+app.post(
+  '/api/listings/:listingId/promotion/purchase',
+  async (req, res) => {
+    const auth = await resolveAuthenticatedUser(req);
+    const actor = String(auth?.user?.id || '').trim();
+
+    if (!actor) {
+      return res.status(401).json({
+        ok: false,
+        error: 'AUTH_REQUIRED'
+      });
+    }
+
+    if (
+      true /* AUTODEAR_V3550K_PURCHASE_HARD_OFF */
+    ) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_PURCHASE_NOT_ENABLED'
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    const listingId =
+      String(req.params?.listingId || '').trim();
+
+    const operationKey =
+      String(req.body?.operationKey || '').trim();
+
+    const walletType =
+      String(req.body?.walletType || '').trim();
+
+    const services = req.body?.services;
+
+    const valid = new Set([
+      'raise24h',
+      'highlight7days',
+      'vip7days',
+      'wide7days',
+      'turbo7days'
+    ]);
+
+    if (
+      !listingId ||
+      listingId.length > 160 ||
+      !/^listing-promotion:[A-Za-z0-9._:-]{8,192}$/.test(
+        operationKey
+      ) ||
+      !['personal', 'business'].includes(walletType) ||
+      !Array.isArray(services) ||
+      services.length < 1 ||
+      services.length > 5 ||
+      services.some(
+        x => typeof x !== 'string' || !valid.has(x)
+      ) ||
+      new Set(services).size !== services.length
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROMOTION_PURCHASE_REQUEST_INVALID'
+      });
+    }
+
+    try {
+      // Внутри PostgreSQL одной транзакцией:
+      // проверка владельца и связи,
+      // актуальная цена,
+      // списание,
+      // обновление объявления,
+      // сохранение результата операции.
+
+      const { data, error } =
+        await supabaseServiceRole.rpc(
+          'autodear_buy_listing_promotion_v3550',
+          {
+            p_actor_auth_id: actor,
+            p_listing_id: listingId,
+            p_services: services,
+            p_wallet_type: walletType,
+            p_operation_key: operationKey
+          }
+        );
+
+      if (error) {
+        const rawError = String(error.message || '');
+
+        const tag =
+          rawError.match(/PROMOTION_[A-Z_]+/)?.[0] ||
+          'PROMOTION_PURCHASE_FAILED';
+
+        const status =
+          tag.includes('FORBIDDEN') ? 403 :
+          tag.includes('NOT_FOUND') ? 404 :
+          rawError.includes('INSUFFICIENT_FUNDS') ? 409 :
+          (tag.includes('ACTIVE') ||
+           tag.includes('CONFLICT')) ? 409 :
+          tag.includes('INVALID') ? 400 : 503;
+
+        console.error(
+          '[AUTODEAR][PROMOTION][PURCHASE_RPC_ERROR_V3550D]',
+          {
+            tag,
+            pgCode: error.code || null,
+            listingId
+          }
+        );
+
+        return res.status(status).json({
+          ok: false,
+          error: tag
+        });
+      }
+
+      if (
+        !data ||
+        data.ok !== true ||
+        String(data.listingId || '') !== listingId
+      ) {
+        return res.status(503).json({
+          ok: false,
+          error: 'PROMOTION_PURCHASE_RESULT_INVALID'
+        });
+      }
+
+      return res.json(data);
+
+    } catch (error) {
+      console.error(
+        '[AUTODEAR][PROMOTION][PURCHASE_FATAL_V3550D]',
+        {
+          listingId,
+          message: String(error?.message || error)
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_PURCHASE_UNAVAILABLE'
+      });
+    }
+  }
+);
+
+
+// Проверка результата операции БЕЗ списания.
+// Отсутствие записи не доказывает отсутствие
+// старого платежа через прежний кошелёк.
+
+app.get(
+  '/api/listings/:listingId/promotion/order-status',
+  async (req, res) => {
+    const auth = await resolveAuthenticatedUser(req);
+    const actor = String(auth?.user?.id || '').trim();
+
+    if (!actor) {
+      return res.status(401).json({
+        ok: false,
+        error: 'AUTH_REQUIRED'
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    const listingId =
+      String(req.params?.listingId || '').trim();
+
+    const operationKey =
+      String(req.query?.operationKey || '').trim();
+
+    if (
+      !listingId ||
+      listingId.length > 160 ||
+      !/^listing-promotion:[A-Za-z0-9._:-]{8,192}$/.test(
+        operationKey
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROMOTION_STATUS_REQUEST_INVALID'
+      });
+    }
+
+    try {
+      const { data, error } =
+        await supabaseServiceRole
+          .from('listing_promotion_orders_v3550')
+          .select(
+            'listing_id,owner_auth_id,wallet_type,' +
+            'service_codes,total_amount,transaction_id,' +
+            'promotion_snapshot,created_at'
+          )
+          .eq('operation_key', operationKey)
+          .eq('actor_auth_id', actor)
+          .eq('listing_id', listingId)
+          .maybeSingle();
+
+      if (error) throw error;
+
+      if (!data) {
+        return res.json({
+          ok: true,
+          status: 'not_found',
+          listingId
+        });
+      }
+
+      return res.json({
+        ok: true,
+        status: 'completed',
+        listingId,
+        ownerId: data.owner_auth_id,
+        walletType: data.wallet_type,
+        services: data.service_codes,
+        total: data.total_amount,
+        transactionId: data.transaction_id,
+        promotion: data.promotion_snapshot,
+        createdAt: data.created_at
+      });
+
+    } catch (error) {
+      console.error(
+        '[AUTODEAR][PROMOTION][STATUS_FAILED_V3550D]',
+        {
+          listingId,
+          message: String(error?.message || error)
+        }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error: 'PROMOTION_STATUS_UNAVAILABLE'
+      });
+    }
+  }
+);
+
+
+// AUTODEAR_V3550G_DIRECTOR_PRICING_API
+// Директорская запись через проверенную серверную роль.
+// Выключена до завершения тестов и обновления клиента.
+app.put('/api/director/pricing-config', async (req, res) => {
+  try {
+    const access = await resolveStaffAccess(req, 'director');
+
+    if (!access.ok) {
+      return res.status(access.status || 403).json({
+        ok: false,
+        error: access.error || 'DIRECTOR_REQUIRED'
+      });
+    }
+
+    if (true /* AUTODEAR_V3550K_PRICING_HARD_OFF */) {
+      return res.status(503).json({
+        ok: false,
+        error: 'DIRECTOR_PRICING_NOT_ENABLED'
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PRICING_SERVICE_UNAVAILABLE'
+      });
+    }
+
+    const config = req.body?.config;
+
+    const plain = value =>
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value);
+
+    const positiveInt = (value, min, max) =>
+      Number.isSafeInteger(value) &&
+      value >= min && value <= max;
+
+    const allowedTop = new Set([
+      'freeListingsLimit',
+      'categories',
+      'promotions',
+      'promotionGroups',
+      'business',
+      'paidFeatures'
+    ]);
+
+    if (
+      !plain(config) ||
+      JSON.stringify(config).length > 60000 ||
+      Object.keys(config).some(key => !allowedTop.has(key)) ||
+      !positiveInt(config.freeListingsLimit, 0, 1000000000)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PRICING_CONFIG_INVALID'
+      });
+    }
+
+    const ruleFields = new Set([
+      'price', 'durationDays',
+      'oldPrice', 'discountEnabled'
+    ]);
+
+    function validRule(rule, paid) {
+      if (!plain(rule)) return false;
+
+      if (Object.keys(rule).some(
+        key => !ruleFields.has(key)
+      )) return false;
+
+      if (!positiveInt(rule.price, paid ? 1 : 0, 10000000))
+        return false;
+
+      if (
+        rule.durationDays !== undefined &&
+        !positiveInt(rule.durationDays, 1, 365)
+      ) return false;
+
+      if (
+        rule.oldPrice !== undefined &&
+        !positiveInt(rule.oldPrice, 0, 10000000)
+      ) return false;
+
+      if (
+        rule.discountEnabled !== undefined &&
+        typeof rule.discountEnabled !== 'boolean'
+      ) return false;
+
+      return true;
+    }
+
+    function validDomain(domain, paid, maxEntries = 100) {
+      return plain(domain) &&
+        Object.keys(domain).length <= maxEntries &&
+        Object.entries(domain).every(([key, rule]) =>
+          /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) &&
+          validRule(rule, paid)
+        );
+    }
+
+    if (
+      !validDomain(config.categories, false) ||
+      !validDomain(config.promotions, true) ||
+      !validDomain(config.business, false) ||
+      !validDomain(config.paidFeatures, false)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PRICING_RULE_INVALID'
+      });
+    }
+
+    const groupNames = [
+      'standard', 'transport', 'commercial'
+    ];
+
+    const services = [
+      'raise24h', 'highlight7days',
+      'vip7days', 'wide7days', 'turbo7days'
+    ];
+
+    const groups = config.promotionGroups;
+
+    if (
+      !plain(groups) ||
+      Object.keys(groups).length !== 3 ||
+      groupNames.some(group =>
+        !plain(groups[group]) ||
+        Object.keys(groups[group]).length !== 5 ||
+        services.some(service =>
+          !validRule(groups[group][service], true) ||
+          !positiveInt(
+            groups[group][service]?.durationDays, 1, 365
+          )
+        )
+      )
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: 'PROMOTION_GROUPS_INVALID'
+      });
+    }
+
+    const { data: existing, error: readError } =
+      await supabaseServiceRole
+        .from('app_settings')
+        .select('value,updated_at')
+        .eq('key', 'pricing_config')
+        .maybeSingle();
+
+    if (readError || !existing) {
+      return res.status(503).json({
+        ok: false,
+        error: 'PRICING_READ_FAILED'
+      });
+    }
+
+    // Сохраняем поля старой конфигурации,
+    // которых нет в разрешённой схеме.
+    const next = {
+      ...(plain(existing.value) ? existing.value : {}),
+      ...config
+    };
+
+    const { data: saved, error: saveError } =
+      await supabaseServiceRole
+        .from('app_settings')
+        .update({
+          value: next,
+          updated_at: new Date().toISOString()
+        })
+        .eq('key', 'pricing_config')
+        .eq('updated_at', existing.updated_at)
+        .select('updated_at')
+        .maybeSingle();
+
+    if (saveError) throw saveError;
+
+    if (!saved) {
+      return res.status(409).json({
+        ok: false,
+        error: 'PRICING_CHANGED_RELOAD_REQUIRED'
+      });
+    }
+
+    console.log('[AUTODEAR][DIRECTOR][PRICING_SAVED_V3550G]', {
+      actorId: access.actor.authUserId
+    });
+
+    return res.json({
+      ok: true,
+      updatedAt: saved.updated_at
+    });
+
+  } catch (error) {
+    console.error('[AUTODEAR][DIRECTOR][PRICING_ERROR_V3550G]', {
+      message: error?.message || String(error)
+    });
+
+    return res.status(503).json({
+      ok: false,
+      error: 'PRICING_SAVE_FAILED'
+    });
+  }
+});
+
 app.post("/api/wallet/:walletType/:ownerId/charge", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
