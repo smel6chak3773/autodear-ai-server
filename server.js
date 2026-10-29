@@ -27506,7 +27506,7 @@ app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
   try {
     const {data:listing,error:listingError} =
       await supabaseServiceRole.from('listings')
-        .select('id,owner_id,status,category_id,extra_fields,payload,type')
+        .select('id,owner_id,status,category_id,extra_fields,payload')
         .eq('id',listingId).maybeSingle();
 
     if (listingError) throw listingError;
@@ -27594,8 +27594,13 @@ app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
     else if (
       taxonomy === 'transport.trucks' ||
       taxonomy.startsWith('transport.special.') ||
-      vehicle === 'trucks' ||
-      vehicle === 'special' ||
+      [
+        'trucks',
+        'special',
+        'грузовая техника',
+        'грузовик',
+        'спецтехника'
+      ].includes(vehicle) ||
       trailer.includes('полуприцеп') ||
       category === 'business_sale' ||
       category === 'services'
