@@ -35301,7 +35301,11 @@ app.get(
   "/api/business-directory/staff/services",
   async (req, res) => {
     try {
+      // AUTODEAR_STAFF_SERVICES_TIMING_V3562H
+      const staffPerfStartV3562H = Date.now();
       await requireBusinessDirectoryStaffUser(req);
+      console.log("[AUTODEAR][STAFF_SERVICES_PERF][AUTH_MS]",
+        Date.now() - staffPerfStartV3562H);
 
       const db =
         getStaffServiceManagementDb();
@@ -35447,6 +35451,7 @@ app.get(
           ];
       }
 
+      const staffQueryStartV3562H = Date.now();
       let request =
         db
           .from("stations")
@@ -35524,6 +35529,9 @@ const {
         offset,
         offset + limit - 1
       );
+      console.log("[AUTODEAR][STAFF_SERVICES_PERF][STATIONS_MS]",
+        Date.now() - staffQueryStartV3562H);
+
 
       console.log(
         "[AUTODEAR][STAFF_SERVICE_MANAGEMENT][DB_TIMING]",
@@ -35746,6 +35754,8 @@ const {
           totalCount || 0
         );
 
+      console.log("[AUTODEAR][STAFF_SERVICES_PERF][TOTAL_MS]",
+        Date.now() - staffPerfStartV3562H);
       return res.json({
         ok: true,
 
