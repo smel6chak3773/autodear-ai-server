@@ -35300,6 +35300,21 @@ function getStaffServiceManagementDb() {
 app.get(
   "/api/business-directory/staff/services",
   async (req, res) => {
+    // AUTODEAR_STAFF_SERVICES_ENTRY_V3562M
+    const routeStartedV3562M = Date.now();
+
+    console.log("[AUTODEAR][STAFF_SERVICES_TRACE][ENTER]", {
+      method: req.method,
+      hasAuthorization: Boolean(req.headers.authorization),
+    });
+
+    res.once("finish", () => {
+      console.log("[AUTODEAR][STAFF_SERVICES_TRACE][FINISH]", {
+        status: res.statusCode,
+        elapsedMs: Date.now() - routeStartedV3562M,
+      });
+    });
+
     try {
       // AUTODEAR_STAFF_SERVICES_TIMING_V3562H
       const staffPerfStartV3562H = Date.now();
