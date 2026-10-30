@@ -47254,7 +47254,202 @@ app.get("/api/integrations/pampadu/postback", async (req, res) => {
 });
 
 
+
+// AUTODEAR_SMART_REVIEW_PUSH_V4141
+// Persistent queue: only listing review notifications.
+// Requires service-role access; never uses a client-supplied recipient.
+let smartReviewPushRunningV4141 = false;
+
+async function processSmartReviewPushV4141() {
+  if (smartReviewPushRunningV4141 || !supabaseServiceRole) return;
+  smartReviewPushRunningV4141 = true;
+
+  try {
+    const db = supabaseServiceRole;
+    const { data: pending, error: loadError } = await db
+      .from("notifications")
+      .select("id,recipient_id,title,body,related_id,push_attempts,push_claimed_at")
+      .eq("type", "listing_new_review")
+      .eq("related_type", "review")
+      .is("push_sent_at", null)
+      .lt("push_attempts", 5)
+      .order("created_at", { ascending: true })
+      .limit(10);
+
+    if (loadError) throw loadError;
+
+    for (const row of pending || []) {
+      const now = Date.now();
+      const previousClaim = row.push_claimed_at
+        ? new Date(row.push_claimed_at).getTime() : 0;
+
+      // Lease prevents concurrent workers from processing the same row.
+      if (previousClaim && now - previousClaim < 5 * 60 * 1000) continue;
+
+      let claim = db.from("notifications")
+        .update({
+          push_claimed_at: new Date(now).toISOString(),
+          push_attempts: Number(row.push_attempts || 0) + 1,
+          push_last_error: null,
+        })
+        .eq("id", row.id)
+        .is("push_sent_at", null)
+        .eq("push_attempts", Number(row.push_attempts || 0));
+
+      claim = row.push_claimed_at
+        ? claim.eq("push_claimed_at", row.push_claimed_at)
+        : claim.is("push_claimed_at", null);
+
+      const { data: claimed, error: claimError } =
+        await claim.select("id").maybeSingle();
+
+      if (claimError || !claimed) continue;
+
+      try {
+        const recipient = String(row.recipient_id || "").trim();
+        const owner = await resolveAdminListingOwner(recipient);
+        const authId = String(owner.authUserId || "").trim();
+
+        if (!authId || !/^[0-9a-f-]{36}$/i.test(authId)) {
+          throw new Error("SELLER_AUTH_NOT_RESOLVED");
+        }
+
+        // Ensure the review actually targets this notification recipient.
+        const { data: review, error: reviewError } = await db
+          .from("reviews")
+          .select("id,target_id,source_type,status")
+          .eq("id", String(row.related_id || ""))
+          .eq("source_type", "listing_interest")
+          .eq("status", "published")
+          .eq("target_id", recipient)
+          .maybeSingle();
+
+        if (reviewError || !review) {
+          throw new Error("REVIEW_RECIPIENT_MISMATCH");
+        }
+
+        const { data: devices, error: devicesError } = await db
+          .from("device_push_tokens")
+          .select("expo_push_token")
+          .eq("user_id", authId)
+          .eq("is_active", true);
+
+        if (devicesError) throw devicesError;
+
+        const tokens = [...new Set(
+          (devices || [])
+            .map(d => String(d.expo_push_token || "").trim())
+            .filter(Boolean)
+        )];
+
+        if (!tokens.length) {
+          throw new Error("NO_ACTIVE_PUSH_TOKENS");
+        }
+
+        const result = await sendAutodearExpoPush({
+          tokens,
+          title: String(row.title || "Вам оставили отзыв"),
+          body: String(row.body || "Покупатель оставил отзыв."),
+          data: {
+            type: "listing_new_review",
+            eventType: "listing_new_review",
+            targetRole: "user",
+            relatedType: "review",
+            relatedId: String(row.related_id),
+            reviewId: String(row.related_id),
+            route: "/profile/notification-center",
+          },
+        });
+
+        // AUTODEAR_SMART_REVIEW_EXPO_TICKETS_V4144
+        // Expo acceptance != delivery to the device.
+        const tickets = Array.isArray(result?.payload?.data)
+          ? result.payload.data
+          : result?.payload?.data
+            ? [result.payload.data]
+            : [];
+
+        const accepted = tickets.filter(
+          (ticket) => ticket?.status === "ok" && ticket?.id
+        );
+
+        const rejected = tickets.filter(
+          (ticket) => ticket?.status !== "ok" || !ticket?.id
+        );
+
+        if (
+          result?.ok !== true ||
+          !tickets.length ||
+          tickets.length !== tokens.length ||
+          !accepted.length
+        ) {
+          throw new Error("EXPO_PUSH_NO_ACCEPTED_TICKETS");
+        }
+
+        if (rejected.length) {
+          console.warn(
+            "[AUTODEAR][SMART_REVIEW_PUSH][PARTIAL_ACCEPTANCE]",
+            {
+              notificationId: row.id,
+              accepted: accepted.length,
+              rejected: rejected.length,
+            }
+          );
+        }
+
+        // At least one accepted ticket: don't blindly resend to
+        // already accepted devices. Device delivery remains unverified.
+
+
+        const { error: savedError } = await db.from("notifications")
+          .update({
+            push_sent_at: new Date().toISOString(),
+            push_last_error: null,
+            push_claimed_at: null,
+          })
+          .eq("id", row.id);
+
+        if (savedError) throw savedError;
+
+        console.log("[AUTODEAR][SMART_REVIEW_PUSH][SENT]", {
+          notificationId: row.id,
+          tokenCount: tokens.length,
+        });
+
+      } catch (sendError) {
+        const message = String(sendError?.message || sendError).slice(0, 400);
+        console.warn("[AUTODEAR][SMART_REVIEW_PUSH][RETRY]", {
+          notificationId: row.id,
+          message,
+        });
+
+        await db.from("notifications")
+          .update({
+            push_claimed_at: null,
+            push_last_error: message,
+          })
+          .eq("id", row.id);
+      }
+    }
+  } catch (error) {
+    console.warn(
+      "[AUTODEAR][SMART_REVIEW_PUSH][WORKER_ERROR]",
+      String(error?.message || error)
+    );
+  } finally {
+    smartReviewPushRunningV4141 = false;
+  }
+}
+
 app.listen(PORT, "0.0.0.0", () => {
+  // AUTODEAR_SMART_REVIEW_PUSH_V4141_START
+  setTimeout(() => {
+    void processSmartReviewPushV4141();
+    setInterval(() => {
+      void processSmartReviewPushV4141();
+    }, 60000);
+  }, 10000);
+
   console.log(`AUTODEAR AI Server started on port ${PORT}`);
 
   startCustomerBookingReminderScheduler();
