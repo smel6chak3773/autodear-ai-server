@@ -32564,6 +32564,33 @@ app.get(
       }
 
       if (!station) {
+        // AUTODEAR_DURABLE_STAFF_REQUEST_V3561D
+        const { data: queuedRequest, error: queueLookupError } =
+          await supabase
+            .from("staff_service_create_requests")
+            .select("status,station_id,created_at")
+            .eq("request_id", requestId)
+            .eq("created_by_user_id", user.id)
+            .maybeSingle();
+
+        if (queueLookupError) {
+          return res.status(503).json({
+            ok: false,
+            error: "STAFF_QUEUE_LOOKUP_FAILED",
+            pendingVerification: true,
+          });
+        }
+
+        if (queuedRequest) {
+          return res.status(202).json({
+            ok: false,
+            pendingVerification: true,
+            requestSaved: true,
+            status: queuedRequest.status,
+            requestId,
+          });
+        }
+
         return res.status(404).json({
           ok: false,
           pendingVerification: true,
@@ -32692,9 +32719,9 @@ app.get(
  * A business user starts confirmation later through
  * the persistent ownership-claim workflow.
  */
-app.post(
-  "/api/business-directory/staff/listings",
-  async (req, res) => {
+async function processStaffListingQueueV3561F2(
+  req, res, trustedQueueUserV3561F2 = null, leaseGuardV3561N1 = null
+) {
     const diagnosticRequestId =
       crypto.randomUUID();
 
@@ -32791,12 +32818,9 @@ app.post(
         "auth_start"
       );
 
-      const {
-        user,
-      } =
-        await requireBusinessDirectoryStaffUser(
-          req
-        );
+      const { user } = trustedQueueUserV3561F2
+        ? { user: trustedQueueUserV3561F2 }
+        : await requireBusinessDirectoryStaffUser(req);
 
       markStaffBusinessListingCreateDiagnostic(
         diagnosticRequestId,
@@ -32831,6 +32855,92 @@ app.post(
         });
       }
 
+
+
+      // AUTODEAR_DURABLE_STAFF_REQUEST_V3561D
+      // A received request must survive a mobile network failure.
+      // This is a receipt, NOT proof that station creation succeeded.
+      if (staffCreateRequestId) {
+        const { data: savedRequest, error: readRequestError } =
+          await supabase
+            .from("staff_service_create_requests")
+            .select("request_id,created_by_user_id,status")
+            .eq("request_id", staffCreateRequestId)
+            .maybeSingle();
+
+        if (readRequestError) {
+          console.error(
+            "[AUTODEAR][STAFF_QUEUE][LOOKUP_FAILED]",
+            readRequestError.code
+          );
+          return res.status(503).json({
+            ok: false,
+            error: "STAFF_QUEUE_UNAVAILABLE",
+          });
+        }
+
+        if (savedRequest &&
+            savedRequest.created_by_user_id !== user.id) {
+          return res.status(409).json({
+            ok: false,
+            error: "STAFF_CREATE_REQUEST_CONFLICT",
+          });
+        }
+
+        if (!savedRequest) {
+          const serializedRequest = JSON.stringify(body);
+
+          if (serializedRequest.length > 250000) {
+            return res.status(413).json({
+              ok: false,
+              error: "STAFF_CREATE_PAYLOAD_TOO_LARGE",
+            });
+          }
+
+          const { error: saveRequestError } = await supabase
+            .from("staff_service_create_requests")
+            .insert({
+              request_id: staffCreateRequestId,
+              created_by_user_id: user.id,
+              payload: body,
+              status: "submitted",
+            });
+
+          if (saveRequestError) {
+            if (saveRequestError.code === "23505") {
+              const { data: concurrent, error: concurrentError } =
+                await supabase
+                  .from("staff_service_create_requests")
+                  .select("created_by_user_id")
+                  .eq("request_id", staffCreateRequestId)
+                  .maybeSingle();
+
+              if (concurrentError ||
+                  concurrent?.created_by_user_id !== user.id) {
+                return res.status(409).json({
+                  ok: false,
+                  error: "STAFF_CREATE_REQUEST_CONFLICT",
+                });
+              }
+            } else {
+              console.error(
+                "[AUTODEAR][STAFF_QUEUE][SAVE_FAILED]",
+                saveRequestError.code
+              );
+              return res.status(503).json({
+                ok: false,
+                error: "STAFF_QUEUE_SAVE_FAILED",
+              });
+            }
+          }
+        }
+
+        markStaffBusinessListingCreateDiagnostic(
+          diagnosticRequestId,
+          diagnosticStartedAt,
+          "request_saved_in_supabase"
+        );
+      }
 
       const name =
         String(
@@ -33822,6 +33932,9 @@ const stationPayload = {
         "station_insert_start"
       );
 
+      // AUTODEAR_QUEUE_LEASE_GUARD_V3561N1
+      if (leaseGuardV3561N1) await leaseGuardV3561N1("station_insert");
+
       const {
         data: station,
         error: stationError,
@@ -33988,6 +34101,8 @@ const stationPayload = {
           }
         );
 
+        if (leaseGuardV3561N1) await leaseGuardV3561N1("services_upsert");
+
         const {
           error:
             servicesSaveError,
@@ -34034,6 +34149,8 @@ const stationPayload = {
                 null,
             }
           );
+
+          if (leaseGuardV3561N1) await leaseGuardV3561N1("station_cleanup");
 
           const {
             error:
@@ -34093,6 +34210,8 @@ const stationPayload = {
       if (staffCreateRequestId) {
         // AUTODEAR_STAFF_CREATE_COMPLETION_VERIFY_V35_54H
         // Never report success without a confirmed database row.
+        if (leaseGuardV3561N1) await leaseGuardV3561N1("station_completion");
+
         const {
           data: completedStation,
           error: completionError,
@@ -34122,6 +34241,31 @@ const stationPayload = {
             error: "STAFF_CREATE_COMPLETION_UNCONFIRMED",
             pendingVerification: true,
           });
+        }
+      }
+
+
+      // V35.61D: station completion is already verified above.
+      // Queue status is synchronized without misreporting a
+      // successful station insert as a failed creation.
+      if (staffCreateRequestId) {
+        const { error: queueCompletionError } = await supabase
+          .from("staff_service_create_requests")
+          .update({
+            status: "completed",
+            station_id: station.id,
+            completed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            last_error: null,
+          })
+          .eq("request_id", staffCreateRequestId)
+          .eq("created_by_user_id", user.id);
+
+        if (queueCompletionError) {
+          console.error(
+            "[AUTODEAR][STAFF_QUEUE][COMPLETION_SYNC_FAILED]",
+            queueCompletionError.code
+          );
         }
       }
 
@@ -34227,8 +34371,427 @@ const stationPayload = {
           "BUSINESS_LISTING_CREATE_FATAL",
       });
     }
+}
+
+// AUTODEAR_STAFF_QUEUE_WORKER_V3561F2
+// HTTP confirms only a durable queue receipt, never station publication.
+// The payload is processed with the legacy validation and station-services logic.
+app.post("/api/business-directory/staff/listings", async (req, res) => {
+  // AUTODEAR_STAFF_QUEUE_ROLLOUT_V3561R
+  // Default OFF: preserve the existing synchronous API for old clients.
+  if (process.env.STAFF_SERVICE_QUEUE_V3561_ENABLED !== "true") {
+    return processStaffListingQueueV3561F2(req, res);
   }
-);
+  try {
+    if (!supabase) return res.status(503).json({ ok: false, error: "SUPABASE_NOT_CONFIGURED" });
+    const { user } = await requireBusinessDirectoryStaffUser(req);
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+    const requestId = String(body.requestId || "").trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      return res.status(400).json({ ok: false, error: "STAFF_CREATE_REQUEST_ID_INVALID" });
+    }
+    const encoded = JSON.stringify(body);
+    if (encoded.length > 250000) return res.status(413).json({ok:false,error:"STAFF_CREATE_PAYLOAD_TOO_LARGE"});
+    const {data: existing, error: lookupError} = await supabase.from("staff_service_create_requests")
+      .select("created_by_user_id,status,payload,station_id")
+      .eq("request_id",requestId).maybeSingle();
+    if (lookupError) return res.status(503).json({ok:false,error:"STAFF_QUEUE_UNAVAILABLE"});
+    if (existing) {
+      if (existing.created_by_user_id !== user.id || JSON.stringify(existing.payload) !== encoded) {
+        // JSONB may reorder keys. Compare parsed data canonically instead.
+        if (existing.created_by_user_id !== user.id ||
+            stableStaffPayloadV3561F2(existing.payload) !== stableStaffPayloadV3561F2(body)) {
+          return res.status(409).json({ok:false,error:"STAFF_CREATE_REQUEST_CONFLICT"});
+        }
+      }
+      if (existing.status === "failed") {
+        return res.status(409).json({ok:false,error:"STAFF_CREATE_FAILED",requestId});
+      }
+      return res.status(202).json({ok:true,accepted:true,requestSaved:true,
+        status:existing.status,requestId,pendingVerification:existing.status!=="completed"});
+    }
+    const { error: insertError } = await supabase.from("staff_service_create_requests").insert({
+      request_id:requestId,created_by_user_id:user.id,payload:body,status:"submitted"
+    });
+    if (insertError) {
+      // Concurrent identical insert: GET result with same ID, avoid creating twice.
+      if (insertError.code === "23505") {
+        const {data: concurrent} = await supabase.from("staff_service_create_requests")
+          .select("created_by_user_id,payload,status").eq("request_id",requestId).maybeSingle();
+        if (concurrent?.created_by_user_id === user.id &&
+            stableStaffPayloadV3561F2(concurrent.payload) === stableStaffPayloadV3561F2(body)) {
+          return res.status(202).json({ok:true,accepted:true,requestSaved:true,status:concurrent.status,requestId});
+        }
+        return res.status(409).json({ok:false,error:"STAFF_CREATE_REQUEST_CONFLICT"});
+      }
+      console.error("[AUTODEAR][STAFF_QUEUE][RECEIPT_ERROR]", insertError.code || "UNKNOWN");
+      return res.status(503).json({ok:false,error:"STAFF_QUEUE_SAVE_FAILED"});
+    }
+    console.log("[AUTODEAR][STAFF_QUEUE][ACCEPTED]", {requestSuffix:requestId.slice(-8)});
+    return res.status(202).json({ok:true,accepted:true,requestSaved:true,status:"submitted",requestId});
+  } catch (error) {
+    const status = Number(error?.statusCode || error?.status || 500);
+    return res.status(status === 401 || status === 403 ? status : 500).json({
+      ok:false,error:status===401||status===403?"STAFF_UNAUTHORIZED":"STAFF_QUEUE_ACCEPT_FAILED"
+    });
+  }
+});
+
+function stableStaffPayloadV3561F2(value) {
+  if (Array.isArray(value)) return "[" + value.map(stableStaffPayloadV3561F2).join(",") + "]";
+  if (value && typeof value === "object") return "{" + Object.keys(value).sort().map(k =>
+    JSON.stringify(k) + ":" + stableStaffPayloadV3561F2(value[k])).join(",") + "}";
+  return JSON.stringify(value);
+}
+
+
+// AUTODEAR_STAFF_QUEUE_RECONCILE_V3561H1
+// Reconcile ONLY the station created for this exact request and staff user.
+// Never insert a second station; never trust client-reported completion.
+async function reconcileStaffQueueStationV3561H1(requestId, userId) {
+  const {data: station, error: stationError} = await supabase
+    .from("stations")
+    .select("id,services,staff_create_completed_at,created_source,owner_id,ownership_status,is_active,status")
+    .eq("staff_create_request_id",requestId)
+    .eq("created_by_user_id",userId)
+    .maybeSingle();
+
+  if (stationError || !station) return null;
+
+  if (station.created_source !== "autodear_staff" ||
+      station.owner_id != null ||
+      station.ownership_status !== "unclaimed" ||
+      station.is_active !== true ||
+      station.status !== "active") return null;
+
+  const expected = station.services;
+  if (!Array.isArray(expected) || expected.length > 100 ||
+      !expected.every(v => typeof v === "string" && v.trim().length > 0)) {
+    return null;
+  }
+
+  const {data: rows, error: servicesError} = await supabase
+    .from("station_services")
+    .select("title")
+    .eq("station_id",station.id)
+    .limit(101);
+
+  if (servicesError || !Array.isArray(rows)) return null;
+
+  const normalize = v => String(v || "").trim();
+  const expectedTitles = expected.map(normalize).sort();
+  const actualTitles = rows.map(r => normalize(r.title)).sort();
+
+  if (expectedTitles.length !== actualTitles.length ||
+      !expectedTitles.every((title,i) =>
+        title && title === actualTitles[i])) return null;
+
+  if (station.staff_create_completed_at) return station.id;
+
+  const {data: completed, error: completionError} = await supabase
+    .from("stations")
+    .update({staff_create_completed_at:new Date().toISOString()})
+    .eq("id",station.id)
+    .eq("staff_create_request_id",requestId)
+    .eq("created_by_user_id",userId)
+    .eq("created_source","autodear_staff")
+    .eq("ownership_status","unclaimed")
+    .eq("is_active",true)
+    .eq("status","active")
+    .is("owner_id",null)
+    .is("staff_create_completed_at",null)
+    .select("id,staff_create_completed_at")
+    .maybeSingle();
+
+  if (!completionError && completed?.staff_create_completed_at) {
+    return completed.id;
+  }
+
+  // Another worker might have finished concurrently. Read, never guess.
+  const {data: concurrent, error: readError} = await supabase
+    .from("stations")
+    .select("id,staff_create_completed_at")
+    .eq("id",station.id)
+    .eq("staff_create_request_id",requestId)
+    .eq("created_by_user_id",userId)
+    .maybeSingle();
+
+  return !readError && concurrent?.staff_create_completed_at
+    ? concurrent.id : null;
+}
+
+let staffWorkerBusyV3561F2 = false;
+async function tickStaffQueueV3561F2() {
+  if (staffWorkerBusyV3561F2 || !supabase) return;
+  staffWorkerBusyV3561F2 = true;
+  let claim = null;
+  try {
+    // AUTODEAR_STAFF_QUEUE_RECOVERY_V3561J1
+    // Recover confirmed partial stations independently of the 24h lease.
+    // Never insert stations or services during this recovery pass.
+    const {data: partialRows, error: partialReadError} = await supabase
+      .from("staff_service_create_requests")
+      .select("request_id,created_by_user_id,attempts")
+      .eq("status","processing")
+      .eq("last_error","PARTIAL_STATION_REQUIRES_RECONCILIATION")
+      .order("updated_at",{ascending:true})
+      .limit(10);
+
+    if (partialReadError) {
+      console.error("[AUTODEAR][STAFF_QUEUE][PARTIAL_READ_ERROR]",
+        partialReadError.code || "UNKNOWN");
+    } else {
+      for (const pending of partialRows || []) {
+        try {
+          const stationId = await reconcileStaffQueueStationV3561H1(
+            pending.request_id,
+            pending.created_by_user_id
+          );
+
+          if (!stationId) continue;
+
+          const {data: updated, error: updateError} = await supabase
+            .from("staff_service_create_requests")
+            .update({
+              status:"completed",
+              station_id:stationId,
+              last_error:null,
+              locked_until:null,
+              completed_at:new Date().toISOString(),
+              updated_at:new Date().toISOString()
+            })
+            .eq("request_id",pending.request_id)
+            .eq("created_by_user_id",pending.created_by_user_id)
+            .eq("status","processing")
+            .eq("attempts",pending.attempts)
+            .eq("last_error","PARTIAL_STATION_REQUIRES_RECONCILIATION")
+            .select("request_id")
+            .maybeSingle();
+
+          if (updateError) {
+            console.error("[AUTODEAR][STAFF_QUEUE][RECOVERY_UPDATE_ERROR]",
+              updateError.code || "UNKNOWN");
+          } else if (updated?.request_id) {
+            console.log("[AUTODEAR][STAFF_QUEUE][RECOVERED]",{
+              requestSuffix:pending.request_id.slice(-8)
+            });
+          }
+        } catch (recoveryError) {
+          console.error("[AUTODEAR][STAFF_QUEUE][RECOVERY_ERROR]",
+            String(recoveryError?.message || recoveryError).slice(0,120));
+        }
+      }
+    }
+
+    // AUTODEAR_QUEUE_FINALIZATION_V3561L
+    const {data: finalizedCount, error: finalizeError} =
+      await supabase.rpc("finalize_exhausted_staff_create_requests");
+
+    if (finalizeError) {
+      console.error(
+        "[AUTODEAR][STAFF_QUEUE][FINALIZE_ERROR]",
+        finalizeError.code || "UNKNOWN"
+      );
+    } else if (Number(finalizedCount) > 0) {
+      console.log(
+        "[AUTODEAR][STAFF_QUEUE][EXHAUSTED_FINALIZED]",
+        finalizedCount
+      );
+    }
+
+    const {data, error} = await supabase.rpc("claim_staff_service_create_request");
+    if (error) {console.error("[AUTODEAR][STAFF_QUEUE][CLAIM_ERROR]",error.code||"UNKNOWN");return;}
+    claim = Array.isArray(data) ? data[0] : null;
+    if (!claim) return;
+    const id=claim.claimed_request_id, userId=claim.claimed_created_by_user_id;
+    const payload=claim.claimed_payload, attempt=claim.claimed_attempts;
+    if (!id || !userId || !payload || payload.requestId !== id) {
+      await supabase.from("staff_service_create_requests").update({status:"failed",last_error:"INVALID_PERSISTED_PAYLOAD",locked_until:null,updated_at:new Date().toISOString()}).eq("request_id",id);
+      return;
+    }
+    console.log("[AUTODEAR][STAFF_QUEUE][PROCESS]",{requestSuffix:id.slice(-8),attempt});
+    // Lease heartbeat prevents re-claiming a request while a live worker is processing.
+    // AUTODEAR_STAFF_LEASE_LOSS_V3561P
+    let leaseLostV3561N1 = false;
+    let heartbeatBusy=false;
+    const heartbeat=setInterval(async()=>{
+      if (heartbeatBusy) return;
+      heartbeatBusy=true;
+      try {
+        const {data: renewed, error: renewError} = await supabase
+          .from("staff_service_create_requests")
+          .update({
+            locked_until:new Date(Date.now()+180000).toISOString(),
+            updated_at:new Date().toISOString()
+          })
+          .eq("request_id",id)
+          .eq("status","processing")
+          .eq("attempts",attempt)
+          .gt("locked_until",new Date().toISOString())
+          .select("request_id")
+          .maybeSingle();
+
+        if (renewError || !renewed?.request_id) {
+          leaseLostV3561N1 = true;
+          console.error("[AUTODEAR][STAFF_QUEUE][LEASE_RENEW_FAILED]",{
+            requestSuffix:id.slice(-8),
+            attempt,
+            code:renewError?.code || "LEASE_NOT_OWNED"
+          });
+        }
+      } catch (heartbeatError) {
+        leaseLostV3561N1 = true;
+        console.error("[AUTODEAR][STAFF_QUEUE][LEASE_RENEW_EXCEPTION]",
+          String(heartbeatError?.message || heartbeatError).slice(0,120));
+      } finally {
+        heartbeatBusy=false;
+      }
+    },45000);
+    try {
+      const captured={status:200,payload:null};
+      const fakeRes={statusCode:200,on:()=>fakeRes,status(code){this.statusCode=code;return this;},json(data){captured.status=this.statusCode;captured.payload=data;return data;}};
+      // V35.61N1: fail closed if the lease is expired,
+      // replaced by another worker, or cannot be verified.
+      const verifyLeaseV3561N1 = async (stage) => {
+        if (leaseLostV3561N1) {
+          throw new Error("STAFF_QUEUE_LEASE_LOST");
+        }
+
+        const {data: current, error: leaseError} = await supabase
+          .from("staff_service_create_requests")
+          .select("request_id")
+          .eq("request_id",id)
+          .eq("created_by_user_id",userId)
+          .eq("status","processing")
+          .eq("attempts",attempt)
+          .gt("locked_until",new Date().toISOString())
+          .maybeSingle();
+
+        if (leaseError || current?.request_id !== id) {
+          leaseLostV3561N1 = true;
+          console.error("[AUTODEAR][STAFF_QUEUE][LEASE_LOST]",{
+            requestSuffix:id.slice(-8),
+            stage,
+            attempt
+          });
+          throw new Error("STAFF_QUEUE_LEASE_LOST");
+        }
+      };
+
+      await verifyLeaseV3561N1("start");
+
+      await processStaffListingQueueV3561F2(
+        {body:payload},
+        fakeRes,
+        {id:userId},
+        verifyLeaseV3561N1
+      );
+      const result=captured.payload || {};
+      let completed=Boolean((captured.status===201 || captured.status===200) && result.ok===true && result.listing?.id);
+      let stationId=completed?result.listing.id:null;
+
+      // V35.61H1: a timed-out completion can leave a valid station.
+      // Verify it and its services before any retry or failed status.
+      await verifyLeaseV3561N1("before_reconciliation");
+
+      if (!completed) {
+        const recoveredId = await reconcileStaffQueueStationV3561H1(id,userId);
+        if (recoveredId) {
+          completed=true;
+          stationId=recoveredId;
+          console.log("[AUTODEAR][STAFF_QUEUE][RECONCILED]",{
+            requestSuffix:id.slice(-8)
+          });
+        }
+      }
+      if (!completed && captured.status===202) {
+        // A station can exist while completion timestamp is missing.
+        // Never create a second station. Leave for explicit reconciliation.
+        console.warn("[AUTODEAR][STAFF_QUEUE][PARTIAL_STATION]",{requestSuffix:id.slice(-8)});
+      }
+      // AUTODEAR_QUEUE_PARTIAL_GUARD_V3561I
+      // A station that already exists must never be classified
+      // as a failed creation merely because completion is pending.
+      if (!completed) {
+        const {data: existingStation, error: existingError} =
+          await supabase.from("stations")
+            .select("id,staff_create_completed_at")
+            .eq("staff_create_request_id",id)
+            .eq("created_by_user_id",userId)
+            .maybeSingle();
+
+        if (existingError) {
+          throw new Error("STAFF_QUEUE_STATION_RECHECK_FAILED");
+        }
+
+        if (existingStation?.id) {
+          const recovered = await reconcileStaffQueueStationV3561H1(id,userId);
+          if (recovered) {
+            completed = true;
+            stationId = recovered;
+          } else {
+            console.warn("[AUTODEAR][STAFF_QUEUE][PARTIAL_REQUIRES_REVIEW]",{
+              requestSuffix:id.slice(-8)
+            });
+            await verifyLeaseV3561N1("before_partial_status");
+            await supabase.from("staff_service_create_requests")
+              .update({
+                status:"processing",
+                last_error:"PARTIAL_STATION_REQUIRES_RECONCILIATION",
+                locked_until:new Date(Date.now()+86400000).toISOString(),
+                updated_at:new Date().toISOString()
+              })
+              .eq("request_id",id)
+              .eq("created_by_user_id",userId)
+              .eq("status","processing")
+              .eq("attempts",attempt);
+            return;
+          }
+        }
+      }
+
+      await verifyLeaseV3561N1("before_final_status");
+
+      if (completed) {
+        await supabase.from("staff_service_create_requests").update({status:"completed",station_id:stationId,
+          completed_at:new Date().toISOString(),locked_until:null,last_error:null,updated_at:new Date().toISOString()})
+          .eq("request_id",id).eq("created_by_user_id",userId)
+          .eq("status","processing").eq("attempts",attempt)
+          .gt("locked_until",new Date().toISOString());
+      } else {
+        const permanent = captured.status>=400 && captured.status<500 && captured.status!==409 ? true
+          : captured.status===409 && result.error!=="STAFF_CREATE_RESULT_UNAVAILABLE";
+        const terminal=permanent || attempt>=5;
+        await supabase.from("staff_service_create_requests").update({status:terminal?"failed":"submitted",
+          locked_until:null,last_error:String(result.error||"PROCESSING_NOT_CONFIRMED").slice(0,120),updated_at:new Date().toISOString()})
+          .eq("request_id",id).eq("created_by_user_id",userId)
+          .eq("status","processing").eq("attempts",attempt)
+          .gt("locked_until",new Date().toISOString());
+      }
+      console.log("[AUTODEAR][STAFF_QUEUE][RESULT]",{requestSuffix:id.slice(-8),http:captured.status,completed});
+    } finally {clearInterval(heartbeat);}
+  } catch (error) {
+    console.error("[AUTODEAR][STAFF_QUEUE][WORKER_ERROR]",String(error?.message||error).slice(0,120));
+    if (claim?.claimed_request_id && !(
+      String(error?.message || error).includes("STAFF_QUEUE_LEASE_LOST")
+    )) {
+      const terminal=claim.claimed_attempts>=5;
+      await supabase.from("staff_service_create_requests").update({status:terminal?"failed":"submitted",
+        locked_until:null,last_error:"WORKER_EXCEPTION",updated_at:new Date().toISOString()})
+        .eq("request_id",claim.claimed_request_id)
+        .eq("status","processing")
+        .eq("attempts",claim.claimed_attempts)
+        .gt("locked_until",new Date().toISOString());
+    }
+  } finally {staffWorkerBusyV3561F2=false;}
+}
+
+// Retry the durable queue; tick starts only after the server is listening.
+function startStaffQueueWorkerV3561F2() {
+  setInterval(() => { void tickStaffQueueV3561F2(); }, 15000);
+  void tickStaffQueueV3561F2();
+}
+
 
 /*
  * TEMPORARY STAFF CREATE DIAGNOSTIC.
@@ -46658,4 +47221,10 @@ app.listen(PORT, "0.0.0.0", () => {
   startCustomerBookingReminderScheduler();
 startBusinessTomorrowReminderScheduler();
   startAutodearListingPricePlanScheduler();
+  if (process.env.STAFF_SERVICE_QUEUE_V3561_ENABLED === "true") {
+    startStaffQueueWorkerV3561F2();
+    console.log("[AUTODEAR][STAFF_QUEUE][ENABLED]");
+  } else {
+    console.log("[AUTODEAR][STAFF_QUEUE][DISABLED_LEGACY_API]");
+  }
 });
