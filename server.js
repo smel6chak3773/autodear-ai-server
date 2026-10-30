@@ -35306,10 +35306,15 @@ app.get(
     console.log("[AUTODEAR][STAFF_SERVICES_TRACE][ENTER]", {
       method: req.method,
       hasAuthorization: Boolean(req.headers.authorization),
+      // AUTODEAR_STAFF_TRACE_ID_V3562R
+      traceId: String(req.headers["x-autodear-trace"] || "")
+        .slice(0, 80) || null,
     });
 
     res.once("finish", () => {
       console.log("[AUTODEAR][STAFF_SERVICES_TRACE][FINISH]", {
+        traceId: String(req.headers["x-autodear-trace"] || "")
+          .slice(0, 80) || null,
         status: res.statusCode,
         elapsedMs: Date.now() - routeStartedV3562M,
       });
