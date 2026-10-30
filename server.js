@@ -34379,7 +34379,16 @@ const stationPayload = {
 app.post("/api/business-directory/staff/listings", async (req, res) => {
   // AUTODEAR_STAFF_QUEUE_ROLLOUT_V3561R
   // Default OFF: preserve the existing synchronous API for old clients.
-  if (process.env.STAFF_SERVICE_QUEUE_V3561_ENABLED !== "true") {
+  // AUTODEAR_STAFF_QUEUE_SELECTIVE_V3561X
+  // Only explicitly opted-in DEV clients use the durable queue.
+  // Existing clients keep the original synchronous response.
+  const queueRequested =
+    req.get("X-AUTODEAR-STAFF-QUEUE") === "v3561";
+
+  if (
+    process.env.STAFF_SERVICE_QUEUE_V3561_ENABLED !== "true" ||
+    !queueRequested
+  ) {
     return processStaffListingQueueV3561F2(req, res);
   }
   try {
