@@ -27215,8 +27215,17 @@ async function canReadLinkedBusinessWalletV3537(authUserId, walletOwnerId) {
 }
 
 app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
+  // AUTODEAR_SERVER_WALLET_TRACE_V1
+  const walletTraceStartedV1 = Date.now();
+  console.log("[AUTODEAR][WALLET_TRACE][START]", {
+    walletType: String(req.params?.walletType || ""),
+  });
   const authResult =
     await resolveAuthenticatedUser(req);
+  console.log("[AUTODEAR][WALLET_TRACE][AUTH_DONE]", {
+    ms: Date.now() - walletTraceStartedV1,
+    authenticated: Boolean(authResult?.user?.id),
+  });
 
   const authUserId =
     String(
@@ -27308,6 +27317,11 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
         walletType
       )
       .maybeSingle();
+    console.log("[AUTODEAR][WALLET_TRACE][BALANCE_DONE]", {
+      ms: Date.now() - walletTraceStartedV1,
+      hasWallet: Boolean(wallet),
+      hasError: Boolean(walletError),
+    });
 
     if (walletError) {
       console.error(
@@ -27351,6 +27365,11 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
         }
       )
       .limit(100);
+    console.log("[AUTODEAR][WALLET_TRACE][HISTORY_DONE]", {
+      ms: Date.now() - walletTraceStartedV1,
+      count: Array.isArray(transactions) ? transactions.length : null,
+      hasError: Boolean(transactionsError),
+    });
 
     if (transactionsError) {
       console.error(
