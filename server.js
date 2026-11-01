@@ -14830,8 +14830,26 @@ app.post(
 
 
 app.post("/api/account/link-existing", async (req, res) => {
+  // AUTODEAR_BUSINESS_LINK_SERVER_DIAG_V3
+  const linkDiagStartedV3 = Date.now();
+  const linkDiagV3 = (stage) => {
+    console.log("[AUTODEAR][ACCOUNT_LINK_V3]", {
+      stage,
+      ms: Date.now() - linkDiagStartedV3,
+    });
+  };
+  res.once("finish", () => {
+    console.log("[AUTODEAR][ACCOUNT_LINK_V3][FINISH]", {
+      status: res.statusCode,
+      ms: Date.now() - linkDiagStartedV3,
+    });
+  });
+  linkDiagV3("REQUEST_RECEIVED");
+
+  linkDiagV3("AUTH_START");
   const authResult =
     await resolveAuthenticatedUser(req);
+  linkDiagV3("AUTH_DONE");
 
   const currentUser =
     authResult?.user || null;
@@ -14886,6 +14904,7 @@ app.post("/api/account/link-existing", async (req, res) => {
      * Текущая мобильная сессия при этом
      * НЕ меняется.
      */
+    linkDiagV3("PASSWORD_VERIFY_START");
     const {
       data: signInData,
       error: signInError,
@@ -14895,6 +14914,7 @@ app.post("/api/account/link-existing", async (req, res) => {
           email,
           password,
         });
+    linkDiagV3("PASSWORD_VERIFY_DONE");
 
     const linkedUser =
       signInData?.user || null;
@@ -14908,11 +14928,13 @@ app.post("/api/account/link-existing", async (req, res) => {
      * Серверному auth client сессия
      * после проверки больше не нужна.
      */
+    linkDiagV3("TEMP_SIGNOUT_START");
     try {
       await supabaseAuth.auth.signOut();
     } catch (_) {
       // ignore
     }
+    linkDiagV3("TEMP_SIGNOUT_DONE");
 
     if (
       signInError ||
@@ -15152,6 +15174,7 @@ app.post("/api/account/link-existing", async (req, res) => {
      * unique constraint account_links:
      * сначала проверяем существующую связь.
      */
+    linkDiagV3("ACCOUNT_LINK_DATABASE_START");
     const createdLinks = [];
 
     for (const row of rows) {
@@ -15223,6 +15246,7 @@ app.post("/api/account/link-existing", async (req, res) => {
       );
     }
 
+    linkDiagV3("ACCOUNT_LINK_DATABASE_DONE");
     console.log(
       "[AUTODEAR][ACCOUNT_LINK][OK]",
       {
