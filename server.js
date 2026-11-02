@@ -27878,7 +27878,16 @@ app.post(
 app.get(
   '/api/listings/:listingId/promotion/order-status',
   async (req, res) => {
+    // AUTODEAR_PROMOTION_STATUS_TIMING_V13
+    const statusStartedV13 = Date.now();
+    console.log('[AUTODEAR][PROMOTION][STATUS_ENTER_V13]', {
+      listingSuffix: String(req.params?.listingId || '').slice(-8)
+    });
     const auth = await resolveReferralAuthenticatedUser(req);
+    console.log('[AUTODEAR][PROMOTION][STATUS_AUTH_V13]', {
+      ms: Date.now() - statusStartedV13,
+      authenticated: Boolean(auth?.user?.id)
+    });
     const actor = String(auth?.user?.id || '').trim();
 
     if (!actor) {
@@ -27928,6 +27937,11 @@ app.get(
           .eq('listing_id', listingId)
           .maybeSingle();
 
+      console.log('[AUTODEAR][PROMOTION][STATUS_DB_V13]', {
+        ms: Date.now() - statusStartedV13,
+        found: Boolean(data),
+        dbError: Boolean(error)
+      });
       if (error) throw error;
 
       if (!data) {
