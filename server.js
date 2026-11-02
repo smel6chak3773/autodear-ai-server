@@ -21067,7 +21067,7 @@ app.post("/api/payments/ckassa/create", async (req, res) => {
       const minimumAmountKopecks =
         purpose === "ads_wallet_topup"
           ? 50000
-          : 10000;
+          : 5000;
 
       if (
         !Number.isInteger(amountKopecks) ||
@@ -28170,6 +28170,119 @@ app.put('/api/director/pricing-config', async (req, res) => {
     return res.status(503).json({
       ok: false,
       error: 'PRICING_SAVE_FAILED'
+    });
+  }
+});
+
+
+// AUTODEAR_VEHICLE_REPORT_WALLET_PURCHASE_V1
+// Authenticated personal-wallet purchase.
+// Debit and report credit occur atomically inside PostgreSQL.
+app.post("/api/vehicle-reports/wallet-purchase", async (req, res) => {
+  try {
+    const authResult = await resolveAuthenticatedUser(req);
+    const userId = String(authResult?.user?.id || "").trim();
+
+    if (!userId) {
+      return res.status(401).json({
+        ok: false,
+        error: "AUTH_REQUIRED",
+      });
+    }
+
+    if (!supabaseServiceRole) {
+      return res.status(503).json({
+        ok: false,
+        error: "WALLET_SERVICE_NOT_CONFIGURED",
+      });
+    }
+
+    const productId = String(req.body?.productId || "").trim();
+    const operationKey = String(req.body?.operationKey || "").trim();
+
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    if (!uuidPattern.test(productId) ||
+        !uuidPattern.test(operationKey)) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_PURCHASE_REQUEST",
+      });
+    }
+
+    // Never accept ownerId, walletType, amount or price
+    // from the mobile client. The database owns pricing.
+    const { data, error } = await supabaseServiceRole.rpc(
+      "autodear_purchase_vehicle_report_wallet_v1",
+      {
+        p_user_id: userId,
+        p_product_id: productId,
+        p_operation_key: operationKey,
+      }
+    );
+
+    if (error) {
+      console.error(
+        "[AUTODEAR][VEHICLE_REPORT][WALLET_PURCHASE_RPC_ERROR]",
+        { code: error.code, message: error.message }
+      );
+
+      return res.status(503).json({
+        ok: false,
+        error: "PURCHASE_STATUS_UNCONFIRMED",
+        retrySameOperation: true,
+      });
+    }
+
+    if (data?.error === "INSUFFICIENT_FUNDS") {
+      const shortage = Math.max(0, Number(data.shortage || 0));
+      return res.status(409).json({
+        ok: false,
+        error: "INSUFFICIENT_FUNDS",
+        balance: Number(data.balance || 0),
+        price: Number(data.price || 0),
+        shortage,
+        minimumTopup: 50,
+        suggestedTopup: Math.max(50, shortage),
+      });
+    }
+
+    if (data?.error === "PRODUCT_NOT_AVAILABLE") {
+      return res.status(404).json({
+        ok: false,
+        error: "PRODUCT_NOT_AVAILABLE",
+      });
+    }
+
+    if (data?.ok !== true) {
+      return res.status(503).json({
+        ok: false,
+        error: "PURCHASE_STATUS_UNCONFIRMED",
+        retrySameOperation: true,
+      });
+    }
+
+    console.log("[AUTODEAR][VEHICLE_REPORT][WALLET_PURCHASE_OK]", {
+      orderId: data.orderId,
+      duplicate: data.duplicate === true,
+      reportType: data.reportType || null,
+    });
+
+    return res.json({
+      ...data,
+      ok: true,
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][VEHICLE_REPORT][WALLET_PURCHASE_FATAL]",
+      error?.message || String(error)
+    );
+
+    return res.status(503).json({
+      ok: false,
+      error: "PURCHASE_STATUS_UNCONFIRMED",
+      retrySameOperation: true,
     });
   }
 });
