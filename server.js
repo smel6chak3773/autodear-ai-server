@@ -27524,8 +27524,11 @@ app.get("/api/wallet/:walletType/:ownerId", async (req, res) => {
 
 // AUTODEAR_V3550B_QUOTE_SERVER_V1
 // Только проверка и расчёт. Денежных операций здесь нет.
+// AUTODEAR_PROMOTION_AUTH_FAST_V9
+// Signed-JWT auth for promotion routes only.
+// Database purchase permissions remain unchanged.
 app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
-  const authResult = await resolveAuthenticatedUser(req);
+  const authResult = await resolveReferralAuthenticatedUser(req);
   const actorId = String(authResult?.user?.id || '').trim();
 
   if (!actorId)
@@ -27721,7 +27724,7 @@ app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
 app.post(
   '/api/listings/:listingId/promotion/purchase',
   async (req, res) => {
-    const auth = await resolveAuthenticatedUser(req);
+    const auth = await resolveReferralAuthenticatedUser(req);
     const actor = String(auth?.user?.id || '').trim();
 
     if (!actor) {
@@ -27875,7 +27878,7 @@ app.post(
 app.get(
   '/api/listings/:listingId/promotion/order-status',
   async (req, res) => {
-    const auth = await resolveAuthenticatedUser(req);
+    const auth = await resolveReferralAuthenticatedUser(req);
     const actor = String(auth?.user?.id || '').trim();
 
     if (!actor) {
