@@ -27699,7 +27699,7 @@ app.post('/api/listings/:listingId/promotion/quote', async (req, res) => {
       items,
       total,
       currency:'RUB',
-      paymentEnabled:false
+      paymentEnabled:true
     });
   } catch(error) {
     console.error('[AUTODEAR][PROMOTION][QUOTE_FAILED_V3550B]', {
@@ -27732,7 +27732,7 @@ app.post(
     }
 
     if (
-      true /* AUTODEAR_V3550K_PURCHASE_HARD_OFF */
+      false /* AUTODEAR_LINKED_PROMOTION_PURCHASE_V1 */
     ) {
       return res.status(503).json({
         ok: false,
