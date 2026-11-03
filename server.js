@@ -33660,33 +33660,40 @@ async function processStaffListingQueueV3561F2(
         }
       );
 
+      // AUTODEAR_STAFF_GEO_OPTIONAL_V92
+      // The written address is required; geocoder matches are NOT mandatory.
+      // No guessed coordinates: missing latitude and longitude stay null.
+      // A navigator may use the stored full address as a text query.
+      // But if coordinates are supplied, they must be a valid pair.
+      const geoSuppliedV92 =
+        (body.latitude != null && body.latitude !== "") ||
+        (body.longitude != null && body.longitude !== "");
+
       if (
-        latitude == null ||
-        longitude == null ||
-        latitude < -90 ||
-        latitude > 90 ||
-        longitude < -180 ||
-        longitude > 180
+        geoSuppliedV92 &&
+        (
+          latitude == null ||
+          longitude == null ||
+          latitude < -90 ||
+          latitude > 90 ||
+          longitude < -180 ||
+          longitude > 180 ||
+          (latitude === 0 && longitude === 0)
+        )
       ) {
         markStaffBusinessListingCreateDiagnostic(
           diagnosticRequestId,
           diagnosticStartedAt,
-          "rejected_geo_required",
+          "rejected_geo_invalid",
           {
-            hasLatitude:
-              latitude != null,
-
-            hasLongitude:
-              longitude != null,
+            hasLatitude: latitude != null,
+            hasLongitude: longitude != null,
           }
         );
-
         return res.status(400).json({
           ok: false,
-          error:
-            "BUSINESS_LISTING_GEO_REQUIRED",
-          message:
-            "Выберите точный адрес из подсказок AUTODEAR.",
+          error: "BUSINESS_LISTING_GEO_INVALID",
+          message: "Проверьте координаты либо оставьте оба поля пустыми.",
         });
       }
 
