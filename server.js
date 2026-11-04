@@ -6,6 +6,7 @@ const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
 const multer = require("multer");
 const crypto = require("crypto");
+const { startSubscriptionReminder310 } = require("./subscriptionReminder310V107");
 
 const { processMessage } = require("./assistant/brain");
 const memoryStore = require("./assistant/memoryStore");
@@ -27223,9 +27224,21 @@ async function canReadLinkedBusinessWalletV3537(authUserId, walletOwnerId) {
   if (businessError || !Array.isArray(ownedBusinesses) || !ownedBusinesses.length) return false;
   const allowedIds = ownedBusinesses.map((row) => String(row.id)).filter(Boolean);
   if (!allowedIds.length) return false;
-  // Legacy verified account_links can store the owner's Auth UUID in business_id.
-  // The owner and link are also checked below; this is NOT a general owner bypass.
-  const permittedBusinessKeysV3541 = [...new Set([...allowedIds, String(walletOwnerId)])];
+  // AUTODEAR_V114_STABLE_DASHBOARD_ACCOUNTS_WALLET
+  // /api/account/link-existing stores station.id in account_links.business_id.
+  // A verified password-linked business must be readable, but ONLY when the
+  // linked station actually belongs to walletOwnerId. Never grant write access.
+  const { data: ownedStationsV114, error: stationsErrorV114 } = await supabase
+    .from("stations")
+    .select("id")
+    .eq("owner_id", walletOwnerId);
+  if (stationsErrorV114) return false;
+  const stationIdsV114 = (Array.isArray(ownedStationsV114) ? ownedStationsV114 : [])
+    .map((row) => String(row?.id || "").trim()).filter(Boolean);
+  // Existing verified links may refer to business_accounts.id or owner Auth UUID.
+  const permittedBusinessKeysV3541 = [...new Set([
+    ...allowedIds, ...stationIdsV114, String(walletOwnerId)
+  ])];
   const { data: verifiedLinks, error: linkError } = await supabase
     .from("account_links")
     .select("id")
@@ -47622,6 +47635,12 @@ async function processSmartReviewPushV4141() {
 }
 
 app.listen(PORT, "0.0.0.0", () => {
+  // AUTODEAR_SUBSCRIPTION_310_V107: OFF until explicit env flag.
+  startSubscriptionReminder310({
+    db: supabaseServiceRole,
+    sendPush: sendAutodearExpoPush,
+  });
+
   // AUTODEAR_SMART_REVIEW_PUSH_V4141_START
   setTimeout(() => {
     void processSmartReviewPushV4141();
