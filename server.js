@@ -15310,6 +15310,135 @@ app.post("/api/account/link-existing", async (req, res) => {
 });
 
 
+// AUTODEAR_V311_6_BUSINESS_AVATAR
+// Business account image is independent from profiles and stations.
+app.patch("/api/account/business-avatar", async (req, res) => {
+  try {
+    const authResult = await resolveAuthenticatedUser(req);
+    const authId = String(authResult?.user?.id || "").trim();
+
+    if (!authId) {
+      return res.status(401).json({
+        ok: false, error: "AUTH_REQUIRED"
+      });
+    }
+
+    if (!supabase) {
+      return res.status(503).json({
+        ok: false, error: "SUPABASE_UNAVAILABLE"
+      });
+    }
+
+    const businessId = String(req.body?.businessId || "").trim();
+    const avatarUrl = String(req.body?.avatarUrl || "").trim();
+
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    const storageBase =
+      String(process.env.SUPABASE_URL || "").replace(/\/+$/, "") +
+      "/storage/v1/object/public/avatars/";
+
+    const expectedPrefix =
+      storageBase + authId + "/business/" + businessId + "/";
+
+    const avatarFile =
+      avatarUrl.startsWith(expectedPrefix)
+        ? avatarUrl.slice(expectedPrefix.length)
+        : "";
+
+    const validAvatar =
+      Boolean(process.env.SUPABASE_URL) &&
+      uuid.test(authId) &&
+      uuid.test(businessId) &&
+      avatarUrl.length <= 2048 &&
+      /^avatar-[0-9]{10,}\.(jpg|png|webp)$/.test(avatarFile);
+
+    if (!validAvatar) {
+      return res.status(400).json({
+        ok: false, error: "INVALID_AVATAR_REQUEST"
+      });
+    }
+
+    const { data: account, error: lookupError } = await supabase
+      .from("business_accounts")
+      .select("id,auth_user_id")
+      .eq("id", businessId)
+      .maybeSingle();
+
+    if (lookupError) {
+      return res.status(500).json({
+        ok: false, error: "BUSINESS_LOOKUP_FAILED"
+      });
+    }
+
+    if (!account) {
+      return res.status(404).json({
+        ok: false, error: "BUSINESS_NOT_FOUND"
+      });
+    }
+
+    const businessOwner = String(account.auth_user_id || "");
+    let authorized = businessOwner === authId;
+
+    if (!authorized) {
+      const { data: links, error: linkError } = await supabase
+        .from("account_links")
+        .select("id")
+        .eq("link_type", "business")
+        .eq("owner_auth_user_id", authId)
+        .eq("linked_auth_user_id", businessOwner)
+        .eq("business_id", businessId)
+        .not("verified_at", "is", null)
+        .limit(1);
+
+      if (linkError) {
+        return res.status(500).json({
+          ok: false, error: "BUSINESS_LINK_CHECK_FAILED"
+        });
+      }
+
+      authorized = Array.isArray(links) && links.length > 0;
+    }
+
+    if (!authorized) {
+      return res.status(403).json({
+        ok: false, error: "BUSINESS_ACCESS_DENIED"
+      });
+    }
+
+    // Do not update personal profiles, station photos or listings.
+    const { data: updated, error: saveError } = await supabase
+      .from("business_accounts")
+      .update({
+        avatar_url: avatarUrl,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", businessId)
+      .select("id,avatar_url")
+      .single();
+
+    if (saveError || !updated) {
+      return res.status(500).json({
+        ok: false, error: "BUSINESS_AVATAR_SAVE_FAILED"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      businessId: updated.id,
+      avatarUrl: updated.avatar_url
+    });
+  } catch (error) {
+    console.error(
+      "[AUTODEAR][BUSINESS_AVATAR_V311_6]",
+      error?.message || error
+    );
+    return res.status(500).json({
+      ok: false, error: "BUSINESS_AVATAR_UNEXPECTED"
+    });
+  }
+});
+
 app.get("/api/account/workspaces", async (req, res) => {
   const authResult =
     await resolveAuthenticatedUser(req);
@@ -15960,6 +16089,11 @@ app.get("/api/account/workspaces", async (req, res) => {
               null,
 
             avatarUrl:
+              businessAccount.avatar_url ||
+              null,
+
+            // AUTODEAR_V311_6_BUSINESS_AVATAR
+            ownerAvatarUrl:
               businessAccount.avatar_url ||
               null,
 
